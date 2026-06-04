@@ -1,0 +1,2942 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "neteng/fboss/bgp/cpp/tests/e2e/E2ETestFixture.h"
+
+#include <folly/container/small_vector.h>
+#include <folly/coro/Baton.h>
+#include <folly/coro/BlockingWait.h>
+
+#include "fboss/lib/CommonUtils.h"
+#include "neteng/fboss/bgp/cpp/common/FeatureFlags.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
+#include "neteng/fboss/bgp/cpp/lib/BgpMessageParser.h"
+#include "neteng/fboss/bgp/cpp/lib/fibers/BgpSerializer.h"
+#include "neteng/fboss/bgp/cpp/lib/fibers/FiberBgpPeer.h"
+#include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopCache.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
+#include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+
+#include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
+
+namespace facebook {
+namespace bgp {
+
+std::shared_ptr<Config> E2ETestFixture::getConfig(
+    bool enableUpdateGroup,
+    bool enableSerializeGroupPdu) {
+  /* Build thrift config */
+  thrift::BgpConfig thriftConfig;
+  thriftConfig.router_id() = kLocalAddr1.str();
+  thriftConfig.local_as() = kAsn1;
+  thriftConfig.hold_time() = kHoldTime.count();
+  thriftConfig.graceful_restart_convergence_seconds() =
+      grConvergenceSecondsOverride_.value_or(kGrRestartTime.count());
+  thriftConfig.listen_addr() = kLocalAddr1.str();
+  thriftConfig.eor_time_s() = 45;
+  /*
+   * Use port 0 for OS-assigned dynamic port allocation. This avoids port
+   * collision when running multiple tests in parallel (e.g., with stress-runs).
+   * The previous approach of random ports (1179 + rand % 60000) led to
+   * collisions during parallel stress testing.
+   */
+  thriftConfig.listen_port() = 0;
+
+  /* Enable UCMP calculation from LBW extended community if requested */
+  if (enableComputeUcmpFromLbw_) {
+    thriftConfig.compute_ucmp_from_link_bandwidth_community() = true;
+  }
+
+  /* Add all dynamically configured peers */
+  for (const auto& peer : peers_) {
+    thriftConfig.peers()->push_back(peer);
+  }
+
+  /*
+   * Plumb the parent confederation AS into the global config if any peer
+   * added via addPeer() asked for it. Required by Config.cpp validation
+   * when peer.is_confed_peer=true (see Config.cpp ~line 1015).
+   */
+  if (pendingLocalConfedAsn_.has_value()) {
+    thriftConfig.local_confed_as_4_byte() = *pendingLocalConfedAsn_;
+  }
+
+  /* Setup bgp_setting_config */
+  thrift::BgpSettingConfig tBgpSettingConfig;
+  tBgpSettingConfig.enable_egress_queue_backpressure() =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+  tBgpSettingConfig.enable_update_group() = enableUpdateGroup;
+  tBgpSettingConfig.enable_next_hop_tracking() = enableNexthopTracking_;
+  {
+    thrift::UpdateGroupConfig ugConfig;
+    if (updateGroupConfigOverride_.has_value()) {
+      ugConfig = *updateGroupConfigOverride_;
+      ugConfig.enableSerializeGroupPdu() = enableSerializeGroupPdu;
+    } else {
+      ugConfig.allowSlowPeerDetach() = true;
+      ugConfig.enableSerializeGroupPdu() = enableSerializeGroupPdu;
+    }
+    tBgpSettingConfig.update_group_config() = std::move(ugConfig);
+  }
+  if (enableEiBgpMultipath_) {
+    tBgpSettingConfig.enable_eibgp_multipath() = true;
+  }
+  thriftConfig.bgp_setting_config() = std::move(tBgpSettingConfig);
+
+  FeatureFlags::LoadFromThriftConfig(thriftConfig);
+
+  return std::make_shared<Config>(thriftConfig);
+}
+
+// ==================== PEER MANAGEMENT ====================
+
+void E2ETestFixture::addPeer(const BgpPeerSpec& spec) {
+  auto peer = createBgpPeer(
+      spec.asn,
+      spec.localAddr,
+      spec.peerAddr,
+      spec.v4Nexthop,
+      spec.v6Nexthop,
+      true /* allowAsIn */,
+      spec.peerType);
+
+  if (!spec.description.empty()) {
+    peer.description() = spec.description;
+  }
+
+  if (spec.disableIpv4Afi) {
+    peer.disable_ipv4_afi() = true;
+  }
+  if (spec.disableIpv6Afi) {
+    peer.disable_ipv6_afi() = true;
+  }
+
+  /* Set out-delay timer if specified */
+  if (spec.outDelaySeconds.has_value()) {
+    thrift::BgpPeerTimers timers;
+    timers.hold_time_seconds() = 90;
+    timers.keep_alive_seconds() = 30;
+    timers.out_delay_seconds() = spec.outDelaySeconds.value();
+    peer.bgp_peer_timers() = std::move(timers);
+  }
+
+  /* Set LBW (Link Bandwidth) configuration if specified */
+  if (spec.advertiseLinkBandwidth.has_value()) {
+    peer.advertise_link_bandwidth() = spec.advertiseLinkBandwidth.value();
+  }
+  if (spec.receiveLinkBandwidth.has_value()) {
+    peer.receive_link_bandwidth() = spec.receiveLinkBandwidth.value();
+  }
+
+  /* Set egress policy name if specified */
+  if (spec.egressPolicyName.has_value()) {
+    peer.egress_policy_name() = spec.egressPolicyName.value();
+  }
+
+  /* Confederation peer: mark on the thrift::BgpPeer. */
+  if (spec.isConfedPeer) {
+    peer.is_confed_peer() = true;
+  }
+
+  /* Route-Reflector client: mark on the thrift::BgpPeer. */
+  if (spec.isRrClient) {
+    peer.is_rr_client() = true;
+  }
+
+  /*
+   * Parent confederation AS is a global config field, not per-peer. If
+   * multiple specs supply localConfedAsn they must agree (otherwise the
+   * test setup is internally inconsistent).
+   */
+  if (spec.localConfedAsn.has_value()) {
+    if (pendingLocalConfedAsn_.has_value() &&
+        *pendingLocalConfedAsn_ != *spec.localConfedAsn) {
+      throw std::logic_error(
+          "BgpPeerSpec::localConfedAsn conflicts across peers in this fixture");
+    }
+    pendingLocalConfedAsn_ = spec.localConfedAsn;
+  }
+
+  /* Store ADD-PATH capability for this peer (used in establishSession) */
+  peerAddPathCapabilities_[spec.peerAddr] = spec.addPathCapability;
+
+  peers_.push_back(std::move(peer));
+}
+
+void E2ETestFixture::deletePeer(const folly::IPAddress& peerAddr) {
+  peers_.erase(
+      std::remove_if(
+          peers_.begin(),
+          peers_.end(),
+          [&](const auto& p) { return *p.peer_addr() == peerAddr.str(); }),
+      peers_.end());
+}
+
+folly::Expected<folly::Unit, nettools::bgplib::FiberBgpPeerManager::ErrorCode>
+E2ETestFixture::delPeerAtRuntime(const folly::IPAddress& peerAddr) {
+  XLOGF(INFO, "=== delPeerAtRuntime: peer {} ===", peerAddr.str());
+  return folly::coro::blockingWait(
+      peerManager_->delPeers({peerAddr})
+          .scheduleOn(&peerManager_->getEventBase()));
+}
+
+void E2ETestFixture::bringUpPeer(
+    const folly::IPAddress& peerAddr,
+    uint64_t versionNumber) {
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  establishSession(peerId, versionNumber);
+}
+
+void E2ETestFixture::bringUpPeerBlocked(
+    const folly::IPAddress& peerAddr,
+    uint64_t versionNumber) {
+  blockPeer(peerAddr);
+  bringUpPeer(peerAddr, versionNumber);
+}
+
+void E2ETestFixture::testOnlyDeferInitDump(
+    const folly::IPAddress& peerAddr,
+    bool defer) {
+  peerManager_->testOnlySetDeferInitDump(peerAddr, defer);
+}
+
+void E2ETestFixture::testOnlyDeferDrjAcceptance(
+    const folly::IPAddress& peerAddr,
+    bool defer) {
+  peerManager_->testOnlySetDeferDrjAcceptance(peerAddr, defer);
+}
+
+void E2ETestFixture::bringDownPeer(
+    const folly::IPAddress& peerAddr,
+    bool peerDelete) {
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  if (auto queues = getPeerQueues(peerId)) {
+    /*
+     * Close bounded queue BEFORE sending BgpSessionStop to wake up any
+     * deferredPushToPeer coroutines blocked on waitToPush().
+     *
+     * In production, the I/O thread (FiberBgpPeer) owns this queue and closes
+     * it during session teardown. In E2E tests, we mock the I/O thread, so the
+     * test owns the queue and must close it here.
+     *
+     * Without this, the coroutine remains blocked and can cause use-after-free
+     * when the group is destroyed while the coroutine still holds references.
+     */
+    if (queues->boundedAdjRibOutQ) {
+      queues->boundedAdjRibOutQ->close();
+      XLOGF(
+          INFO,
+          "bringDownPeer: Closed bounded queue for peer {}",
+          peerAddr.str());
+    }
+    queues->adjRibInQ->fiberPush(FiberBgpPeer::BgpSessionStop{});
+  }
+
+  /*
+   * Wait for session termination to complete before returning.
+   *
+   * This is critical for test correctness: without waiting, the next
+   * bringUpPeer() call would block in waitForSessionTerminateBaton()
+   * on PeerManager's EVB, but the work to signal the baton (processing
+   * BgpSessionStop in processPeerMessageLoop) also runs on the same EVB,
+   * causing a deadlock.
+   *
+   * By waiting here from the test thread (not the EVB), we allow the
+   * EVB to process the BgpSessionStop and signal the semaphore before we
+   * attempt to bring the peer back up.
+   */
+  auto batonIt = peerManager_->sessionTerminateBatons_.find(peerId);
+  if (batonIt != peerManager_->sessionTerminateBatons_.end()) {
+    XLOGF(
+        INFO,
+        "Waiting for session termination baton for peer: {}",
+        peerAddr.str());
+    // Baton has latch semantics: stays posted between post() and reset().
+    // No need to re-signal after waiting — sessionEstablished() will also
+    // pass through immediately since the baton remains posted.
+    folly::coro::blockingWait(
+        [&]() -> folly::coro::Task<void> { co_await *batonIt->second; }());
+    XLOGF(
+        INFO,
+        "Session termination baton received for peer: {}",
+        peerAddr.str());
+  }
+
+  /*
+   * Now notify PeerManager about the session termination.
+   *
+   * With MockSessionManager, pushing BgpSessionStop to adjRibInQ only triggers
+   * AdjRib::sessionTerminated(). We also need to trigger
+   * PeerManager::sessionTerminated() to update PeerManager state (e.g.,
+   * markStateTerminated on AdjRib, cleanup update groups, etc.).
+   *
+   * This must be done AFTER waiting for the semaphore, because
+   * PeerManager::sessionTerminated() accesses AdjRib state that may be
+   * modified during AdjRib::sessionTerminated().
+   */
+  FiberBgpPeer::ObservableStateT terminateEvent{
+      .peerId = peerId,
+      .state = BgpSessionState::IDLE,
+      .versionNumber = 0,
+      .sessionInfo = nullptr,
+      .peerDelete = peerDelete};
+
+  auto& evb = peerManager_->getEventBase();
+  folly::via(&evb, [this, terminateEvent]() {
+    folly::coro::blockingWait(peerManager_->sessionTerminated(terminateEvent));
+  }).wait();
+
+  XLOGF(INFO, "Session termination complete for peer: {}", peerAddr.str());
+}
+
+void E2ETestFixture::bringDownPeerWithGr(const folly::IPAddress& peerAddr) {
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  auto it = peerQueues_.find(peerId);
+  ASSERT_NE(it, peerQueues_.end());
+
+  if (it->second.boundedAdjRibOutQ) {
+    it->second.boundedAdjRibOutQ->close();
+  }
+  it->second.adjRibInQ->fiberPush(
+      FiberBgpPeer::BgpSessionStop{.gracefulRestart = true});
+
+  auto batonIt = peerManager_->sessionTerminateBatons_.find(peerId);
+  ASSERT_NE(batonIt, peerManager_->sessionTerminateBatons_.end());
+  folly::coro::blockingWait(
+      [&]() -> folly::coro::Task<void> { co_await *batonIt->second; }());
+
+  FiberBgpPeer::ObservableStateT terminateEvent{
+      .peerId = peerId,
+      .state = BgpSessionState::IDLE,
+      .versionNumber = 0,
+      .sessionInfo = nullptr};
+  auto& evb = peerManager_->getEventBase();
+  folly::via(&evb, [this, terminateEvent]() {
+    folly::coro::blockingWait(peerManager_->sessionTerminated(terminateEvent));
+  }).wait();
+}
+
+void E2ETestFixture::runAdjRibStop(const std::shared_ptr<AdjRib>& adjRib) {
+  auto& evb = peerManager_->getEventBase();
+  folly::via(&evb, [adjRib]() {
+    folly::coro::blockingWait(adjRib->stop());
+  }).wait();
+}
+
+PeerUpdateState E2ETestFixture::getPeerState(
+    const nettools::bgplib::BgpPeerId& peerId) {
+  PeerUpdateState state = PeerUpdateState::DOWN;
+  auto& evb = peerManager_->getEventBase();
+  folly::via(&evb, [&]() {
+    auto adjRib = peerManager_->findAdjRib(peerId);
+    if (adjRib) {
+      state = adjRib->getPeerState();
+    }
+  }).wait();
+  return state;
+}
+
+// ==================== LOCAL ROUTE MANAGEMENT ====================
+
+void E2ETestFixture::addLocalRoute(
+    const std::string& prefix,
+    const std::vector<std::string>& communities,
+    uint32_t localPref,
+    const std::string& nexthop,
+    uint32_t minSupportingRoutes) {
+  thrift::BgpNetwork network;
+  network.prefix() = prefix;
+
+  if (!communities.empty()) {
+    network.communities() = communities;
+  }
+
+  if (localPref != kLocalPref) {
+    network.local_pref() = localPref;
+  }
+
+  if (!nexthop.empty()) {
+    network.nexthop() = nexthop;
+  }
+
+  if (minSupportingRoutes > 0) {
+    network.minimum_supporting_routes() = minSupportingRoutes;
+  }
+
+  auto cidr = folly::IPAddress::createNetwork(prefix);
+  localRoutes_[cidr] = std::move(network);
+}
+
+void E2ETestFixture::injectLocalRoutesAtRuntime(
+    const std::vector<std::string>& prefixes,
+    const std::vector<std::string>& communities,
+    uint32_t localPref) {
+  std::map<
+      facebook::neteng::fboss::bgp_attr::TIpPrefix,
+      facebook::neteng::fboss::bgp::thrift::TBgpAttributes>
+      routesToInject;
+
+  for (const auto& prefixStr : prefixes) {
+    auto cidr = folly::IPAddress::createNetwork(prefixStr);
+
+    /* Build TIpPrefix */
+    facebook::neteng::fboss::bgp_attr::TIpPrefix tPrefix;
+    auto binAddr = facebook::network::toBinaryAddress(cidr.first);
+    tPrefix.afi() = cidr.first.isV4()
+        ? facebook::neteng::fboss::bgp_attr::TBgpAfi::AFI_IPV4
+        : facebook::neteng::fboss::bgp_attr::TBgpAfi::AFI_IPV6;
+    tPrefix.num_bits() = cidr.second;
+    tPrefix.prefix_bin() = binAddr.addr()->toStdString();
+
+    /* Build TBgpAttributes */
+    facebook::neteng::fboss::bgp::thrift::TBgpAttributes attributes;
+
+    if (!communities.empty()) {
+      std::vector<facebook::neteng::fboss::bgp_attr::TBgpCommunity>
+          tCommunities;
+      for (const auto& commStr : communities) {
+        folly::small_vector<std::string_view, 2> parts;
+        folly::split(':', commStr, parts);
+        if (parts.size() == 2) {
+          facebook::neteng::fboss::bgp_attr::TBgpCommunity comm;
+          comm.asn() = folly::to<uint16_t>(parts[0]);
+          comm.value() = folly::to<uint16_t>(parts[1]);
+          tCommunities.push_back(comm);
+        }
+      }
+      attributes.communities() = std::move(tCommunities);
+    }
+
+    if (localPref != kLocalPref) {
+      attributes.local_pref() = localPref;
+    }
+
+    routesToInject[tPrefix] = std::move(attributes);
+  }
+
+  /* Inject routes into RIB */
+  rib_->injectLocalRoutes(routesToInject);
+}
+
+void E2ETestFixture::withdrawLocalRoutesAtRuntime(
+    const std::vector<std::string>& prefixes) {
+  std::set<facebook::neteng::fboss::bgp_attr::TIpPrefix> routesToWithdraw;
+
+  for (const auto& prefixStr : prefixes) {
+    auto cidr = folly::IPAddress::createNetwork(prefixStr);
+
+    /* Build TIpPrefix */
+    facebook::neteng::fboss::bgp_attr::TIpPrefix tPrefix;
+    auto binAddr = facebook::network::toBinaryAddress(cidr.first);
+    tPrefix.afi() = cidr.first.isV4()
+        ? facebook::neteng::fboss::bgp_attr::TBgpAfi::AFI_IPV4
+        : facebook::neteng::fboss::bgp_attr::TBgpAfi::AFI_IPV6;
+    tPrefix.num_bits() = cidr.second;
+    tPrefix.prefix_bin() = binAddr.addr()->toStdString();
+
+    routesToWithdraw.insert(tPrefix);
+  }
+
+  rib_->removeLocalRoutes(routesToWithdraw);
+}
+
+// ==================== POLICY CONFIGURATION ====================
+
+void E2ETestFixture::setPolicyConfig(const bgp_policy::BgpPolicies& policies) {
+  policyConfig_ = policies;
+}
+
+void E2ETestFixture::addPrefixDenyPolicy(
+    const std::vector<std::string>& prefixes) {
+  /*
+   * Create a policy that denies routes matching the specified prefixes.
+   * Structure:
+   *   Term 1: match prefix-list -> DENY
+   *   Term 2: match any -> PERMIT (implicit accept-all fallback)
+   */
+  std::vector<routing_policy::PrefixListEntry> prefixEntries;
+  for (const auto& prefixStr : prefixes) {
+    std::vector<routing_policy::CompareNumericValue> emptyLenRange;
+    auto entry = createPrefixListEntry(prefixStr, emptyLenRange);
+    prefixEntries.push_back(entry);
+  }
+
+  auto prefixMatch = createPrefixListMatch(prefixEntries);
+  auto denyAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::DENY);
+
+  auto denyTerm = createBgpPolicyTerm(
+      "deny-prefix",
+      "Deny matching prefixes",
+      {std::move(prefixMatch)},
+      {std::move(denyAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  /* Accept-all fallback term */
+  auto acceptAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT);
+  auto acceptTerm = createBgpPolicyTerm(
+      "accept-all",
+      "Accept all other routes",
+      {},
+      {std::move(acceptAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  policyConfig_ = createBgpPolicies(
+      "prefix-deny-policy", {std::move(denyTerm), std::move(acceptTerm)});
+  ingressPolicyName_ = "prefix-deny-policy";
+}
+
+void E2ETestFixture::addCommunityDenyPolicy(const std::string& community) {
+  /*
+   * Create a policy that denies routes matching the specified community.
+   */
+  auto communityMatch = createBgpPolicyAtomicMatch(
+      bgp_policy::BgpPolicyAtomicMatchType::COMMUNITY_LIST, {community});
+  auto denyAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::DENY);
+
+  auto denyTerm = createBgpPolicyTerm(
+      "deny-community",
+      "Deny routes with matching community",
+      {std::move(communityMatch)},
+      {std::move(denyAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  /* Accept-all fallback term */
+  auto acceptAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT);
+  auto acceptTerm = createBgpPolicyTerm(
+      "accept-all",
+      "Accept all other routes",
+      {},
+      {std::move(acceptAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  policyConfig_ = createBgpPolicies(
+      "community-deny-policy", {std::move(denyTerm), std::move(acceptTerm)});
+  ingressPolicyName_ = "community-deny-policy";
+}
+
+void E2ETestFixture::addCommunitySetLocalPrefPolicy(
+    const std::string& matchCommunity,
+    uint32_t localPref) {
+  /*
+   * Create a policy that sets local preference for routes matching a community.
+   */
+  auto communityMatch = createBgpPolicyAtomicMatch(
+      bgp_policy::BgpPolicyAtomicMatchType::COMMUNITY_LIST, {matchCommunity});
+  auto setLpAction = createActionSetLocalPreference(localPref);
+  auto acceptAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT);
+
+  auto matchTerm = createBgpPolicyTerm(
+      "set-localpref",
+      "Set local preference for matching community",
+      {std::move(communityMatch)},
+      {std::move(setLpAction), std::move(acceptAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  /* Accept-all fallback term */
+  auto acceptAllAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT);
+  auto acceptTerm = createBgpPolicyTerm(
+      "accept-all",
+      "Accept all other routes",
+      {},
+      {std::move(acceptAllAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  policyConfig_ = createBgpPolicies(
+      "community-setlp-policy", {std::move(matchTerm), std::move(acceptTerm)});
+  ingressPolicyName_ = "community-setlp-policy";
+}
+
+bool E2ETestFixture::waitForRouteInShadowRib(
+    const folly::CIDRNetwork& prefix,
+    std::optional<folly::IPAddress> fromPeer,
+    int maxRetries) {
+  if (!peerManager_) {
+    XLOG(
+        ERR,
+        "PeerManager must be created before calling waitForRouteInShadowRib");
+    return false;
+  }
+
+  auto& evb = peerManager_->getEventBase();
+  bool found = false;
+
+  /*
+   * Use deterministic retry loop instead of sleep
+   * This matches the pattern used in readOutboundUpdateToPeer()
+   */
+  WITH_RETRIES_N(maxRetries, {
+    /*
+     * Run the check on PeerManager's event base thread
+     * This is thread-safe because shadowRibEntries_ is only accessed
+     * from PeerManager's event base
+     */
+    found = folly::via(
+                &evb,
+                [this, prefix, fromPeer]() -> bool {
+                  auto it = peerManager_->shadowRibEntries_.find(prefix);
+                  if (it == peerManager_->shadowRibEntries_.end()) {
+                    return false;
+                  }
+                  /*
+                   * If fromPeer is specified, check that the bestpath
+                   * is from that specific peer
+                   */
+                  if (fromPeer.has_value()) {
+                    const auto& entry = it->second->get();
+                    if (!entry.bestpath) {
+                      return false;
+                    }
+                    return entry.bestpath->peer.addr == fromPeer.value();
+                  }
+                  return true;
+                })
+                .wait()
+                .value();
+
+    EXPECT_EVENTUALLY_TRUE(found);
+  });
+
+  if (found) {
+    if (fromPeer.has_value()) {
+      XLOGF(
+          DBG2,
+          "Route {} from peer {} found in shadowRIB",
+          folly::IPAddress::networkToString(prefix),
+          fromPeer.value().str());
+    } else {
+      XLOGF(
+          DBG2,
+          "Route {} found in shadowRIB",
+          folly::IPAddress::networkToString(prefix));
+    }
+  } else {
+    if (fromPeer.has_value()) {
+      XLOGF(
+          WARN,
+          "Route {} from peer {} NOT found in shadowRIB after {} retries",
+          folly::IPAddress::networkToString(prefix),
+          fromPeer.value().str(),
+          maxRetries);
+    } else {
+      XLOGF(
+          WARN,
+          "Route {} NOT found in shadowRIB after {} retries",
+          folly::IPAddress::networkToString(prefix),
+          maxRetries);
+    }
+  }
+
+  return found;
+}
+
+bool E2ETestFixture::verifyRouteNotInShadowRib(
+    const folly::CIDRNetwork& prefix,
+    int waitRetries) {
+  if (!peerManager_) {
+    XLOG(
+        ERR,
+        "PeerManager must be created before calling verifyRouteNotInShadowRib");
+    return false;
+  }
+
+  auto& evb = peerManager_->getEventBase();
+
+  /*
+   * Wait for the route to NOT be present in shadowRib. With change list
+   * tracker and backpressure enabled, there can be a delay between the
+   * RIB processing a withdrawal and PeerManager updating shadowRib.
+   * Retry until the route disappears or retries are exhausted.
+   */
+  for (int i = 0; i < waitRetries; ++i) {
+    bool found = folly::via(
+                     &evb,
+                     [this, prefix]() -> bool {
+                       return peerManager_->shadowRibEntries_.find(prefix) !=
+                           peerManager_->shadowRibEntries_.end();
+                     })
+                     .wait()
+                     .value();
+
+    if (!found) {
+      XLOGF(
+          DBG2,
+          "Route {} correctly NOT found in shadowRIB on retry {}",
+          folly::IPAddress::networkToString(prefix),
+          i);
+      return true;
+    }
+
+    // NOLINTNEXTLINE(facebook-hte-BadCall-sleep_for)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  XLOGF(
+      WARN,
+      "Route {} still found in shadowRIB after {} retries",
+      folly::IPAddress::networkToString(prefix),
+      waitRetries);
+  return false;
+}
+
+bool E2ETestFixture::waitForPathCountInRib(
+    const std::string& prefixStr,
+    size_t minPathCount,
+    int maxRetries) {
+  if (!rib_) {
+    XLOG(ERR, "RIB must be created before calling waitForPathCountInRib");
+    return false;
+  }
+
+  bool found = false;
+
+  WITH_RETRIES_N(maxRetries, {
+    auto ribEntries =
+        rib_->getRibEntryForPrefix(std::make_unique<std::string>(prefixStr));
+    if (!ribEntries.empty()) {
+      size_t totalPaths = 0;
+      for (const auto& [key, paths] : *ribEntries[0].paths()) {
+        totalPaths += paths.size();
+      }
+      found = (totalPaths >= minPathCount);
+    }
+    EXPECT_EVENTUALLY_TRUE(found);
+  });
+
+  if (found) {
+    XLOGF(
+        DBG2, "Route {} has at least {} paths in RIB", prefixStr, minPathCount);
+  } else {
+    XLOGF(
+        WARN,
+        "Route {} does NOT have {} paths in RIB after {} retries",
+        prefixStr,
+        minPathCount,
+        maxRetries);
+  }
+
+  return found;
+}
+
+bool E2ETestFixture::waitForRouteWithdrawnFromRib(
+    const std::string& prefixStr,
+    int maxRetries) {
+  if (!rib_) {
+    XLOG(
+        ERR, "RIB must be created before calling waitForRouteWithdrawnFromRib");
+    return false;
+  }
+
+  bool withdrawn = false;
+
+  WITH_RETRIES_N(maxRetries, {
+    auto ribEntries =
+        rib_->getRibEntryForPrefix(std::make_unique<std::string>(prefixStr));
+    if (ribEntries.empty()) {
+      withdrawn = true;
+    } else {
+      size_t totalPaths = 0;
+      for (const auto& [key, paths] : *ribEntries[0].paths()) {
+        totalPaths += paths.size();
+      }
+      withdrawn = (totalPaths == 0);
+    }
+    EXPECT_EVENTUALLY_TRUE(withdrawn);
+  });
+
+  if (withdrawn) {
+    XLOGF(DBG2, "Route {} withdrawn from RIB", prefixStr);
+  } else {
+    XLOGF(
+        WARN,
+        "Route {} still has paths in RIB after {} retries",
+        prefixStr,
+        maxRetries);
+  }
+
+  return withdrawn;
+}
+
+size_t E2ETestFixture::getMultipathNexthopCount(const std::string& prefixStr) {
+  if (!rib_) {
+    XLOG(ERR, "RIB must be created before calling getMultipathNexthopCount");
+    return 0;
+  }
+
+  size_t nexthopCount = 0;
+  auto prefix = folly::IPAddress::createNetwork(prefixStr);
+
+  rib_->getEventBase().runInEventBaseThreadAndWait([&]() {
+    auto ribEntry = rib_->ribEntries_.find(prefix);
+    if (ribEntry != rib_->ribEntries_.end()) {
+      auto weightedNexthops = ribEntry->second.getMultipathWeightedNexthops();
+      if (weightedNexthops) {
+        nexthopCount = weightedNexthops->size();
+      }
+    }
+  });
+
+  return nexthopCount;
+}
+
+bool E2ETestFixture::waitForMultipathNexthopCount(
+    const std::string& prefixStr,
+    size_t minNexthops,
+    int maxRetries) {
+  if (!rib_) {
+    XLOG(
+        ERR, "RIB must be created before calling waitForMultipathNexthopCount");
+    return false;
+  }
+
+  bool found = false;
+  auto prefix = folly::IPAddress::createNetwork(prefixStr);
+
+  WITH_RETRIES_N(maxRetries, {
+    size_t nexthopCount = 0;
+    rib_->getEventBase().runInEventBaseThreadAndWait([&]() {
+      auto ribEntry = rib_->ribEntries_.find(prefix);
+      if (ribEntry != rib_->ribEntries_.end()) {
+        auto weightedNexthops = ribEntry->second.getMultipathWeightedNexthops();
+        if (weightedNexthops) {
+          nexthopCount = weightedNexthops->size();
+        }
+      }
+    });
+    found = (nexthopCount >= minNexthops);
+    EXPECT_EVENTUALLY_TRUE(found);
+  });
+
+  if (found) {
+    XLOGF(
+        DBG2,
+        "Route {} has at least {} multipath nexthops",
+        prefixStr,
+        minNexthops);
+  } else {
+    XLOGF(
+        WARN,
+        "Route {} does NOT have {} multipath nexthops after {} retries",
+        prefixStr,
+        minNexthops,
+        maxRetries);
+  }
+
+  return found;
+}
+
+std::map<folly::IPAddress, uint32_t> E2ETestFixture::getWeightedNexthops(
+    const std::string& prefixStr) {
+  std::map<folly::IPAddress, uint32_t> result;
+
+  if (!rib_) {
+    XLOG(ERR, "RIB must be created before calling getWeightedNexthops");
+    return result;
+  }
+
+  auto prefix = folly::IPAddress::createNetwork(prefixStr);
+
+  rib_->getEventBase().runInEventBaseThreadAndWait([&]() {
+    auto ribEntry = rib_->ribEntries_.find(prefix);
+    if (ribEntry != rib_->ribEntries_.end()) {
+      auto weightedNexthops = ribEntry->second.getMultipathWeightedNexthops();
+      if (weightedNexthops) {
+        for (const auto& [nexthop, weight] : *weightedNexthops) {
+          result[nexthop] = weight;
+        }
+      }
+    }
+  });
+
+  return result;
+}
+
+// ==================== COMPONENT LIFECYCLE ====================
+
+void E2ETestFixture::TearDown() {
+  XLOG(INFO, "=== TearDown starting ===");
+
+  /*
+   * Flush the PeerManager event base before inspecting any peer/queue
+   * state from the test thread. Without this, in-flight evb writes
+   * (e.g. SCHEDULED_PUSH_TO_PEER flag clears in deferredPushToPeer
+   * SCOPE_EXIT) can race the test-thread reads of queue size / isBlocked
+   * a few lines below, causing TSan reports that mark the test as flaky.
+   */
+  if (peerManager_) {
+    peerManager_->getEventBase().runInEventBaseThreadAndWait([] {});
+  }
+
+  auto allQueues = getAllPeerQueues();
+
+  /* Log the state of all peers before termination */
+  for (const auto& [peerId, queues] : allQueues) {
+    const bool useBoundedQueue =
+        FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+    size_t queueSize = useBoundedQueue ? queues.boundedAdjRibOutQ->size()
+                                       : queues.adjRibOutQ->size();
+    bool isBlocked = useBoundedQueue && queues.boundedAdjRibOutQ->isBlocked();
+    XLOGF(
+        INFO,
+        "TearDown: peer {} queueSize={} isBlocked={}",
+        peerId.peerAddr.str(),
+        queueSize,
+        isBlocked);
+  }
+
+  /*
+   * CRITICAL FIX: Close all bounded queues BEFORE sending BgpSessionStop.
+   *
+   * This breaks the circular reference deadlock:
+   * - deferredPushToPeer() coroutine holds shared_ptr<AdjRib>
+   * - AdjRib holds shared_ptr<AdjRibOutGroup>
+   * - AdjRibOutGroup owns the coroutine on asyncScope_
+   * - Coroutine is suspended at waitToPush()
+   *
+   * By closing the queue first, we wake up the suspended coroutine.
+   * The coroutine exits, releases the shared_ptr<AdjRib>, breaking the cycle.
+   */
+  XLOG(INFO, "TearDown: Closing all bounded queues to wake up waiters");
+  for (const auto& [peerId, queues] : allQueues) {
+    if (queues.boundedAdjRibOutQ) {
+      queues.boundedAdjRibOutQ->close();
+      XLOGF(
+          INFO,
+          "TearDown: Closed bounded queue for peer {}",
+          peerId.peerAddr.str());
+    }
+  }
+
+  /* Terminate peer sessions */
+  XLOG(INFO, "TearDown: Sending BgpSessionStop to all peers");
+  for (const auto& [peerId, queues] : allQueues) {
+    XLOGF(
+        INFO,
+        "TearDown: Sending BgpSessionStop to peer {}",
+        peerId.peerAddr.str());
+    queues.adjRibInQ->fiberPush(FiberBgpPeer::BgpSessionStop{});
+  }
+
+  /* Stop PeerManager */
+  XLOG(INFO, "TearDown: Stopping PeerManager");
+  if (peerManager_) {
+    peerManager_->stop();
+    XLOG(INFO, "TearDown: PeerManager stop() returned, joining thread");
+    if (peerMgrThread_.joinable()) {
+      peerMgrThread_.join();
+    }
+    XLOG(INFO, "TearDown: PeerManager thread joined");
+  }
+
+  /* Stop SessionManager */
+  XLOG(INFO, "TearDown: Stopping SessionManager");
+  if (sessionManager_) {
+    sessionManager_->stop();
+    if (sessionMgrThread_ && sessionMgrThread_->joinable()) {
+      sessionMgrThread_->join();
+    }
+    XLOG(INFO, "TearDown: SessionManager thread joined");
+  }
+
+  /* Stop RIB */
+  XLOG(INFO, "TearDown: Stopping RIB");
+  if (rib_) {
+    rib_->stop();
+    if (ribThread_.joinable()) {
+      ribThread_.join();
+    }
+    XLOG(INFO, "TearDown: RIB thread joined");
+  }
+
+  peerManager_.reset();
+  sessionManager_.reset();
+  rib_.reset();
+
+  XLOG(INFO, "=== TearDown complete ===");
+}
+
+void E2ETestFixture::createRib(
+    bool enableNexthopTracking,
+    const std::unordered_map<folly::CIDRNetwork, thrift::BgpNetwork>&
+        localRoutes) {
+  XLOG(INFO, "=== Creating RIB... ===");
+  XLOGF(
+      INFO,
+      "Nexthop tracking: {}",
+      enableNexthopTracking ? "enabled" : "disabled");
+
+  // Store the nexthop tracking setting so it can be reused by createPeerManager
+  enableNexthopTracking_ = enableNexthopTracking;
+
+  /*
+   * If a policy is configured, set the ingress policy name on all peers.
+   * This must be done before getConfig() creates the Config object.
+   */
+  if (ingressPolicyName_.has_value()) {
+    for (auto& peer : peers_) {
+      peer.ingress_policy_name() = *ingressPolicyName_;
+    }
+    XLOGF(
+        INFO,
+        "Set ingress policy '{}' on {} peers",
+        *ingressPolicyName_,
+        peers_.size());
+  }
+
+  /* Get config - uses enableNexthopTracking_ and enableComputeUcmpFromLbw_ */
+  auto bgpConfig = getConfig();
+  auto globalConfig = bgpConfig->getBgpGlobalConfig();
+  ASSERT_NE(globalConfig, nullptr);
+
+  /*
+   * Use provided localRoutes if non-empty, otherwise use member variable
+   * This allows both explicit passing and using addLocalRoute()
+   */
+  const auto& routesToUse = localRoutes.empty() ? localRoutes_ : localRoutes;
+
+  // Create NexthopCache if nexthop tracking is enabled
+  std::shared_ptr<NexthopCache> nexthopCache = nullptr;
+  if (enableNexthopTracking) {
+    nexthopCache = std::make_shared<NexthopCache>();
+    XLOG(INFO, "Created NexthopCache for nexthop tracking");
+  }
+
+  // Create a new BgpGlobalConfig with nexthop tracking if needed
+  std::shared_ptr<BgpGlobalConfig> modifiedGlobalConfig;
+  if (enableNexthopTracking && !globalConfig->enableNextHopTracking) {
+    // Need to create new config with nexthop tracking enabled
+    modifiedGlobalConfig = std::make_shared<BgpGlobalConfig>(
+        globalConfig->localAsn,
+        globalConfig->routerId,
+        globalConfig->clusterId,
+        globalConfig->holdTime,
+        globalConfig->listenAddr,
+        globalConfig->grRestartTime,
+        globalConfig->networksV4,
+        globalConfig->networksV6,
+        globalConfig->localConfedAsn,
+        globalConfig->computeUcmpFromLbwComm,
+        globalConfig->ucmpWidth,
+        globalConfig->ucmpQuantizer,
+        globalConfig->validateRemoteAs,
+        globalConfig->supportStatefulGr,
+        globalConfig->enableServerSocket,
+        globalConfig->allowLoopbackReflection,
+        globalConfig->countConfedsInAsPathLen,
+        globalConfig->communityToClassId,
+        globalConfig->deviceName,
+        globalConfig->switchLimitConfig,
+        globalConfig->dynamicPeerLimit,
+        globalConfig->streamSubscriberLimit,
+        EnableNexthopTracking{true}); // Enable nexthop tracking
+  } else {
+    modifiedGlobalConfig =
+        std::const_pointer_cast<BgpGlobalConfig>(globalConfig);
+  }
+
+  /* Create TestRib */
+  rib_ = std::make_unique<TestRib>(
+      routesToUse,
+      *modifiedGlobalConfig,
+      policyConfig_,
+      ribInQ_,
+      ribOutQ_,
+      kDevPlatform,
+      nexthopCache);
+
+  rib_->createFib();
+
+  /* Start RIB thread using runInThread() */
+  ribThread_ = rib_->runInThread();
+
+  rib_->getEventBase().waitUntilRunning();
+  XLOG(INFO, "RIB running");
+}
+
+namespace {
+
+BgpPeerDisplayInfo createDisplayInfo(
+    const BgpPeerId& peerId,
+    const BgpCommonPeerGroupConfig& cfg,
+    const std::shared_ptr<const BgpGlobalConfig>& globalConfig,
+    const std::optional<nettools::bgplib::BgpAddPathSendRec>& addPathCapa =
+        std::nullopt,
+    std::optional<uint16_t> grRestartTimeSeconds = std::nullopt) {
+  BgpPeerDisplayInfo displayInfo;
+  displayInfo.peeringParams.peerAddr = peerId.peerAddr;
+  displayInfo.peeringParams.remoteAs = cfg.peerAsn;
+  displayInfo.peeringParams.localAs =
+      cfg.localAsn.value_or(globalConfig->localAsn);
+  displayInfo.peeringParams.globalAs = globalConfig->localAsn;
+  /*
+   * Confederation plumbing — mirror production Config::getPeeringParamsHelper
+   * (Config.cpp ~lines 1011-1021). Without this, getBgpSessionType() classifies
+   * confed peers as plain EBGP and tests for ConfedEBGP semantics
+   * (e.g., NO_EXPORT allowed to ConfedEBGP per RFC 1997) fail.
+   */
+  displayInfo.peeringParams.isConfedPeer =
+      ConfedPeerConfigured{cfg.isConfedPeer.value_or(false)};
+  if (displayInfo.peeringParams.isConfedPeer &&
+      globalConfig->localConfedAsn.has_value()) {
+    displayInfo.peeringParams.localConfedAs = *globalConfig->localConfedAsn;
+    displayInfo.peeringParams.asConfedId =
+        cfg.localAsn.value_or(globalConfig->localAsn);
+    displayInfo.peeringParams.localAs = *globalConfig->localConfedAsn;
+  }
+  /*
+   * Route-Reflector client plumbing — production parses peer.is_rr_client
+   * (Config.cpp:518) into the per-peer BgpCommonPeerGroupConfig, which we
+   * propagate here so tests can exercise RR-aware code paths.
+   */
+  displayInfo.peeringParams.isRrClient =
+      RrClientConfigured{cfg.isRrClient.value_or(false)};
+  displayInfo.peeringParams.localBgpId = globalConfig->routerId.asV4();
+  displayInfo.peeringParams.holdTime =
+      cfg.holdTime.value_or(std::chrono::seconds(90));
+  displayInfo.peeringParams.description = cfg.description.value_or("");
+  displayInfo.peeringParams.isAfiIpv4Configured = true;
+  displayInfo.peeringParams.isAfiIpv6Configured = true;
+  displayInfo.peeringParams.nexthopV4 = cfg.nexthopV4;
+  displayInfo.peeringParams.nexthopV6 = cfg.nexthopV6;
+  displayInfo.peeringParams.advertiseLinkBandwidth = cfg.advertiseLinkBandwidth;
+  displayInfo.peeringParams.receiveLinkBandwidth = cfg.receiveLinkBandwidth;
+  displayInfo.peeringParams.linkBandwidthBps = cfg.linkBandwidthBps;
+  displayInfo.remoteBgpId = peerId.remoteBgpId;
+  displayInfo.negotiatedCapabilities.mpExtV4Unicast() = true;
+  displayInfo.negotiatedCapabilities.mpExtV6Unicast() = true;
+  /* Enable 4-byte ASN capability (most common at Meta, required for ASNs >
+   * 65535) */
+  displayInfo.negotiatedCapabilities.as4byte() = true;
+
+  /*
+   * Enable GR capability for tests that opt in via setPeerGrRestartTime().
+   * Without this, AdjRib::sessionTerminated() with gracefulRestart=true
+   * still falls into the immediate-purge branch (remoteGrRestartTime_ == 0s).
+   */
+  if (grRestartTimeSeconds.has_value()) {
+    displayInfo.negotiatedCapabilities.gracefulRestart() = true;
+    displayInfo.negotiatedCapabilities.restartTime() =
+        grRestartTimeSeconds.value();
+    displayInfo.remoteGrRestartTime = grRestartTimeSeconds.value();
+  }
+
+  /* Set ADD-PATH capabilities if enabled for this peer */
+  if (addPathCapa.has_value()) {
+    nettools::bgplib::BgpAddPathCapability v4AddPath;
+    v4AddPath.afi() = nettools::bgplib::BgpUpdateAfi::AFI_IPv4;
+    v4AddPath.safi() = nettools::bgplib::BgpUpdateSafi::SAFI_UNICAST;
+    v4AddPath.sor() = addPathCapa.value();
+
+    nettools::bgplib::BgpAddPathCapability v6AddPath;
+    v6AddPath.afi() = nettools::bgplib::BgpUpdateAfi::AFI_IPv6;
+    v6AddPath.safi() = nettools::bgplib::BgpUpdateSafi::SAFI_UNICAST;
+    v6AddPath.sor() = addPathCapa.value();
+
+    displayInfo.negotiatedCapabilities.addPathCapabilities()->push_back(
+        v4AddPath);
+    displayInfo.negotiatedCapabilities.addPathCapabilities()->push_back(
+        v6AddPath);
+  }
+
+  return displayInfo;
+}
+
+} // namespace
+
+void E2ETestFixture::createPeerManager(
+    bool enableUpdateGroup,
+    bool enableEgressBackpressure,
+    bool enableSerializeGroupPdu) {
+  XLOG(INFO, "=== Creating PeerManager... ===");
+
+  FLAGS_enable_egress_backpressure_in_peer_mgr_tests = enableEgressBackpressure;
+
+  /* Get config with dynamic peers */
+  config_ = getConfig(enableUpdateGroup, enableSerializeGroupPdu);
+  auto globalConfig = config_->getBgpGlobalConfig();
+  ASSERT_NE(globalConfig, nullptr);
+
+  /* Create MockSessionManager */
+  sessionManager_ = std::make_shared<MockSessionManager>(*globalConfig, true);
+  sessionMgrThread_ =
+      std::make_shared<std::thread>(sessionManager_->runInThread());
+
+  /* Create PeerManager */
+  configManager_ = std::make_shared<ConfigManager>(config_);
+
+  /*
+   * Create PolicyManager if policy config is set.
+   * This enables policy-based E2E tests (deny, attribute modification, etc.)
+   */
+  std::shared_ptr<PolicyManager> policyManager = nullptr;
+  if (policyConfig_.has_value()) {
+    policyManager =
+        std::make_shared<PolicyManager>(*policyConfig_, globalConfig.get());
+    XLOG(INFO, "Created PolicyManager for E2E policy tests");
+  }
+
+  peerManager_ = std::make_unique<PeerManager>(
+      configManager_, policyManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
+
+  peerManager_->setSessionManager(sessionManager_);
+
+  /* Start PeerManager thread */
+  peerMgrThread_ = std::thread([this]() {
+    XLOG(INFO, "PeerManager thread started");
+    peerManager_->run();
+    XLOG(INFO, "PeerManager thread exiting");
+  });
+
+  peerManager_->getEventBase().waitUntilRunning();
+  XLOG(INFO, "PeerManager running");
+}
+
+void E2ETestFixture::establishSession(
+    const BgpPeerId& peerId,
+    uint64_t versionNumber) {
+  XLOGF(
+      INFO, "=== Establishing session for peer: {} ===", peerId.peerAddr.str());
+
+  auto adjRibInQ = std::make_shared<AdjRib::AdjRibInQueueT>();
+  auto adjRibOutQ = std::make_shared<AdjRib::AdjRibOutQueueT>();
+  auto boundedAdjRibOutQ = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
+      defaultQueueCapacity_, defaultQueueHighWm_, defaultQueueLowWm_);
+
+  XLOGF(
+      INFO,
+      "Test created bounded queue {} for peer {} (capacity={}, highWm={}, lowWm={})",
+      (void*)boundedAdjRibOutQ.get(),
+      peerId.peerAddr.str(),
+      defaultQueueCapacity_,
+      defaultQueueHighWm_,
+      defaultQueueLowWm_);
+
+  peerQueues_[peerId] = {adjRibInQ, adjRibOutQ, boundedAdjRibOutQ};
+  auto currentVersion = std::make_shared<VersionNumber>(versionNumber);
+
+  // Get peer configuration to populate peeringParams
+  auto peerConfig = config_->getConfigOfAPeer(peerId.peerAddr);
+  ASSERT_TRUE(peerConfig.has_value())
+      << "Peer config not found for " << peerId.peerAddr.str();
+
+  auto& cfg = peerConfig.value();
+  auto globalConfig = config_->getBgpGlobalConfig();
+
+  /* Look up ADD-PATH capability for this peer */
+  std::optional<nettools::bgplib::BgpAddPathSendRec> addPathCapa = std::nullopt;
+  auto addPathIt = peerAddPathCapabilities_.find(peerId.peerAddr);
+  if (addPathIt != peerAddPathCapabilities_.end()) {
+    addPathCapa = addPathIt->second;
+  }
+
+  auto displayInfo = createDisplayInfo(
+      peerId, cfg, globalConfig, addPathCapa, peerGrRestartTimeSeconds_);
+
+  auto sessionInfo = FiberBgpPeer::getObservableSessionInfo(
+      displayInfo,
+      std::move(adjRibOutQ),
+      std::move(boundedAdjRibOutQ),
+      std::move(adjRibInQ),
+      currentVersion);
+
+  FiberBgpPeer::ObservableStateT stateEvent{
+      .peerId = peerId,
+      .state = BgpSessionState::ESTABLISHED,
+      .versionNumber = versionNumber,
+      .sessionInfo = std::move(sessionInfo)};
+
+  auto& evb = peerManager_->getEventBase();
+  folly::via(&evb, [this, stateEvent = std::move(stateEvent)]() mutable {
+    folly::coro::blockingWait(
+        peerManager_->sessionEstablished(std::move(stateEvent)));
+  }).wait();
+
+  XLOGF(INFO, "Session established for peer: {}", peerId.peerAddr.str());
+}
+
+void E2ETestFixture::dispatchStaleSessionEstablished(
+    const folly::IPAddress& peerAddr) {
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  XLOGF(
+      INFO,
+      "=== Dispatching stale sessionEstablished for peer: {} ===",
+      peerAddr.str());
+
+  auto adjRibInQ = std::make_shared<AdjRib::AdjRibInQueueT>();
+  auto adjRibOutQ = std::make_shared<AdjRib::AdjRibOutQueueT>();
+  auto boundedAdjRibOutQ = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
+      defaultQueueCapacity_, defaultQueueHighWm_, defaultQueueLowWm_);
+
+  // Create VersionNumber with an initial value
+  uint64_t staleVersionNumber = 42;
+  auto currentVersion = std::make_shared<VersionNumber>(staleVersionNumber);
+
+  auto peerConfig = config_->getConfigOfAPeer(peerAddr);
+  ASSERT_TRUE(peerConfig.has_value())
+      << "Peer config not found for " << peerAddr.str();
+  auto& cfg = peerConfig.value();
+  auto globalConfig = config_->getBgpGlobalConfig();
+  auto displayInfo = createDisplayInfo(peerId, cfg, globalConfig, std::nullopt);
+
+  auto sessionInfo = FiberBgpPeer::getObservableSessionInfo(
+      displayInfo,
+      std::move(adjRibOutQ),
+      std::move(boundedAdjRibOutQ),
+      std::move(adjRibInQ),
+      currentVersion);
+
+  FiberBgpPeer::ObservableStateT staleEvent{
+      .peerId = peerId,
+      .state = BgpSessionState::ESTABLISHED,
+      .versionNumber = staleVersionNumber, // captured before bump
+      .sessionInfo = std::move(sessionInfo)};
+
+  // Simulate FiberBgpPeer bumping the version for a new session incarnation.
+  // Now currentVersion->getWithoutLock() != staleVersionNumber, causing
+  // the version check inside sessionEstablished() to fail -> early return.
+  // Critically, the baton is NOT reset on early return (latch stays posted).
+  currentVersion->bumpUp();
+
+  auto& evb = peerManager_->getEventBase();
+  folly::via(&evb, [this, staleEvent = std::move(staleEvent)]() mutable {
+    folly::coro::blockingWait(
+        peerManager_->sessionEstablished(std::move(staleEvent)));
+  }).wait();
+
+  XLOGF(
+      INFO,
+      "Stale sessionEstablished dispatched (early return expected) for peer: {}",
+      peerAddr.str());
+}
+
+void E2ETestFixture::sendUpdateToPeer(
+    const BgpPeerId& peerId,
+    const folly::CIDRNetwork& prefix) {
+  XLOGF(
+      INFO,
+      "=== Sending UPDATE to peer {} for prefix {} ===",
+      peerId.peerAddr.str(),
+      prefix.first.str());
+
+  auto queues = getPeerQueues(peerId);
+  ASSERT_TRUE(queues.has_value())
+      << "No queues for peer " << peerId.peerAddr.str();
+
+  auto update = createV4BgpUpdateSingleAnnounce(
+      prefix, kV4Nexthop1, kMed, kOriginatorId, BgpAttrOrigin::BGP_ORIGIN_EGP);
+
+  queues->adjRibInQ->fiberPush(std::move(update));
+}
+
+void E2ETestFixture::sendEoRToPeer(const BgpPeerId& peerId) {
+  XLOGF(INFO, "Sending EoR to peer: {}", peerId.peerAddr.str());
+  auto queues = getPeerQueues(peerId);
+  ASSERT_TRUE(queues.has_value())
+      << "No queues for peer " << peerId.peerAddr.str();
+  queues->adjRibInQ->fiberPush(BgpEndOfRib{});
+}
+
+// ==================== HELPER FUNCTIONS FOR QUEUE/MESSAGE HANDLING
+// ====================
+
+namespace {
+
+bool isIpv4Protocol(const std::string& protocol) {
+  return protocol == "v4" || protocol == "V4" || protocol == "ipv4";
+}
+
+bool isValidProtocol(const std::string& protocol) {
+  return isIpv4Protocol(protocol) || protocol == "v6" || protocol == "V6" ||
+      protocol == "ipv6";
+}
+
+using QueueMessage = std::variant<
+    std::shared_ptr<const BgpUpdate2>,
+    nettools::bgplib::UpdateDescriptor,
+    BgpEndOfRib,
+    nettools::bgplib::BgpRouteRefresh,
+    nettools::bgplib::BgpNotification>;
+
+std::optional<QueueMessage> popFromQueue(
+    const E2ETestFixture::PeerQueues& queues,
+    bool useBoundedQueue) {
+  try {
+    if (useBoundedQueue) {
+      XLOGF(
+          INFO,
+          "Test READING from QUEUE POINTER {}",
+          (void*)queues.boundedAdjRibOutQ.get());
+      return folly::coro::blockingWait(queues.boundedAdjRibOutQ->pop());
+    } else {
+      XLOGF(
+          INFO,
+          "Test READING from QUEUE POINTER {}",
+          (void*)queues.adjRibOutQ.get());
+      return folly::coro::blockingWait(queues.adjRibOutQ->pop());
+    }
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+bool isUpdateMessage(const QueueMessage& msg) {
+  return std::holds_alternative<std::shared_ptr<const BgpUpdate2>>(msg) ||
+      std::holds_alternative<nettools::bgplib::UpdateDescriptor>(msg);
+}
+
+bool isEoRMessage(const QueueMessage& msg) {
+  if (std::holds_alternative<BgpEndOfRib>(msg)) {
+    return true;
+  }
+  if (auto* updatePtr = std::get_if<std::shared_ptr<const BgpUpdate2>>(&msg)) {
+    return isEoRUpdate(**updatePtr);
+  }
+  return false;
+}
+
+/*
+ * Helper to convert IPPrefix thrift struct to folly::CIDRNetwork for display
+ */
+folly::CIDRNetwork ipPrefixToCIDR(
+    const facebook::network::thrift::IPPrefix& prefix) {
+  return facebook::network::toCIDRNetwork(prefix);
+}
+
+/*
+ * Log BgpUpdate2 contents for debugging
+ */
+void logBgpUpdate(const BgpUpdate2& update, const std::string& context = "") {
+  std::string logMsg = context.empty() ? "BgpUpdate2:" : context + ":";
+
+  /* Log V4 announced prefixes */
+  if (!update.v4Announced2()->empty()) {
+    logMsg += fmt::format(
+        "\n  V4 Announced: {} prefixes", update.v4Announced2()->size());
+    for (const auto& prefix : *update.v4Announced2()) {
+      auto cidr = ipPrefixToCIDR(*prefix.prefix());
+      logMsg +=
+          fmt::format("\n    {}", folly::IPAddress::networkToString(cidr));
+      if (prefix.pathId()) {
+        logMsg += fmt::format(" (pathId={})", *prefix.pathId());
+      }
+    }
+  }
+
+  /* Log MP announced prefixes (v6 or v4) */
+  if (!update.mpAnnounced()->prefixes()->empty()) {
+    logMsg += fmt::format(
+        "\n  MP Announced: {} prefixes (AFI={}, SAFI={})",
+        update.mpAnnounced()->prefixes()->size(),
+        static_cast<int>(*update.mpAnnounced()->afi()),
+        static_cast<int>(*update.mpAnnounced()->safi()));
+    for (const auto& prefix : *update.mpAnnounced()->prefixes()) {
+      auto cidr = ipPrefixToCIDR(*prefix.prefix());
+      logMsg +=
+          fmt::format("\n    {}", folly::IPAddress::networkToString(cidr));
+      if (prefix.pathId()) {
+        logMsg += fmt::format(" (pathId={})", *prefix.pathId());
+      }
+    }
+    if (!update.mpAnnounced()->nexthop()->addr()->empty()) {
+      try {
+        auto nexthopBytes = update.mpAnnounced()->nexthop()->addr().value();
+        auto nexthopIp = folly::IPAddress::fromBinary(
+            folly::ByteRange(
+                reinterpret_cast<const unsigned char*>(nexthopBytes.data()),
+                nexthopBytes.size()));
+        logMsg += fmt::format("\n    MP Nexthop: {}", nexthopIp.str());
+      } catch (const std::exception& e) {
+        logMsg += fmt::format("\n    MP Nexthop: <parse error: {}>", e.what());
+      }
+    }
+  }
+
+  /* Log V4 withdrawn prefixes */
+  if (!update.v4Withdrawn2()->empty()) {
+    logMsg += fmt::format(
+        "\n  V4 Withdrawn: {} prefixes", update.v4Withdrawn2()->size());
+    for (const auto& prefix : *update.v4Withdrawn2()) {
+      auto cidr = ipPrefixToCIDR(*prefix.prefix());
+      logMsg +=
+          fmt::format("\n    {}", folly::IPAddress::networkToString(cidr));
+      if (prefix.pathId()) {
+        logMsg += fmt::format(" (pathId={})", *prefix.pathId());
+      }
+    }
+  }
+
+  /* Log MP withdrawn prefixes (v6) */
+  if (!update.mpWithdrawn()->prefixes()->empty()) {
+    logMsg += fmt::format(
+        "\n  MP Withdrawn: {} prefixes",
+        update.mpWithdrawn()->prefixes()->size());
+    for (const auto& prefix : *update.mpWithdrawn()->prefixes()) {
+      auto cidr = ipPrefixToCIDR(*prefix.prefix());
+      logMsg +=
+          fmt::format("\n    {}", folly::IPAddress::networkToString(cidr));
+      if (prefix.pathId()) {
+        logMsg += fmt::format(" (pathId={})", *prefix.pathId());
+      }
+    }
+  }
+
+  /* Log path attributes */
+  logMsg += "\n  Attributes:";
+
+  /* Nexthop */
+  if (!update.attrs()->nexthop()->empty()) {
+    logMsg +=
+        fmt::format("\n    Nexthop: {}", update.attrs()->nexthop().value());
+  }
+
+  /* AS Path */
+  if (!update.attrs()->asPath()->empty()) {
+    logMsg += "\n    AS Path:";
+    for (const auto& segment : update.attrs()->asPath().value()) {
+      if (!segment.asSequence()->empty()) {
+        logMsg += " [";
+        for (size_t i = 0; i < segment.asSequence()->size(); ++i) {
+          if (i > 0) {
+            logMsg += " ";
+          }
+          logMsg += fmt::format("{}", segment.asSequence().value()[i]);
+        }
+        logMsg += "]";
+      }
+    }
+  } else {
+    logMsg += "\n    AS Path: <empty>";
+  }
+
+  /* Local Pref */
+  if (update.attrs()->localPref()) {
+    logMsg += fmt::format(
+        "\n    Local Pref: {}", update.attrs()->localPref().value());
+  }
+
+  /* MED */
+  if (apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
+          update.attrs()->med())) {
+    logMsg += fmt::format("\n    MED: {}", update.attrs()->med().value());
+  }
+
+  /* Communities */
+  if (!update.attrs()->communities()->empty()) {
+    logMsg += "\n    Communities:";
+    for (const auto& comm : update.attrs()->communities().value()) {
+      logMsg += fmt::format(" {}:{}", comm.asn().value(), comm.value().value());
+    }
+  }
+
+  /* Origin */
+  if (apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
+          update.attrs()->origin())) {
+    logMsg += fmt::format(
+        "\n    Origin: {}", static_cast<int>(update.attrs()->origin().value()));
+  }
+
+  XLOGF(INFO, "{}", logMsg);
+}
+
+} // namespace
+
+/*
+ * Helper class to capture BgpUpdate2 from BgpMessageParser2 callbacks
+ */
+class CaptureUpdateCallback
+    : public nettools::bgplib::BgpMessageParser2::BgpMessageParserCallbacks {
+ private:
+  std::shared_ptr<const BgpUpdate2> capturedUpdate_;
+
+ public:
+  void rcvdBgpUpdate(BgpUpdate2 update) override {
+    XLOG(INFO, "CaptureUpdateCallback: rcvdBgpUpdate called");
+    capturedUpdate_ = std::make_shared<const BgpUpdate2>(std::move(update));
+  }
+
+  std::shared_ptr<const BgpUpdate2> getCapturedUpdate() const {
+    return capturedUpdate_;
+  }
+
+  /* Log when other callbacks are called */
+  void rcvdBgpOpenMsg(nettools::bgplib::BgpOpenMsg) override {
+    XLOG(WARN, "CaptureUpdateCallback: rcvdBgpOpenMsg called (unexpected)");
+  }
+  void rcvdBgpNotification(nettools::bgplib::BgpNotification) override {
+    XLOG(
+        WARN, "CaptureUpdateCallback: rcvdBgpNotification called (unexpected)");
+  }
+  void rcvdBgpKeepAlive() override {
+    XLOG(WARN, "CaptureUpdateCallback: rcvdBgpKeepAlive called (unexpected)");
+  }
+  void rcvdBgpEndOfRib(BgpEndOfRib) override {
+    XLOG(WARN, "CaptureUpdateCallback: rcvdBgpEndOfRib called (unexpected)");
+  }
+  void rcvdBgpRouteRefresh(nettools::bgplib::BgpRouteRefresh) override {
+    XLOG(
+        WARN, "CaptureUpdateCallback: rcvdBgpRouteRefresh called (unexpected)");
+  }
+  void handleBgpException(const nettools::bgplib::BgpException& e) override {
+    XLOGF(ERR, "CaptureUpdateCallback: handleBgpException: {}", e.what());
+  }
+  void handleBgpFsmException(
+      const nettools::bgplib::BgpFsmException& e) override {
+    XLOGF(ERR, "CaptureUpdateCallback: handleBgpFsmException: {}", e.what());
+  }
+  void handleBgpHeaderException(
+      const nettools::bgplib::BgpHeaderException& e) override {
+    XLOGF(ERR, "CaptureUpdateCallback: handleBgpHeaderException: {}", e.what());
+  }
+  void handleBgpOpenMsgException(
+      const nettools::bgplib::BgpOpenMsgException& e) override {
+    XLOGF(
+        ERR, "CaptureUpdateCallback: handleBgpOpenMsgException: {}", e.what());
+  }
+  void handleBgpUpdateMsgException(
+      const nettools::bgplib::BgpUpdateMsgException& e) override {
+    XLOGF(
+        ERR,
+        "CaptureUpdateCallback: handleBgpUpdateMsgException: {}",
+        e.what());
+  }
+  void handleBgpRouteRefreshMsgException(
+      const nettools::bgplib::BgpRouteRefreshMsgException& e) override {
+    XLOGF(
+        ERR,
+        "CaptureUpdateCallback: handleBgpRouteRefreshMsgException: {}",
+        e.what());
+  }
+};
+
+/*
+ * Parse IOBuf containing serialized BGP UPDATE message into BgpUpdate2
+ * This simulates what the I/O thread does on the ingress path
+ */
+std::optional<std::shared_ptr<const BgpUpdate2>> parseBgpUpdateFromIOBuf(
+    std::unique_ptr<folly::IOBuf> iobuf) {
+  if (!iobuf || iobuf->empty()) {
+    XLOG(ERR, "parseBgpUpdateFromIOBuf: null or empty IOBuf");
+    return std::nullopt;
+  }
+
+  XLOGF(
+      DBG2,
+      "parseBgpUpdateFromIOBuf: Parsing IOBuf of length {}",
+      iobuf->computeChainDataLength());
+
+  try {
+    CaptureUpdateCallback callback;
+
+    /* Create capabilities for parsing - must match what peers negotiated.
+     * IMPORTANT: Must match capabilities used during serialization!
+     * All test peers negotiate these capabilities (see createDisplayInfo). */
+    nettools::bgplib::BgpCapabilities caps;
+    caps.as4byte() = true; /* Peers negotiate 4-byte ASN capability */
+    caps.mpExtV4Unicast() =
+        true; /* Peers negotiate multiprotocol IPv4 unicast */
+    caps.mpExtV6Unicast() =
+        true; /* Peers negotiate multiprotocol IPv6 unicast */
+
+    /* Use the IOBuf overload of parseBgpMessage with capabilities */
+    nettools::bgplib::BgpMessageParser2::parseBgpMessage(
+        &callback, *iobuf, std::move(caps));
+
+    auto result = callback.getCapturedUpdate();
+    if (!result) {
+      XLOG(
+          ERR,
+          "parseBgpUpdateFromIOBuf: Parser did not capture BgpUpdate2 (might be a different message type or parse error)");
+      return std::nullopt;
+    }
+
+    XLOG(DBG2, "parseBgpUpdateFromIOBuf: Successfully parsed BgpUpdate2");
+    return result;
+  } catch (const std::exception& e) {
+    XLOGF(
+        ERR,
+        "parseBgpUpdateFromIOBuf: exception parsing BGP message: {}",
+        e.what());
+    return std::nullopt;
+  }
+}
+
+/*
+ * Deserialize UpdateDescriptor into BgpUpdate2
+ * This simulates what happens in the I/O thread:
+ * 1. Clone IOBuf from serializedGroupPDU
+ * 2. Mutate nexthop at specified offsets
+ * 3. Parse the final IOBuf into BgpUpdate2
+ */
+std::optional<std::shared_ptr<const BgpUpdate2>> deserializeUpdateDescriptor(
+    const nettools::bgplib::UpdateDescriptor& desc) {
+  XLOGF(
+      DBG2,
+      "deserializeUpdateDescriptor: v4Nexthop={}, v6Nexthop={}, nexthopOffsets.size={}",
+      desc.v4Nexthop.str(),
+      desc.v6Nexthop.str(),
+      desc.nexthopOffsets.size());
+
+  if (!desc.serializedGroupPDU) {
+    XLOG(ERR, "deserializeUpdateDescriptor: serializedGroupPDU is null");
+    return std::nullopt;
+  }
+
+  XLOGF(
+      DBG2,
+      "deserializeUpdateDescriptor: serializedGroupPDU length={}",
+      desc.serializedGroupPDU->computeChainDataLength());
+
+  /* Dump hex before nexthop mutation */
+  XLOGF(
+      INFO,
+      "deserializeUpdateDescriptor: serializedGroupPDU hex BEFORE mutation:\n{}",
+      folly::hexDump(
+          desc.serializedGroupPDU->data(),
+          desc.serializedGroupPDU->computeChainDataLength()));
+
+  /* Use BgpSerializer to clone IOBuf and mutate nexthop (simulates I/O thread).
+   * IMPORTANT: Capabilities must match what peers negotiated during session
+   * establishment! All test peers negotiate these capabilities (see
+   * createDisplayInfo). */
+  nettools::bgplib::BgpCapabilities defaultCaps;
+  defaultCaps.as4byte() = true; /* Peers negotiate 4-byte ASN capability */
+  defaultCaps.mpExtV4Unicast() =
+      true; /* Peers negotiate multiprotocol IPv4 unicast */
+  defaultCaps.mpExtV6Unicast() =
+      true; /* Peers negotiate multiprotocol IPv6 unicast */
+  nettools::bgplib::BgpSerializer serializer(defaultCaps);
+
+  /* Call operator() to get the final IOBuf with mutated nexthop */
+  auto finalIOBuf = serializer(desc);
+
+  if (!finalIOBuf || finalIOBuf->empty()) {
+    XLOG(ERR, "deserializeUpdateDescriptor: serializer returned empty IOBuf");
+    return std::nullopt;
+  }
+
+  XLOGF(
+      DBG2,
+      "deserializeUpdateDescriptor: finalIOBuf length={} (after nexthop mutation)",
+      finalIOBuf->computeChainDataLength());
+
+  /* Dump hex after nexthop mutation */
+  XLOGF(
+      INFO,
+      "deserializeUpdateDescriptor: finalIOBuf hex AFTER mutation:\n{}",
+      folly::hexDump(finalIOBuf->data(), finalIOBuf->computeChainDataLength()));
+
+  /* Parse the serialized BGP UPDATE back to BgpUpdate2 */
+  return parseBgpUpdateFromIOBuf(std::move(finalIOBuf));
+}
+
+/* Helper function to attempt reading update from queue - can set breakpoint
+ * here.
+ *
+ * maxDrainAttempts caps how many pops we issue while skipping non-UPDATE
+ * messages (e.g. multiple EoRs in a row). Default 0 = unbounded for
+ * backwards compatibility with callers that depend on the blocking
+ * semantics. Bounded callers (e.g. waitForOutboundUpdate) pass a small
+ * positive limit so a queue that runs dry between empty-check and pop
+ * doesn't trap the test thread in popFromQueue's unbounded blockingWait.
+ */
+std::optional<std::shared_ptr<const BgpUpdate2>> tryReadUpdateFromQueue(
+    const E2ETestFixture::PeerQueues& queues,
+    bool useBoundedQueue,
+    int maxDrainAttempts = 0) {
+  std::optional<std::shared_ptr<const BgpUpdate2>> result;
+  int attempts = 0;
+
+  /* Keep reading messages until we find a non-EoR UPDATE */
+  while (!result.has_value()) {
+    if (maxDrainAttempts > 0) {
+      bool queueEmpty = useBoundedQueue ? queues.boundedAdjRibOutQ->empty()
+                                        : queues.adjRibOutQ->empty();
+      if (queueEmpty) {
+        /* Queue drained — bail rather than block on an empty pop */
+        break;
+      }
+      if (++attempts > maxDrainAttempts) {
+        break;
+      }
+    }
+    auto msg = popFromQueue(queues, useBoundedQueue);
+    if (!msg.has_value()) {
+      break;
+    }
+
+    if (isEoRMessage(*msg)) {
+      continue;
+    }
+
+    if (isUpdateMessage(*msg)) {
+      /* Handle both BgpUpdate2 and UpdateDescriptor */
+      if (auto* updatePtr =
+              std::get_if<std::shared_ptr<const BgpUpdate2>>(&(*msg))) {
+        /* Non-serialized path: BgpUpdate2 directly */
+        XLOG(
+            INFO,
+            "tryReadUpdateFromQueue: Got BgpUpdate2 directly (non-serialized)");
+        result = *updatePtr;
+        break;
+      } else if (
+          auto* descPtr =
+              std::get_if<nettools::bgplib::UpdateDescriptor>(&(*msg))) {
+        /* Serialized path: UpdateDescriptor → deserialize → BgpUpdate2 */
+        XLOG(
+            INFO,
+            "tryReadUpdateFromQueue: Got UpdateDescriptor (serialized), deserializing...");
+        result = deserializeUpdateDescriptor(*descPtr);
+        if (!result.has_value()) {
+          XLOG(ERR, "tryReadUpdateFromQueue: Deserialization FAILED!");
+        } else {
+          XLOG(INFO, "tryReadUpdateFromQueue: Deserialization succeeded");
+        }
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+/*
+ * Helper to wait for and consume EoR from peer's outbound queue
+ * Returns true if EoR was found, false otherwise
+ */
+bool tryConsumeEoRFromQueue(
+    const E2ETestFixture::PeerQueues& queues,
+    bool useBoundedQueue) {
+  while (true) {
+    auto msg = popFromQueue(queues, useBoundedQueue);
+    if (!msg.has_value()) {
+      return false;
+    }
+
+    if (isEoRMessage(*msg)) {
+      return true;
+    }
+
+    /*
+     * Skip non-EoR messages
+     * This shouldn't happen in normal flow but handle it gracefully
+     */
+  }
+}
+
+std::optional<std::shared_ptr<const BgpUpdate2>>
+E2ETestFixture::readOutboundUpdateToPeer(const BgpPeerId& peerId) {
+  /* Check if peer is blocked - do not read if blocked */
+  if (isPeerBlocked(peerId.peerAddr)) {
+    XLOGF(
+        DBG2,
+        "readOutboundUpdateToPeer: peer {} is blocked - skipping read",
+        peerId.peerAddr.str());
+    return std::nullopt;
+  }
+
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    return std::nullopt;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+
+  XLOGF(
+      INFO,
+      "Test reading from peer {} bounded queue {} (useBoundedQueue={})",
+      peerId.peerAddr.str(),
+      (void*)queues->boundedAdjRibOutQ.get(),
+      useBoundedQueue);
+
+  /* popFromQueue() does blockingWait - no retries needed */
+  return tryReadUpdateFromQueue(*queues, useBoundedQueue);
+}
+
+std::optional<std::shared_ptr<const BgpUpdate2>>
+E2ETestFixture::waitForOutboundUpdate(const BgpPeerId& peerId, int maxRetries) {
+  /*
+   * Wait for an UPDATE to appear in peer's outbound queue.
+   * Uses check-sleep-retry pattern to allow async processing to complete.
+   */
+  if (isPeerBlocked(peerId.peerAddr)) {
+    XLOGF(
+        DBG2,
+        "waitForOutboundUpdate: peer {} is blocked - skipping",
+        peerId.peerAddr.str());
+    return std::nullopt;
+  }
+
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    XLOGF(
+        WARN,
+        "waitForOutboundUpdate: peer {} not found",
+        peerId.peerAddr.str());
+    return std::nullopt;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+
+  XLOGF(
+      DBG2,
+      "waitForOutboundUpdate: waiting for update from peer {} (maxRetries={})",
+      peerId.peerAddr.str(),
+      maxRetries);
+
+  /*
+   * Check-sleep-retry pattern:
+   * 1. Check if queue has messages
+   * 2. If not, sleep briefly to allow async processing
+   * 3. Repeat up to maxRetries
+   */
+  for (int retry = 0; retry < maxRetries; ++retry) {
+    bool queueEmpty = useBoundedQueue ? queues->boundedAdjRibOutQ->empty()
+                                      : queues->adjRibOutQ->empty();
+
+    if (!queueEmpty) {
+      XLOGF(
+          DBG2,
+          "waitForOutboundUpdate: queue not empty after {} retries, reading",
+          retry);
+      /*
+       * Cap inner drain attempts at maxRetries so a queue that drains
+       * to empty between empty()-check and pop() doesn't trap us in
+       * the inner blockingWait of tryReadUpdateFromQueue.
+       */
+      return tryReadUpdateFromQueue(
+          *queues, useBoundedQueue, /*maxDrainAttempts=*/maxRetries);
+    }
+
+    /* Sleep briefly to allow async processing to complete */
+    // NOLINTNEXTLINE(facebook-hte-BadCall-sleep_for)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  XLOGF(
+      WARN,
+      "waitForOutboundUpdate: queue still empty after {} retries",
+      maxRetries);
+  return std::nullopt;
+}
+
+bool E2ETestFixture::waitForEoR(const BgpPeerId& peerId) {
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    return false;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+  bool result = false;
+
+  WITH_RETRIES_N(10, {
+    result = tryConsumeEoRFromQueue(*queues, useBoundedQueue);
+    EXPECT_EVENTUALLY_TRUE(result);
+  });
+
+  return result;
+}
+
+// ==================== QUEUE BLOCKING HELPER IMPLEMENTATIONS
+// ====================
+
+bool E2ETestFixture::isPeerQueueBlocked(const BgpPeerId& peerId) {
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    return false;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+  if (!useBoundedQueue) {
+    /* Unbounded queue never blocks */
+    return false;
+  }
+
+  return queues->boundedAdjRibOutQ->isBlocked();
+}
+
+bool E2ETestFixture::waitForPeerQueueBlocked(
+    const BgpPeerId& peerId,
+    int maxRetries) {
+  bool blocked = false;
+  WITH_RETRIES_N(maxRetries, {
+    blocked = isPeerQueueBlocked(peerId);
+    EXPECT_EVENTUALLY_TRUE(blocked);
+  });
+  return blocked;
+}
+
+size_t E2ETestFixture::getPeerQueueSize(const BgpPeerId& peerId) {
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    return 0;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+  if (!useBoundedQueue) {
+    return queues->adjRibOutQ->size();
+  }
+
+  return queues->boundedAdjRibOutQ->size();
+}
+
+size_t E2ETestFixture::drainPeerQueueCompletely(
+    const BgpPeerId& peerId,
+    int maxRetries,
+    int maxMessages) {
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    XLOGF(
+        WARN,
+        "drainPeerQueueCompletely: peer {} not found",
+        peerId.peerAddr.str());
+    return 0;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+
+  XLOGF(
+      INFO,
+      "drainPeerQueueCompletely: draining queue for peer {} (useBoundedQueue={}, maxRetries={}, maxMessages={})",
+      peerId.peerAddr.str(),
+      useBoundedQueue,
+      maxRetries,
+      maxMessages);
+
+  size_t drained = 0;
+  int emptyRetries = 0;
+
+  while (true) {
+    /*
+     * Check if we've hit the message limit.
+     * This prevents infinite draining if messages keep arriving.
+     */
+    if (maxMessages > 0 && static_cast<int>(drained) >= maxMessages) {
+      XLOGF(
+          INFO,
+          "drainPeerQueueCompletely: hit max messages limit ({}), stopping",
+          maxMessages);
+      break;
+    }
+
+    /*
+     * Check queue state BEFORE calling pop().
+     *
+     * pop() blocks indefinitely if the queue is empty and not closed.
+     * We check empty() first to avoid blocking when the queue is drained.
+     *
+     * If queue is empty, messages might be in-flight (async processing).
+     * Pump event loops and retry to allow messages to arrive.
+     */
+    bool queueEmpty = useBoundedQueue ? queues->boundedAdjRibOutQ->empty()
+                                      : queues->adjRibOutQ->empty();
+
+    if (queueEmpty) {
+      // Queue is empty - messages might be in-flight
+      if (emptyRetries >= maxRetries) {
+        XLOGF(
+            INFO,
+            "drainPeerQueueCompletely: queue empty after {} retries, stopping",
+            emptyRetries);
+        break;
+      }
+      emptyRetries++;
+      XLOGF(
+          DBG2,
+          "drainPeerQueueCompletely: queue empty, retry {}/{}",
+          emptyRetries,
+          maxRetries);
+
+      // Pump event loops by scheduling a no-op and waiting for it to complete.
+      // This allows any pending async work to execute.
+      // Note: We can't call loopOnce() from a different thread - it will crash.
+      if (rib_) {
+        rib_->getEventBase().runInEventBaseThreadAndWait([]() {});
+      }
+      if (peerManager_) {
+        peerManager_->getEventBase().runInEventBaseThreadAndWait([]() {});
+      }
+      continue;
+    }
+
+    // Queue is NOT empty - safe to pop (we're the only consumer in tests)
+    // Reset retry counter since we found messages
+    emptyRetries = 0;
+
+    auto msg = popFromQueue(*queues, useBoundedQueue);
+    if (!msg.has_value()) {
+      break;
+    }
+    drained++;
+
+    if (isEoRMessage(*msg)) {
+      XLOGF(
+          INFO,
+          "drainPeerQueueCompletely: peer {} got EoR",
+          peerId.peerAddr.str());
+    }
+  }
+
+  XLOGF(
+      INFO,
+      "drainPeerQueueCompletely: drained {} messages from peer {}",
+      drained,
+      peerId.peerAddr.str());
+
+  return drained;
+}
+
+/*
+ * blockPeer - Block a peer from having its queue read
+ *
+ * Sets a flag that prevents readOutboundUpdateToPeer() from reading
+ * messages from this peer's queue. The queue will fill up naturally
+ * and cause backpressure.
+ */
+void E2ETestFixture::blockPeer(const folly::IPAddress& peerAddr) {
+  blockedPeers_.insert(peerAddr);
+
+  XLOGF(
+      INFO,
+      "blockPeer: blocked peer {} - queue reads will be prevented",
+      peerAddr.str());
+}
+
+/*
+ * unblockPeer - Unblock a peer and drain its queue
+ *
+ * Clears the block flag and optionally drains all pending messages
+ * from the peer's bounded queue.
+ */
+bool E2ETestFixture::unblockPeer(
+    const folly::IPAddress& peerAddr,
+    int maxRetries,
+    int maxMessages) {
+  auto it = blockedPeers_.find(peerAddr);
+  bool wasBlocked = (it != blockedPeers_.end());
+
+  if (wasBlocked) {
+    blockedPeers_.erase(it);
+    XLOGF(INFO, "unblockPeer: unblocked peer {}", peerAddr.str());
+  } else {
+    XLOGF(WARN, "unblockPeer: peer {} was not blocked", peerAddr.str());
+  }
+
+  if (maxRetries == 0) {
+    // no drain
+    return wasBlocked;
+  }
+  /* Drain the queue to resume normal operation */
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  size_t drained = drainPeerQueueCompletely(peerId, maxRetries, maxMessages);
+
+  XLOGF(
+      INFO,
+      "unblockPeer: drained {} messages from peer {}",
+      drained,
+      peerAddr.str());
+
+  return wasBlocked;
+}
+
+/*
+ * isPeerBlocked - Check if a peer is currently blocked
+ */
+bool E2ETestFixture::isPeerBlocked(const folly::IPAddress& peerAddr) const {
+  return blockedPeers_.find(peerAddr) != blockedPeers_.end();
+}
+
+/*
+ * isPeerEgressQueueEmpty - Check if a peer's egress queue is empty
+ * Used for out-delay testing to verify routes are deferred.
+ */
+bool E2ETestFixture::isPeerEgressQueueEmpty(const folly::IPAddress& peerAddr) {
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  return getPeerQueueSize(peerId) == 0;
+}
+
+/*
+ * waitForPeerEgressQueueNonEmpty - Wait for a peer's egress queue to have at
+ * least one message. Returns true if message arrives within retries, false
+ * otherwise.
+ */
+bool E2ETestFixture::waitForPeerEgressQueueNonEmpty(
+    const folly::IPAddress& peerAddr,
+    int maxRetries) {
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+
+  for (int i = 0; i < maxRetries; ++i) {
+    if (getPeerQueueSize(peerId) > 0) {
+      return true;
+    }
+    /* Allow event loops to process */
+    // NOLINTNEXTLINE(facebook-hte-BadCall-sleep_for)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return getPeerQueueSize(peerId) > 0;
+}
+
+// ==================== NEW HELPER API IMPLEMENTATIONS ====================
+
+void E2ETestFixture::addRoute(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    const std::string& nexthop,
+    const std::string& asPath,
+    const std::string& community,
+    uint32_t addPathId,
+    uint32_t localPref,
+    uint32_t med) {
+  ASSERT_TRUE(isValidProtocol(protocol)) << "Invalid protocol: " << protocol;
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  ASSERT_TRUE(peerIdOpt.has_value()) << "Peer " << peer.str() << " not found";
+
+  const folly::CIDRNetwork cidr{folly::IPAddress(prefix), prefixLen};
+  const auto asPathSeq = parseAsPath(asPath);
+  const auto communities = parseCommunities(community);
+
+  auto update = createBgpUpdateAnnouncement(
+      isIpv4Protocol(protocol),
+      cidr,
+      nexthop,
+      asPathSeq,
+      communities,
+      addPathId,
+      localPref,
+      med);
+
+  auto queues = getPeerQueues(*peerIdOpt);
+  ASSERT_TRUE(queues.has_value()) << "No queues for peer " << peer.str();
+  folly::coro::blockingWait(queues->adjRibInQ->push(std::move(update)));
+}
+
+void E2ETestFixture::addRouteWithLbw(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    const std::string& nexthop,
+    const std::string& asPath,
+    float linkBandwidthGbps,
+    uint32_t localPref) {
+  ASSERT_TRUE(isValidProtocol(protocol)) << "Invalid protocol: " << protocol;
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  ASSERT_TRUE(peerIdOpt.has_value()) << "Peer " << peer.str() << " not found";
+
+  const folly::CIDRNetwork cidr{folly::IPAddress(prefix), prefixLen};
+  const auto asPathSeq = parseAsPath(asPath);
+
+  /*
+   * Convert Gbps to Bytes/sec for the LBW extended community.
+   * LBW value is stored as float Bytes/sec: Gbps * 10^9 / 8
+   */
+  float lbwBytesPerSec = linkBandwidthGbps * BpsPerGBps / 8.0f;
+
+  auto update = createBgpUpdateAnnouncement(
+      isIpv4Protocol(protocol),
+      cidr,
+      nexthop,
+      asPathSeq,
+      {},
+      0,
+      localPref,
+      0,
+      lbwBytesPerSec);
+
+  auto queues = getPeerQueues(*peerIdOpt);
+  ASSERT_TRUE(queues.has_value()) << "No queues for peer " << peer.str();
+  folly::coro::blockingWait(queues->adjRibInQ->push(std::move(update)));
+}
+
+void E2ETestFixture::addRouteWithExtCommunities(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    const std::string& nexthop,
+    const std::string& asPath,
+    const std::vector<nettools::bgplib::BgpAttrExtCommunityC>& extCommunities,
+    uint32_t localPref) {
+  ASSERT_TRUE(isValidProtocol(protocol)) << "Invalid protocol: " << protocol;
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  ASSERT_TRUE(peerIdOpt.has_value()) << "Peer " << peer.str() << " not found";
+
+  const folly::CIDRNetwork cidr{folly::IPAddress(prefix), prefixLen};
+  const auto asPathSeq = parseAsPath(asPath);
+
+  auto update = createBgpUpdateAnnouncement(
+      isIpv4Protocol(protocol), cidr, nexthop, asPathSeq, {}, 0, localPref, 0);
+
+  for (const auto& ec : extCommunities) {
+    nettools::bgplib::BgpAttrExtCommunity extComm;
+    auto [firstWord, secondWord] = ec.getRawValueInWords();
+    extComm.firstWord() = firstWord;
+    extComm.secondWord() = secondWord;
+    update->attrs()->extCommunities()->push_back(extComm);
+  }
+
+  auto queues = getPeerQueues(*peerIdOpt);
+  ASSERT_TRUE(queues.has_value()) << "No queues for peer " << peer.str();
+  folly::coro::blockingWait(queues->adjRibInQ->push(std::move(update)));
+}
+
+AdjRibEntry* E2ETestFixture::getAdjRibEntry(
+    const BgpPeerId& peerId,
+    bool ingress,
+    const folly::CIDRNetwork& prefix) {
+  auto it = peerManager_->adjRibs_.find(peerId);
+  if (it == peerManager_->adjRibs_.end()) {
+    return nullptr;
+  }
+  return it->second->getRibEntry(ingress, prefix);
+}
+
+std::shared_ptr<AdjRib> E2ETestFixture::getAdjRibByAddr(
+    const folly::IPAddress& peerAddr) {
+  if (!peerManager_) {
+    return nullptr;
+  }
+  for (const auto& [peerId, adjRib] : peerManager_->adjRibs_) {
+    if (peerId.peerAddr == peerAddr) {
+      return adjRib;
+    }
+  }
+  return nullptr;
+}
+
+void E2ETestFixture::deleteRoute(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    uint32_t addPathId) {
+  ASSERT_TRUE(isValidProtocol(protocol)) << "Invalid protocol: " << protocol;
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  ASSERT_TRUE(peerIdOpt.has_value()) << "Peer " << peer.str() << " not found";
+
+  const folly::CIDRNetwork cidr{folly::IPAddress(prefix), prefixLen};
+  auto update =
+      createBgpUpdateWithdrawal(isIpv4Protocol(protocol), cidr, addPathId);
+
+  auto queues = getPeerQueues(*peerIdOpt);
+  ASSERT_TRUE(queues.has_value()) << "No queues for peer " << peer.str();
+  folly::coro::blockingWait(queues->adjRibInQ->push(std::move(update)));
+}
+
+bool E2ETestFixture::verifyRouteAdd(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    const std::string& expectedNexthop,
+    const std::string& expectedAsPath,
+    const std::string& expectedCommunity,
+    uint32_t addPathId,
+    int maxWaitRetries) {
+  if (!isValidProtocol(protocol)) {
+    return false;
+  }
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  if (!peerIdOpt.has_value()) {
+    return false;
+  }
+
+  /*
+   * If maxWaitRetries > 0, use event loop pumping to wait for the UPDATE.
+   * This is needed when testing bestpath changes where the UPDATE might
+   * not be generated immediately after addRoute().
+   */
+  std::optional<std::shared_ptr<const BgpUpdate2>> updateOpt;
+  if (maxWaitRetries > 0) {
+    updateOpt = waitForOutboundUpdate(*peerIdOpt, maxWaitRetries);
+  } else {
+    updateOpt = readOutboundUpdateToPeer(*peerIdOpt);
+  }
+
+  if (!updateOpt.has_value()) {
+    XLOGF(
+        ERR,
+        "verifyRouteAdd: No update received from queue for peer {}",
+        peer.str());
+    return false;
+  }
+
+  logBgpUpdate(
+      **updateOpt,
+      fmt::format("verifyRouteAdd received update from peer {}", peer.str()));
+
+  const folly::CIDRNetwork expectedCidr{folly::IPAddress(prefix), prefixLen};
+  if (!findPrefixInAnnouncements(
+          **updateOpt, isIpv4Protocol(protocol), expectedCidr, addPathId)) {
+    return false;
+  }
+
+  return verifyRouteAttributes(
+      **updateOpt, expectedNexthop, expectedAsPath, expectedCommunity);
+}
+
+bool E2ETestFixture::drainAndFindRouteAdvertised(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    const std::string& expectedNexthop,
+    const std::string& expectedAsPath,
+    const std::string& expectedCommunity,
+    uint32_t addPathId,
+    int maxFlushRetries) {
+  if (!isValidProtocol(protocol)) {
+    return false;
+  }
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  if (!peerIdOpt.has_value()) {
+    return false;
+  }
+  if (isPeerBlocked(peerIdOpt->peerAddr)) {
+    return false;
+  }
+  auto queues = getPeerQueues(*peerIdOpt);
+  if (!queues) {
+    return false;
+  }
+
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+  const folly::CIDRNetwork expectedCidr{folly::IPAddress(prefix), prefixLen};
+
+  XLOGF(
+      INFO,
+      "drainAndFindRouteAdvertised: searching peer {} for {}/{} nexthop={}",
+      peer.str(),
+      prefix,
+      prefixLen,
+      expectedNexthop);
+
+  int emptyFlushes = 0;
+  while (true) {
+    bool queueEmpty = useBoundedQueue ? queues->boundedAdjRibOutQ->empty()
+                                      : queues->adjRibOutQ->empty();
+    if (queueEmpty) {
+      if (emptyFlushes >= maxFlushRetries) {
+        XLOGF(
+            WARN,
+            "drainAndFindRouteAdvertised: queue empty after {} evb flushes; target {}/{} not found",
+            maxFlushRetries,
+            prefix,
+            prefixLen);
+        return false;
+      }
+      emptyFlushes++;
+      /*
+       * Deterministic sync: flush rib_ and peerManager_ event bases so any
+       * in-flight push completes before we re-check.
+       */
+      if (rib_) {
+        rib_->getEventBase().runInEventBaseThreadAndWait([]() {});
+      }
+      if (peerManager_) {
+        peerManager_->getEventBase().runInEventBaseThreadAndWait([]() {});
+      }
+      continue;
+    }
+    emptyFlushes = 0;
+
+    /*
+     * Reuse tryReadUpdateFromQueue (which already skips EoR messages and
+     * handles both BgpUpdate2-direct and UpdateDescriptor-serialized
+     * paths). It pops one matching UPDATE per call.
+     *
+     * Pass maxDrainAttempts so the inner skip-EoR loop checks queueEmpty
+     * before each pop. Otherwise, if the queue's only message is an EoR,
+     * the inner loop pops it, hits `continue`, then blocks indefinitely
+     * on popFromQueue's unbounded blockingWait — and our outer empty-check
+     * never re-runs. Bound by maxFlushRetries so caller can tune.
+     */
+    auto updateOpt = tryReadUpdateFromQueue(
+        *queues, useBoundedQueue, /*maxDrainAttempts=*/maxFlushRetries);
+    if (!updateOpt.has_value()) {
+      /* Queue ran dry while we were popping — loop will re-check */
+      continue;
+    }
+
+    logBgpUpdate(
+        **updateOpt,
+        fmt::format(
+            "drainAndFindRouteAdvertised popped from peer {}", peer.str()));
+
+    if (!findPrefixInAnnouncements(
+            **updateOpt, isIpv4Protocol(protocol), expectedCidr, addPathId)) {
+      /* Not our prefix — discard and keep draining */
+      continue;
+    }
+
+    if (!verifyRouteAttributes(
+            **updateOpt, expectedNexthop, expectedAsPath, expectedCommunity)) {
+      /* Right prefix wrong attrs — discard and keep draining */
+      continue;
+    }
+
+    XLOGF(
+        INFO,
+        "drainAndFindRouteAdvertised: found target {}/{} for peer {}",
+        prefix,
+        prefixLen,
+        peer.str());
+    return true;
+  }
+}
+
+bool E2ETestFixture::verifyRouteWithdraw(
+    const std::string& protocol,
+    const std::string& prefix,
+    uint8_t prefixLen,
+    const folly::IPAddress& peer,
+    uint32_t addPathId) {
+  if (!isValidProtocol(protocol)) {
+    return false;
+  }
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  if (!peerIdOpt.has_value()) {
+    return false;
+  }
+
+  auto updateOpt = readOutboundUpdateToPeer(*peerIdOpt);
+  if (!updateOpt.has_value()) {
+    return false;
+  }
+
+  const folly::CIDRNetwork expectedCidr{folly::IPAddress(prefix), prefixLen};
+  return findPrefixInWithdrawals(
+      **updateOpt, isIpv4Protocol(protocol), expectedCidr, addPathId);
+}
+
+void E2ETestFixture::addRoutes(
+    const std::string& protocol,
+    const folly::IPAddress& peer,
+    const std::vector<RouteSpec>& routes) {
+  for (const auto& route : routes) {
+    addRoute(
+        protocol,
+        route.prefix,
+        route.prefixLen,
+        peer,
+        route.nexthop,
+        route.asPath,
+        route.community,
+        route.addPathId,
+        route.localPref,
+        route.med);
+  }
+}
+
+void E2ETestFixture::deleteRoutes(
+    const std::string& protocol,
+    const folly::IPAddress& peer,
+    const std::vector<RouteSpec>& routes) {
+  for (const auto& route : routes) {
+    deleteRoute(protocol, route.prefix, route.prefixLen, peer, route.addPathId);
+  }
+}
+
+namespace {
+
+size_t checkRoutesInUpdate(
+    const BgpUpdate2& update,
+    bool isV4,
+    const std::vector<E2ETestFixture::VerifySpec>& routes,
+    std::vector<bool>& verified) {
+  size_t newlyVerified = 0;
+
+  for (size_t i = 0; i < routes.size(); ++i) {
+    if (verified[i]) {
+      continue;
+    }
+
+    const auto& route = routes[i];
+    const folly::CIDRNetwork expectedCidr{
+        folly::IPAddress(route.prefix), route.prefixLen};
+
+    if (!findPrefixInAnnouncements(
+            update, isV4, expectedCidr, route.addPathId)) {
+      continue;
+    }
+
+    if (!verifyRouteAttributes(
+            update,
+            route.expectedNexthop,
+            route.expectedAsPath,
+            route.expectedCommunity)) {
+      continue;
+    }
+
+    verified[i] = true;
+    newlyVerified++;
+  }
+
+  return newlyVerified;
+}
+
+size_t checkWithdrawalsInUpdate(
+    const BgpUpdate2& update,
+    bool isV4,
+    const std::vector<E2ETestFixture::WithdrawSpec>& routes,
+    std::vector<bool>& verified) {
+  size_t newlyVerified = 0;
+
+  for (size_t i = 0; i < routes.size(); ++i) {
+    if (verified[i]) {
+      continue;
+    }
+
+    const auto& route = routes[i];
+    const folly::CIDRNetwork expectedCidr{
+        folly::IPAddress(route.prefix), route.prefixLen};
+
+    if (findPrefixInWithdrawals(update, isV4, expectedCidr, route.addPathId)) {
+      verified[i] = true;
+      newlyVerified++;
+    }
+  }
+
+  return newlyVerified;
+}
+
+} // namespace
+
+bool E2ETestFixture::verifyRoutes(
+    const std::string& protocol,
+    const folly::IPAddress& peer,
+    const std::vector<VerifySpec>& routes) {
+  if (routes.empty()) {
+    return true;
+  }
+
+  if (!isValidProtocol(protocol)) {
+    return false;
+  }
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  if (!peerIdOpt.has_value()) {
+    return false;
+  }
+
+  std::vector<bool> verified(routes.size(), false);
+  size_t verifiedCount = 0;
+
+  XLOGF(INFO, "Verifying {} routes from peer {}", routes.size(), peer.str());
+
+  // Keep reading UPDATEs until all routes are verified
+  // readOutboundUpdateToPeer() handles retries internally
+  int updateCount = 0;
+  while (verifiedCount < routes.size()) {
+    auto updateOpt = readOutboundUpdateToPeer(*peerIdOpt);
+    if (!updateOpt.has_value()) {
+      XLOGF(
+          WARN,
+          "No more updates available, verified {}/{} routes",
+          verifiedCount,
+          routes.size());
+      break;
+    }
+
+    updateCount++;
+    logBgpUpdate(
+        **updateOpt,
+        fmt::format("Update #{} from peer {}", updateCount, peer.str()));
+
+    size_t newlyVerified = checkRoutesInUpdate(
+        **updateOpt, isIpv4Protocol(protocol), routes, verified);
+
+    verifiedCount += newlyVerified;
+    XLOGF(
+        INFO,
+        "Update #{}: verified {} routes (total {}/{})",
+        updateCount,
+        newlyVerified,
+        verifiedCount,
+        routes.size());
+  }
+
+  if (verifiedCount != routes.size()) {
+    XLOGF(
+        ERR,
+        "Route verification failed: expected {} routes, got {}",
+        routes.size(),
+        verifiedCount);
+  }
+
+  return verifiedCount == routes.size();
+}
+
+bool E2ETestFixture::verifyRouteWithdraws(
+    const std::string& protocol,
+    const folly::IPAddress& peer,
+    const std::vector<WithdrawSpec>& routes) {
+  if (routes.empty()) {
+    return true;
+  }
+
+  if (!isValidProtocol(protocol)) {
+    return false;
+  }
+
+  auto peerIdOpt = findPeerIdByAddress(peer);
+  if (!peerIdOpt.has_value()) {
+    return false;
+  }
+
+  std::vector<bool> verified(routes.size(), false);
+  size_t verifiedCount = 0;
+
+  // Keep reading UPDATEs until all withdrawals are verified
+  // readOutboundUpdateToPeer() handles retries internally
+  while (verifiedCount < routes.size()) {
+    auto updateOpt = readOutboundUpdateToPeer(*peerIdOpt);
+    if (!updateOpt.has_value()) {
+      break;
+    }
+
+    verifiedCount += checkWithdrawalsInUpdate(
+        **updateOpt, isIpv4Protocol(protocol), routes, verified);
+  }
+
+  return verifiedCount == routes.size();
+}
+
+void E2ETestFixture::enableComputeUcmpFromLbw(bool enable) {
+  enableComputeUcmpFromLbw_ = enable;
+}
+
+void E2ETestFixture::enableEiBgpMultipath(bool enable) {
+  enableEiBgpMultipath_ = enable;
+}
+
+// ==================== NEXTHOP TRACKING IMPLEMENTATIONS ====================
+
+void E2ETestFixture::injectNexthopStatuses(
+    const std::vector<NexthopStatus>& nexthopStatuses) {
+  ASSERT_NE(rib_, nullptr) << "RIB must be created first";
+  ASSERT_NE(rib_->nexthopCache_, nullptr) << "NexthopCache must be initialized";
+
+  XLOGF(
+      DBG2,
+      "Injecting {} nexthop statuses into RIB's NexthopCache",
+      nexthopStatuses.size());
+
+  // Inject nexthop statuses into the cache and push changed statuses to ribInQ_
+  auto changedStatuses =
+      rib_->nexthopCache_->addOrUpdateNextHopStatus(nexthopStatuses);
+  if (!changedStatuses.empty()) {
+    ribInQ_.fiberPush(RibInNexthopUpdate(std::move(changedStatuses)));
+  }
+
+  for (const auto& status : nexthopStatuses) {
+    XLOGF(
+        INFO,
+        "Injected nexthop {} (reachable={}, igpCost={})",
+        status.getNexthop().str(),
+        status.isReachable(),
+        status.getIgpCost().has_value()
+            ? std::to_string(status.getIgpCost().value())
+            : "none");
+  }
+}
+
+bool E2ETestFixture::verifyNexthopRouteCount(
+    const folly::IPAddress& nexthopIp,
+    std::optional<size_t> expectedRouteCount) {
+  if (rib_ == nullptr) {
+    XLOG(ERR, "verifyNexthopRouteCount FAILED: RIB must be created first");
+    return false;
+  }
+
+  // Run verification on RIB's event base thread for thread safety
+  bool found = false;
+  size_t actualRouteCount = 0;
+
+  rib_->getEventBase().runInEventBaseThreadAndWait([&] {
+    auto it = rib_->nexthopInfoMap_.find(nexthopIp);
+    if (it != rib_->nexthopInfoMap_.end()) {
+      found = true;
+      actualRouteCount = it->second.getRouteInfoListSize();
+      XLOGF(
+          INFO,
+          "Nexthop {} found in nexthopInfoMap_ with {} routes",
+          nexthopIp.str(),
+          actualRouteCount);
+    } else {
+      XLOGF(INFO, "Nexthop {} NOT found in nexthopInfoMap_", nexthopIp.str());
+    }
+  });
+
+  // If expectedRouteCount is nullopt, verify nexthop does NOT exist
+  if (!expectedRouteCount.has_value()) {
+    if (found) {
+      XLOGF(
+          ERR,
+          "verifyNexthopRouteCount FAILED: Nexthop {} found in nexthopInfoMap_ "
+          "(expected NOT to be found)",
+          nexthopIp.str());
+      return false;
+    }
+    XLOGF(
+        INFO,
+        "verifyNexthopRouteCount SUCCESS: Nexthop {} not in nexthopInfoMap_",
+        nexthopIp.str());
+    return true;
+  }
+
+  // If expectedRouteCount has a value, verify nexthop exists with that count
+  if (!found) {
+    XLOGF(
+        ERR,
+        "verifyNexthopRouteCount FAILED: Nexthop {} not found in nexthopInfoMap_",
+        nexthopIp.str());
+    return false;
+  }
+
+  if (actualRouteCount != expectedRouteCount.value()) {
+    XLOGF(
+        ERR,
+        "verifyNexthopRouteCount FAILED: Nexthop {} has {} routes, expected {}",
+        nexthopIp.str(),
+        actualRouteCount,
+        expectedRouteCount.value());
+    return false;
+  }
+
+  XLOGF(
+      INFO,
+      "verifyNexthopRouteCount SUCCESS: Nexthop {} has {} routes",
+      nexthopIp.str(),
+      actualRouteCount);
+  return true;
+}
+
+std::shared_ptr<RouteInfo> E2ETestFixture::getBestPath(
+    const folly::CIDRNetwork& prefix) {
+  if (!rib_) {
+    XLOG(ERR, "RIB is not initialized");
+    return nullptr;
+  }
+
+  std::shared_ptr<RouteInfo> bestPath = nullptr;
+
+  rib_->getEventBase().runInEventBaseThreadAndWait([&]() {
+    auto ribEntry = rib_->ribEntries_.find(prefix);
+    if (ribEntry != rib_->ribEntries_.end()) {
+      bestPath = ribEntry->second.getBestPath();
+    }
+  });
+
+  return bestPath;
+}
+
+std::shared_ptr<const WeightedNexthopMap>
+E2ETestFixture::getFibWeightedNexthops(const std::string& prefixStr) {
+  if (!rib_) {
+    XLOG(ERR, "getFibWeightedNexthops: RIB is not initialized");
+    return nullptr;
+  }
+
+  auto testFib = rib_->getTestFib();
+  if (!testFib) {
+    XLOG(ERR, "getFibWeightedNexthops: TestFib is not initialized");
+    return nullptr;
+  }
+
+  auto prefix = folly::IPAddress::createNetwork(prefixStr);
+  const auto& programmedRoutes = testFib->getProgrammedRoutes();
+
+  auto it = programmedRoutes.find(prefix);
+  if (it != programmedRoutes.end()) {
+    XLOGF(
+        DBG2,
+        "getFibWeightedNexthops: Found {} nexthops for prefix {}",
+        it->second->size(),
+        prefixStr);
+    return it->second;
+  }
+
+  XLOGF(WARN, "getFibWeightedNexthops: Prefix {} not found in FIB", prefixStr);
+  return nullptr;
+}
+
+uint64_t E2ETestFixture::getPeerCachedRibVersion(
+    const folly::IPAddress& peerAddr) {
+  if (!peerManager_) {
+    XLOG(ERR, "PeerManager is not initialized");
+    return 0;
+  }
+
+  BgpPeerId peerId{peerAddr, peerAddr.asV4().toLongHBO()};
+  uint64_t version = 0;
+
+  peerManager_->getEventBase().runInEventBaseThreadAndWait([&]() {
+    auto adjRib = peerManager_->findAdjRib(peerId);
+    if (adjRib) {
+      version = adjRib->getLastSeenRibVersion();
+    }
+  });
+
+  return version;
+}
+
+std::optional<E2ETestFixture::PeerQueues> E2ETestFixture::getPeerQueues(
+    const BgpPeerId& peerId) const {
+  auto it = peerQueues_.find(peerId);
+  if (it == peerQueues_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+std::unordered_map<BgpPeerId, E2ETestFixture::PeerQueues>
+E2ETestFixture::getAllPeerQueues() const {
+  return peerQueues_;
+}
+
+std::optional<BgpPeerId> E2ETestFixture::findPeerIdByAddress(
+    const folly::IPAddress& peerAddr) const {
+  for (const auto& [id, queues] : peerQueues_) {
+    if (id.peerAddr == peerAddr) {
+      return id;
+    }
+  }
+  return std::nullopt;
+}
+
+} // namespace bgp
+} // namespace facebook

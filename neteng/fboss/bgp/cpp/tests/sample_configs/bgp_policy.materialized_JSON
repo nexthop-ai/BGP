@@ -1,0 +1,273 @@
+{
+  "bgp_policy_statements": [
+    {
+      "name": "FA-ESW-IN-20170531",
+      "description": "FAv3 - ESW Ingress policy",
+      "policy_version": "0",
+      "policy_entries": [
+        {
+          "name": "FATAGG-ADMIT-NOT-TO-FAS",
+          "description": "FATAGG-ADMIT-NOT-TO-FAS - reject token 65520:404",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:404"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+            {
+              "type": 6
+            }
+          ]
+        },
+        {
+          "name": "re-prepend lb vips",
+          "description": "re-prepend lb vips tagged with 1x65000 token (always through-fa)",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "community_filter1",
+                  "description": "",
+                  "communities": [
+                    "65520:491"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+            {
+              "type": 1,
+              "set_as_path_prepend": {
+                "asn": 65000,
+                "repeat_times": 1
+              }
+            },
+            {
+              "type": 2,
+              "community_action": {
+                "name": "",
+                "description": "",
+                "communities": [
+                  "65520:491"
+                ],
+                "action_type": 3
+              }
+            },
+            {
+              "type": 9,
+              "as_path_overwrite_list": [0, 0]
+            }
+          ]
+        },
+        {
+          "name": "re-prepend lb vips 2",
+          "description": "re-prepend lb vips tagged with 2x65000 token (always through-fa)",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:492"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+            {
+              "type": 1,
+              "set_as_path_prepend": {
+                "asn": 65000,
+                "repeat_times": 2
+              }
+            },
+            {
+              "type": 2,
+              "community_action": {
+                "name": "",
+                "description": "",
+                "communities": [
+                  "65520:492"
+                ],
+                "action_type": 3
+              }
+            }
+          ]
+        },
+        {
+          "name": "re-prepend lb vips 3",
+          "description": "re-prepend lb vips tagged with 3x65000 token (always through-fa)",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:493"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+            {
+              "type": 1,
+              "set_as_path_prepend": {
+                "asn": 65000,
+                "repeat_times": 3
+              }
+            },
+            {
+              "type": 2,
+              "community_action": {
+                "name": "",
+                "description": "",
+                "communities": [
+                  "65520:493"
+                ],
+                "action_type": 3
+              }
+            }
+          ]
+        },
+        {
+          "name": "protection against un-prepended vip leaks",
+          "description": "protection against un-prepended vip leaks - all vips must have re-prepend token above",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65529:11[0-9]10"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+            {
+              "type": 6
+            }
+          ]
+        },
+        {
+          "name": "anything with pre-admission through fa -> allow, keep through token",
+          "description": "anything with pre-admission through fa -> allow, keep through token",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:434"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+
+          ]
+        },
+        {
+          "name": "anything with pre-admission to fa -> allow, remove used token",
+          "description": "anything with pre-admission to fa -> allow, remove used token",
+          "policy_match_entries": {
+            "name": "",
+            "description": "",
+            "match_logic_type": 1,
+            "match_entries": [
+              {
+                "type": 3,
+                "communities_filter": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:424"
+                  ],
+                  "boolean_operator": 2
+                }
+              }
+            ]
+          },
+          "policy_action_entries": [
+            {
+              "type": 2,
+              "community_action": {
+                "name": "",
+                "description": "",
+                "communities": [
+                  "65520:424"
+                ],
+                "action_type": 3
+              }
+            }
+          ]
+        },
+        {
+          "name": "explicit deny all",
+          "description": "explicit deny all",
+          "policy_action_entries": [
+            {
+              "type": 6
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "community_lists": [
+
+  ],
+  "aspath_lists": [
+
+  ],
+  "prefix_lists": [
+
+  ]
+}

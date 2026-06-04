@@ -1,0 +1,231 @@
+{
+  "policies": {
+    "bgp_policy_statements": [
+      {
+        "name": "PROPAGATE_NOTHING",
+        "description": "Block all",
+        "policy_version": "",
+        "policy_entries": [
+
+        ]
+      },
+      {
+        "name": "RSW-SLB-IN",
+        "description": "Ingress policy for SLB on RSW",
+        "policy_version": "2014032201",
+        "policy_entries": [
+          {
+            "name": "",
+            "description": "",
+            "policy_match_entries": {
+              "name": "",
+              "description": "",
+              "match_logic_type": 1,
+              "match_entries": [
+                {
+                  "type": 5,
+                  "prefix_filters": {
+                    "name": "",
+                    "description": "",
+                    "prefixes": [
+                      {
+                        "base_prefix": "0.0.0.0/0",
+                        "prefix_len_ranges": [
+                          {
+                            "value": 24,
+                            "compare_operator": 6
+                          }
+                        ],
+                        "match_logic": 0
+                      }
+                    ],
+                    "prefix_list_names": [
+
+                    ],
+                    "boolean_operator": 2
+                  }
+                }
+              ]
+            },
+            "policy_action_entries": [
+              {
+                "type": 6
+              }
+            ]
+          },
+          {
+            "name": "",
+            "description": "",
+            "policy_match_entries": {
+              "name": "",
+              "description": "",
+              "match_logic_type": 1,
+              "match_entries": [
+                {
+                  "type": 5,
+                  "prefix_filters": {
+                    "name": "",
+                    "description": "",
+                    "prefixes": [
+                      {
+                        "base_prefix": "::/0",
+                        "prefix_len_ranges": [
+                          {
+                            "value": 48,
+                            "compare_operator": 6
+                          }
+                        ],
+                        "match_logic": 0
+                      }
+                    ],
+                    "prefix_list_names": [
+
+                    ],
+                    "boolean_operator": 2
+                  }
+                }
+              ]
+            },
+            "policy_action_entries": [
+              {
+                "type": 6
+              }
+            ]
+          },
+          {
+            "name": "",
+            "description": "backup anycast path",
+            "policy_match_entries": {
+              "name": "",
+              "description": "",
+              "match_logic_type": 1,
+              "match_entries": [
+                {
+                  "type": 19,
+                  "as_path_len_with_confed_filter": [
+                    {
+                      "value": 3,
+                      "compare_operator": 1
+                    }
+                  ]
+                }
+              ]
+            },
+            "policy_action_entries": [
+              {
+                "type": 3,
+                "set_local_pref": {
+                  "name": "",
+                  "description": "",
+                  "local_pref": 100,
+                  "boolean_operator": 2
+                }
+              },
+              {
+                "type": 2,
+                "community_action": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:100"
+                  ],
+                  "action_type": 1
+                }
+              }
+            ]
+          },
+          {
+            "name": "",
+            "description": "secondary anycast path announcement",
+            "policy_match_entries": {
+              "name": "",
+              "description": "",
+              "match_logic_type": 1,
+              "match_entries": [
+                {
+                  "type": 19,
+                  "as_path_len_with_confed_filter": [
+                    {
+                      "value": 2,
+                      "compare_operator": 1
+                    }
+                  ]
+                }
+              ]
+            },
+            "policy_action_entries": [
+              {
+                "type": 3,
+                "set_local_pref": {
+                  "name": "",
+                  "description": "",
+                  "local_pref": 105,
+                  "boolean_operator": 2
+                }
+              },
+              {
+                "type": 2,
+                "community_action": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:100"
+                  ],
+                  "action_type": 1
+                }
+              }
+            ]
+          },
+          {
+            "name": "",
+            "description": "primary anycast path announcement",
+            "policy_match_entries": {
+              "name": "",
+              "description": "",
+              "match_logic_type": 1,
+              "match_entries": [
+                {
+                  "type": 19,
+                  "as_path_len_with_confed_filter": [
+                    {
+                      "value": 1,
+                      "compare_operator": 1
+                    }
+                  ]
+                }
+              ]
+            },
+            "policy_action_entries": [
+              {
+                "type": 3,
+                "set_local_pref": {
+                  "name": "",
+                  "description": "",
+                  "local_pref": 110,
+                  "boolean_operator": 2
+                }
+              },
+              {
+                "type": 2,
+                "community_action": {
+                  "name": "",
+                  "description": "",
+                  "communities": [
+                    "65520:100"
+                  ],
+                  "action_type": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "community_lists": [
+    ],
+    "aspath_lists": [
+    ],
+    "prefix_lists": [
+    ]
+  }
+}

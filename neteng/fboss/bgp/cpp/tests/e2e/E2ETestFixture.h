@@ -1,0 +1,1100 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * E2ETestFixture.h
+ *
+ * Test fixture for E2E testing of RIB and PeerManager.
+ * Tests complete BGP flows without mocking core components.
+ */
+
+#pragma once
+
+#define PeerManager_TEST_FRIENDS friend class E2ETestFixture;
+#define AdjRib_TEST_FRIENDS friend class E2ETestFixture;
+#define RibBase_TEST_FRIENDS friend class E2ETestFixture;
+
+#include <gtest/gtest.h>
+
+#include <folly/coro/BlockingWait.h>
+#include <folly/logging/xlog.h>
+
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
+#include "neteng/fboss/bgp/cpp/common/RibMessage.h"
+#include "neteng/fboss/bgp/cpp/config/Config.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
+#include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopStatus.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/tests/MockSessionManager.h"
+#include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/e2e/E2ETestUtils.h"
+#include "neteng/fboss/bgp/cpp/watchdog/MonitoredQueue.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/BgpStructs_types.h"
+
+namespace facebook {
+namespace bgp {
+
+using nettools::bgplib::BgpEndOfRib;
+using nettools::bgplib::BgpPeerDisplayInfo;
+using nettools::bgplib::BgpSessionState;
+using nettools::bgplib::BgpUpdate2;
+using nettools::bgplib::VersionNumber;
+
+/*
+ * Specification for creating a BGP peer configuration
+ */
+struct BgpPeerSpec {
+  uint32_t asn;
+  folly::IPAddress localAddr;
+  folly::IPAddress peerAddr;
+  folly::IPAddress v4Nexthop;
+  folly::IPAddress v6Nexthop;
+  std::string description;
+  bool allowAsIn = true;
+  std::string peerType = kPeerTypeCsw;
+  bool disableIpv4Afi = false;
+  bool disableIpv6Afi = false;
+  std::optional<int32_t> outDelaySeconds; /* out-delay timer in seconds */
+  /*
+   * ADD-PATH capability for this peer.
+   * - std::nullopt: No ADD-PATH capability (default, non-ADD-PATH peer)
+   * - RECEIVE: Peer can receive multiple paths
+   * - SEND: Peer can send multiple paths
+   * - BOTH: Peer can both send and receive multiple paths
+   */
+  std::optional<nettools::bgplib::BgpAddPathSendRec> addPathCapability =
+      std::nullopt;
+  /*
+   * LBW (Link Bandwidth) extended community configuration for this peer.
+   * - advertiseLinkBandwidth: Controls egress LBW behavior
+   * - receiveLinkBandwidth: Controls ingress LBW behavior
+   * - std::nullopt means unconfigured (uses default behavior)
+   */
+  std::optional<AdvertiseLinkBandwidth> advertiseLinkBandwidth = std::nullopt;
+  std::optional<ReceiveLinkBandwidth> receiveLinkBandwidth = std::nullopt;
+  std::optional<std::string> egressPolicyName = std::nullopt;
+  /*
+   * Confederation peer settings. When isConfedPeer=true the peer is treated
+   * as a ConfedEBGP session. localConfedAsn must be set on at least one
+   * confed peer in the fixture and identifies the parent confederation AS;
+   * the value is plumbed into thriftConfig.local_confed_as_4_byte by
+   * getConfig(). Conflicting localConfedAsn values across peers throw.
+   */
+  bool isConfedPeer = false;
+  std::optional<uint32_t> localConfedAsn = std::nullopt;
+
+  /*
+   * Route-Reflector client toggle. When true, an IBGP peer is treated as
+   * an RR client and the peer-level canAnnounce / group-level
+   * canAnnounceForGroup paths skip the IBGP split-horizon early-return,
+   * letting downstream filters (e.g., RFC 1997 NO_ADVERTISE) decide.
+   */
+  bool isRrClient = false;
+};
+
+/* Inline default peer specs for common test scenarios */
+inline const BgpPeerSpec kDefaultPeerSpec3 = {
+    .asn = kPeerAsn3,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr3,
+    .v4Nexthop = kNextHopV4_3,
+    .v6Nexthop = kNextHopV6_3,
+    .description = kDescription1,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec4 = {
+    .asn = kPeerAsn4,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr4,
+    .v4Nexthop = kNextHopV4_4,
+    .v6Nexthop = kNextHopV6_4,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec5 = {
+    .asn = kPeerAsn5,
+    .localAddr = kLocalAddr5,
+    .peerAddr = kPeerAddr5,
+    .v4Nexthop = kNextHopV4_5,
+    .v6Nexthop = kNextHopV6_5,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec3_v6 = {
+    .asn = kPeerAsn3,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr3,
+    .v4Nexthop = kEmptyV4Nexthop,
+    .v6Nexthop =
+        kNextHopV6_3, /* 2401:db00:e011:411:1000::29 - expected by tests */
+    .description = kDescription1,
+    .disableIpv4Afi = true, /* v6-only peer - single EoR */
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec3_v4only = {
+    .asn = kPeerAsn3,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr3,
+    .v4Nexthop = kNextHopV4_3,
+    .v6Nexthop = kEmptyV6Nexthop,
+    .description = kDescription1,
+    .disableIpv6Afi = true,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec4_v4only = {
+    .asn = kPeerAsn4,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr4,
+    .v4Nexthop = kNextHopV4_4,
+    .v6Nexthop = kEmptyV6Nexthop,
+    .disableIpv6Afi = true,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec4_v6 = {
+    .asn = kPeerAsn4,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr4,
+    .v4Nexthop = kEmptyV4Nexthop,
+    .v6Nexthop =
+        kNextHopV6_4, /* 2401:db00:e011:411:1000::2b - expected by tests */
+    .disableIpv4Afi = true, /* v6-only peer - single EoR */
+};
+
+/*
+ * Peer specs with out-delay configured for testing AdjRibOut delay behavior.
+ * Peer3: Receives routes (0s out-delay - immediate advertisement)
+ * Peer4: Receives routes (0s out-delay - immediate advertisement)
+ * Peer5: Advertises routes with 1s out-delay
+ */
+inline const BgpPeerSpec kDefaultPeerSpec3_outDelay0s = {
+    .asn = kPeerAsn3,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr3,
+    .v4Nexthop = kNextHopV4_3,
+    .v6Nexthop = kNextHopV6_3,
+    .description = kDescription1,
+    .outDelaySeconds = 0,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec4_outDelay0s = {
+    .asn = kPeerAsn4,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr4,
+    .v4Nexthop = kNextHopV4_4,
+    .v6Nexthop = kNextHopV6_4,
+    .outDelaySeconds = 0,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec5_outDelay1s = {
+    .asn = kPeerAsn5,
+    .localAddr = kLocalAddr5,
+    .peerAddr = kPeerAddr5,
+    .v4Nexthop = kNextHopV4_5,
+    .v6Nexthop = kNextHopV6_5,
+    .outDelaySeconds = 1,
+};
+
+/*
+ * ADD-PATH enabled peer specs
+ * These peers have ADD-PATH capability enabled for receiving multiple paths.
+ */
+inline const BgpPeerSpec kDefaultPeerSpec3_AddPath = {
+    .asn = kPeerAsn3,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr3,
+    .v4Nexthop = kNextHopV4_3,
+    .v6Nexthop = kNextHopV6_3,
+    .description = kDescription1,
+    .addPathCapability = nettools::bgplib::BgpAddPathSendRec::BOTH,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec4_AddPath = {
+    .asn = kPeerAsn4,
+    .localAddr = kLocalAddr1,
+    .peerAddr = kPeerAddr4,
+    .v4Nexthop = kNextHopV4_4,
+    .v6Nexthop = kNextHopV6_4,
+    .addPathCapability = nettools::bgplib::BgpAddPathSendRec::BOTH,
+};
+
+inline const BgpPeerSpec kDefaultPeerSpec5_AddPath = {
+    .asn = kPeerAsn5,
+    .localAddr = kLocalAddr5,
+    .peerAddr = kPeerAddr5,
+    .v4Nexthop = kNextHopV4_5,
+    .v6Nexthop = kNextHopV6_5,
+    .addPathCapability = nettools::bgplib::BgpAddPathSendRec::BOTH,
+};
+
+/*
+ * E2ETestFixture
+ * Base fixture for RIB + PeerManager E2E tests.
+ * Manages component lifecycle and provides helpers for BGP operations.
+ */
+class E2ETestFixture : public ::testing::Test {
+ protected:
+  // Clean up all components
+  void TearDown() override;
+
+  // Create and start RIB with TestFib
+  void createRib(
+      bool enableNexthopTracking = false,
+      const std::unordered_map<folly::CIDRNetwork, thrift::BgpNetwork>&
+          localRoutes = {});
+
+  // ==================== PEER MANAGEMENT ====================
+
+  /*
+   * Add a peer to the configuration (call before createPeerManager)
+   */
+  void addPeer(const BgpPeerSpec& spec);
+
+  /*
+   * Remove a peer from the configuration
+   */
+  void deletePeer(const folly::IPAddress& peerAddr);
+
+  /*
+   * Drive PeerManager::delPeers at runtime.
+   */
+  folly::Expected<folly::Unit, nettools::bgplib::FiberBgpPeerManager::ErrorCode>
+  delPeerAtRuntime(const folly::IPAddress& peerAddr);
+
+  /*
+   * Establish a BGP session for a peer (bring peer up)
+   * Uses default queue sizes set via setDefaultQueueSizes()
+   */
+  void bringUpPeer(
+      const folly::IPAddress& peerAddr,
+      uint64_t versionNumber = 1);
+
+  /*
+   * Bring up a peer with its queue pre-blocked.
+   *
+   * Blocks the peer BEFORE establishing the session so the init dump
+   * PL cannot drain. This holds the peer in DETACHED_INIT_DUMP until
+   * unblockPeer() is called, making DID reliably observable in tests.
+   */
+  void bringUpPeerBlocked(
+      const folly::IPAddress& peerAddr,
+      uint64_t versionNumber = 1);
+
+  /*
+   * Test-only: defer init dump for a specific reconnecting peer.
+   * When deferred, processRibDumpReq re-buffers the request instead of
+   * walking the shadow RIB, keeping that peer in DETACHED_INIT_DUMP.
+   * Call with false to resume normal dump processing for the peer.
+   */
+  void testOnlyDeferInitDump(const folly::IPAddress& peerAddr, bool defer);
+
+  /*
+   * Test-only: defer DRJ acceptance for a specific peer.
+   * When deferred, the peer stays in DETACHED_READY_TO_JOIN.
+   * On release, triggers acceptance so the peer can rejoin the group.
+   */
+  void testOnlyDeferDrjAcceptance(const folly::IPAddress& peerAddr, bool defer);
+
+  /*
+   * Tear down a BGP session for a peer (bring peer down).
+   */
+  void bringDownPeer(const folly::IPAddress& peerAddr, bool peerDelete = false);
+
+  /*
+   * Tear down a BGP session for a peer with gracefulRestart=true so the
+   * AdjRib enters GR helper mode (schedules remoteGrRestartTimer_ and
+   * keeps stale routes in adjRibInStale_). Otherwise mirrors
+   * bringDownPeer().
+   */
+  void bringDownPeerWithGr(const folly::IPAddress& peerAddr);
+
+  /*
+   * Run AdjRib::stop() synchronously on the PeerManager event base. Tests
+   * that exercise AdjRib teardown (e.g. the pendingRibInPushes_ drain)
+   * call this directly instead of going through cleanupPeerState().
+   */
+  void runAdjRibStop(const std::shared_ptr<AdjRib>& adjRib);
+
+  /*
+   * Get the peer's current update-group state.
+   */
+  PeerUpdateState getPeerState(const nettools::bgplib::BgpPeerId& peerId);
+
+  /*
+   * Dispatch a STALE sessionEstablished event for a peer (S619541 test helper).
+   *
+   * Constructs a sessionEstablished event with a version mismatch: the event
+   * carries versionNumber=X but the underlying VersionNumber is bumped to a
+   * higher value before dispatch. This simulates FiberBgpPeer creating the
+   * event, then the session flapping and FiberBgpPeer bumping the version for
+   * a new incarnation before PeerManager processes the old event.
+   *
+   * PeerManager::sessionEstablished() will:
+   *  1. Wait on the terminate baton (passes if already posted)
+   *  2. Detect the version mismatch -> early return
+   *  3. Leave the baton posted (no reset on early return)
+   *
+   * Call after bringDownPeer() and before the next bringUpPeer() to simulate
+   * the rapid session flap with version compression scenario.
+   */
+  void dispatchStaleSessionEstablished(const folly::IPAddress& peerAddr);
+
+  // ==================== LOCAL ROUTE MANAGEMENT ====================
+
+  /*
+   * Add a local route to be originated (call before createRib)
+   */
+  void addLocalRoute(
+      const std::string& prefix,
+      const std::vector<std::string>& communities = {},
+      uint32_t localPref = kLocalPref,
+      const std::string& nexthop = "",
+      uint32_t minSupportingRoutes = 0);
+
+  /*
+   * Inject local routes at runtime (call after RIB is running)
+   */
+  void injectLocalRoutesAtRuntime(
+      const std::vector<std::string>& prefixes,
+      const std::vector<std::string>& communities = {},
+      uint32_t localPref = kLocalPref);
+
+  /*
+   * Withdraw local routes at runtime (call after RIB is running)
+   */
+  void withdrawLocalRoutesAtRuntime(const std::vector<std::string>& prefixes);
+
+  // ==================== POLICY CONFIGURATION ====================
+
+  /*
+   * Set the ingress policy configuration (call before createRib)
+   * The policy will be applied to routes received from peers.
+   *
+   * @param policies The BgpPolicies configuration to use
+   */
+  void setPolicyConfig(const bgp_policy::BgpPolicies& policies);
+
+  /*
+   * Add a policy that denies routes matching a prefix list
+   * Helper for common deny-by-prefix-list scenario.
+   * Call before createRib().
+   *
+   * @param prefixes Vector of prefix strings to deny (e.g., "10.0.0.0/8")
+   */
+  void addPrefixDenyPolicy(const std::vector<std::string>& prefixes);
+
+  /*
+   * Add a policy that denies routes matching a community
+   * Helper for common deny-by-community scenario.
+   * Call before createRib().
+   *
+   * @param community Community string to match and deny (e.g., "65000:100")
+   */
+  void addCommunityDenyPolicy(const std::string& community);
+
+  /*
+   * Add a policy that sets local preference for routes matching a community
+   * Helper for common set-local-pref-by-community scenario.
+   * Call before createRib().
+   *
+   * @param matchCommunity Community to match
+   * @param localPref Local preference value to set
+   */
+  void addCommunitySetLocalPrefPolicy(
+      const std::string& matchCommunity,
+      uint32_t localPref);
+
+  /*
+   * Wait for a route to appear in PeerManager's shadowRIB
+   * Thread-safe: runs check on PeerManager's event base
+   * Returns true if route found within retries, false otherwise
+   *
+   * If fromPeer is specified, waits for a route from that specific peer
+   * (checks bestpath->peer.addr matches). This is useful when a prefix
+   * may already exist but we're waiting for a bestpath change.
+   */
+  bool waitForRouteInShadowRib(
+      const folly::CIDRNetwork& prefix,
+      std::optional<folly::IPAddress> fromPeer = std::nullopt,
+      int maxRetries = 50);
+
+  /*
+   * Verify a route does NOT appear in PeerManager's shadowRIB after waiting
+   * Thread-safe: runs check on PeerManager's event base
+   * Returns true if route is NOT found after waiting, false if route exists
+   * Unlike waitForRouteInShadowRib, this does NOT record test failures
+   */
+  bool verifyRouteNotInShadowRib(
+      const folly::CIDRNetwork& prefix,
+      int waitRetries = 5);
+
+  /*
+   * Wait for a route to have at least minPathCount paths in the RIB
+   * Thread-safe: runs check on RIB's event base
+   * Returns true if path count reached within retries, false otherwise
+   *
+   * @param prefixStr The prefix string (e.g., "10.0.0.0/8")
+   * @param minPathCount Minimum number of paths to wait for
+   * @param maxRetries Number of retry attempts (default 20)
+   */
+  bool waitForPathCountInRib(
+      const std::string& prefixStr,
+      size_t minPathCount,
+      int maxRetries = 20);
+
+  /*
+   * Wait for a route to be withdrawn from the RIB (no paths remaining)
+   * Thread-safe: runs check on RIB's event base
+   * Returns true if route is withdrawn within retries, false otherwise
+   *
+   * @param prefixStr The prefix string (e.g., "10.0.0.0/8")
+   * @param maxRetries Number of retry attempts (default 20)
+   */
+  bool waitForRouteWithdrawnFromRib(
+      const std::string& prefixStr,
+      int maxRetries = 20);
+
+  /*
+   * Verify multipath (ECMP) nexthops for a prefix in the RIB.
+   * Returns the number of nexthops in the weighted nexthop map.
+   * Use this to verify ECMP/UCMP behavior.
+   *
+   * @param prefixStr The prefix string (e.g., "10.0.0.0/8")
+   * @return Number of nexthops, or 0 if prefix not found
+   */
+  size_t getMultipathNexthopCount(const std::string& prefixStr);
+
+  /*
+   * Wait for a route to have at least minNexthops in the weighted nexthop map.
+   * This verifies ECMP/UCMP multipath behavior.
+   *
+   * @param prefixStr The prefix string (e.g., "10.0.0.0/8")
+   * @param minNexthops Minimum number of nexthops to wait for
+   * @param maxRetries Number of retry attempts (default 20)
+   * @return true if minNexthops reached, false otherwise
+   */
+  bool waitForMultipathNexthopCount(
+      const std::string& prefixStr,
+      size_t minNexthops,
+      int maxRetries = 20);
+
+  /*
+   * Get the weighted nexthops for a prefix in the RIB.
+   * Returns a copy of the weighted nexthop map (nexthop IP -> weight).
+   * Use this to verify specific ECMP/UCMP legs and their weights.
+   *
+   * @param prefixStr The prefix string (e.g., "10.0.0.0/8")
+   * @return Map of nexthop IP addresses to weights, empty if prefix not found
+   */
+  std::map<folly::IPAddress, uint32_t> getWeightedNexthops(
+      const std::string& prefixStr);
+
+  // ==================== COMPONENT LIFECYCLE ====================
+
+  /*
+   * Set default queue sizes for all peers
+   * Call before bringUpPeer() to use custom queue sizes
+   * For blocking tests: setDefaultQueueSizes(1, 1, 0) or (2, 1, 0)
+   */
+  void setDefaultQueueSizes(int capacity = 8, int highWm = 6, int lowWm = 2) {
+    defaultQueueCapacity_ = capacity;
+    defaultQueueHighWm_ = highWm;
+    defaultQueueLowWm_ = lowWm;
+  }
+
+  /* Create and start PeerManager with MockSessionManager
+   * enableUpdateGroup: Enable update group optimization
+   * enableEgressBackpressure: Enable egress queue backpressure
+   * enableSerializeGroupPdu: Enable group PDU serialization for zero-copy
+   * NOTE: All features default to TRUE for comprehensive E2E testing
+   */
+  void createPeerManager(
+      bool enableUpdateGroup = true,
+      bool enableEgressBackpressure = true,
+      bool enableSerializeGroupPdu = false);
+
+  // Establish a BGP session for a peer
+  void establishSession(const BgpPeerId& peerId, uint64_t versionNumber = 1);
+
+  // Send BGP UPDATE to a peer
+  void sendUpdateToPeer(
+      const BgpPeerId& peerId,
+      const folly::CIDRNetwork& prefix);
+
+  // Send End-of-RIB marker to a peer
+  void sendEoRToPeer(const BgpPeerId& peerId);
+
+  // Read outbound UPDATE from peer's queue
+  std::optional<std::shared_ptr<const BgpUpdate2>> readOutboundUpdateToPeer(
+      const BgpPeerId& peerId);
+
+  /*
+   * Wait for an UPDATE to appear in peer's outbound queue, then read it.
+   * Uses event loop pumping for deterministic wait (no sleep).
+   * Returns the UPDATE if found within maxRetries, nullopt otherwise.
+   */
+  std::optional<std::shared_ptr<const BgpUpdate2>> waitForOutboundUpdate(
+      const BgpPeerId& peerId,
+      int maxRetries = 50);
+
+  /*
+   * Wait for and consume End-of-RIB marker from peer's outbound queue
+   * Returns true if EoR was received, false if timeout/queue closed
+   */
+  bool waitForEoR(const BgpPeerId& peerId);
+
+  // ==================== QUEUE BLOCKING HELPERS ====================
+
+  /*
+   * Check if a peer's bounded egress queue is blocked (full)
+   * Returns true if queue is at or above high watermark
+   */
+  bool isPeerQueueBlocked(const BgpPeerId& peerId);
+
+  /*
+   * Wait for a peer's bounded egress queue to become blocked
+   * Uses retries to wait for routes to reach the queue
+   * Returns true if queue becomes blocked within timeout, false otherwise
+   */
+  bool waitForPeerQueueBlocked(const BgpPeerId& peerId, int maxRetries = 50);
+
+  /*
+   * Get current size of peer's bounded queue
+   */
+  size_t getPeerQueueSize(const BgpPeerId& peerId);
+
+  /*
+   * Drain a peer's queue completely by reading all messages
+   * Useful for unblocking peers in tests
+   *
+   * maxRetries: Number of times to retry checking the queue when it's empty.
+   *             This allows time for in-flight messages to arrive.
+   *             Each retry pumps the RIB and PeerManager event loops.
+   *             Default is 5 retries.
+   *
+   * maxMessages: Maximum number of messages to drain before stopping.
+   *              This prevents infinite draining if messages keep arriving.
+   *              Default is 100. Set to 0 for unlimited (use with caution).
+   *
+   * Returns: Number of messages actually drained from the queue.
+   */
+  size_t drainPeerQueueCompletely(
+      const BgpPeerId& peerId,
+      int maxRetries = 5,
+      int maxMessages = 100);
+
+  /*
+   * Block a peer's egress queue
+   *
+   * Sets a flag that prevents reading from this peer's queue.
+   * The queue will fill up naturally and cause backpressure.
+   *
+   * Usage pattern:
+   * 1. Set small queue sizes with setDefaultQueueSizes(1, 1, 0) BEFORE
+   * bringUpPeer()
+   * 2. blockPeer(peerAddr) - prevents queue reads
+   * 3. Send routes - queue fills and blocks
+   * 4. unblockPeer(peerAddr) - clears flag and drains queue
+   */
+  void blockPeer(const folly::IPAddress& peerAddr);
+
+  /*
+   * Unblock a peer by clearing the block flag and draining its egress queue
+   *
+   * maxRetries: Number of retries when draining (default 5)
+   * maxMessages: Maximum messages to drain (default 100)
+   *
+   * Returns true if peer was previously blocked, false otherwise
+   */
+  bool unblockPeer(
+      const folly::IPAddress& peerAddr,
+      int maxRetries = 5,
+      int maxMessages = 100);
+
+  /*
+   * Check if a peer is blocked (has block flag set)
+   */
+  bool isPeerBlocked(const folly::IPAddress& peerAddr) const;
+
+  /*
+   * Check if a peer's egress queue is empty (no pending routes to advertise)
+   * This checks the ACTUAL egress queue, not shadowRib.
+   * Used for out-delay testing to verify routes are deferred.
+   */
+  bool isPeerEgressQueueEmpty(const folly::IPAddress& peerAddr);
+
+  /*
+   * Wait for a peer's egress queue to become non-empty
+   * Returns true if message arrives within retries, false otherwise
+   */
+  bool waitForPeerEgressQueueNonEmpty(
+      const folly::IPAddress& peerAddr,
+      int maxRetries = 50);
+
+  // ==================== NEW HELPER APIS ====================
+
+  /*
+   * Add or update a BGP route from a peer
+   * Required: protocol, prefix, prefixLen, nexthop
+   * Optional: asPath (empty if not specified), community (empty if not
+   * specified)
+   */
+  void addRoute(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      const std::string& nexthop,
+      const std::string& asPath = "",
+      const std::string& community = "",
+      uint32_t addPathId = 0,
+      uint32_t localPref = 100,
+      uint32_t med = 0);
+
+  /*
+   * Add or update a BGP route with Link Bandwidth extended community.
+   * Use this for UCMP weight verification tests.
+   *
+   * @param linkBandwidthGbps Link bandwidth in Gbps (e.g., 10.0 for 10 Gbps)
+   */
+  void addRouteWithLbw(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      const std::string& nexthop,
+      const std::string& asPath,
+      float linkBandwidthGbps,
+      uint32_t localPref = 100);
+
+ public:
+  /*
+   * Add or update a BGP route with arbitrary extended communities.
+   */
+  void addRouteWithExtCommunities(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      const std::string& nexthop,
+      const std::string& asPath,
+      const std::vector<nettools::bgplib::BgpAttrExtCommunityC>& extCommunities,
+      uint32_t localPref = 100);
+
+  /*
+   * Get an AdjRibEntry from a peer's AdjRib.
+   * Wraps private PeerManager::adjRibs_ access (requires friend access).
+   */
+
+  AdjRibEntry* getAdjRibEntry(
+      const BgpPeerId& peerId,
+      bool ingress,
+      const folly::CIDRNetwork& prefix);
+
+  /*
+   * Get AdjRib for a peer by IP address.
+   * Iterates PeerManager::adjRibs_ to find the matching entry.
+   */
+  std::shared_ptr<AdjRib> getAdjRibByAddr(const folly::IPAddress& peerAddr);
+
+ protected:
+  /*
+   * Delete a BGP route from a peer
+   */
+  void deleteRoute(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      uint32_t addPathId = 0);
+
+  /*
+   * Verify a route announcement (REACH NLRI) in peer's outbound queue
+   * Required: protocol, prefix, prefixLen, peer, expectedNexthop
+   * Optional: expectedAsPath (not matched if empty), expectedCommunity (not
+   * matched if empty)
+   * maxWaitRetries: if > 0, use event loop pumping to wait for update
+   *                 (deterministic, no sleep); if 0, block on queue
+   */
+  bool verifyRouteAdd(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      const std::string& expectedNexthop,
+      const std::string& expectedAsPath = "",
+      const std::string& expectedCommunity = "",
+      uint32_t addPathId = 0,
+      int maxWaitRetries = 0);
+
+  /*
+   * Drain peer's outbound queue looking for ONE announcement matching the
+   * target prefix + nexthop (and optionally AS path / community).
+   *
+   * Use this in tests where the queue may contain noise (other route
+   * pushes, withdrawals, EoRs) from earlier test phases — e.g., after
+   * a session-flap thrash. Unlike verifyRouteAdd which reads one message
+   * and checks, this consumes messages until the target is found OR the
+   * queue is provably empty after flushing rib_/peerManager_ event bases.
+   *
+   * maxFlushRetries: how many times to flush the evbs when the queue is
+   *                  empty before concluding "not coming". Each flush is
+   *                  a runInEventBaseThreadAndWait — deterministic sync.
+   *                  Default 10 covers normal multi-stage async pipelines.
+   *
+   * Returns true if a matching announcement was popped, false if the
+   * queue drained to empty without finding it.
+   */
+  bool drainAndFindRouteAdvertised(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      const std::string& expectedNexthop,
+      const std::string& expectedAsPath = "",
+      const std::string& expectedCommunity = "",
+      uint32_t addPathId = 0,
+      int maxFlushRetries = 10);
+
+  /*
+   * Verify a route withdrawal (UNREACH NLRI) in peer's outbound queue
+   */
+  bool verifyRouteWithdraw(
+      const std::string& protocol,
+      const std::string& prefix,
+      uint8_t prefixLen,
+      const folly::IPAddress& peer,
+      uint32_t addPathId = 0);
+
+  // ==================== NEXTHOP TRACKING APIS ====================
+
+  /*
+   * Inject nexthop statuses into RIB's NexthopCache
+   * Used for testing nexthop tracking behavior
+   *
+   * @param nexthopStatuses Vector of NexthopStatus objects to inject
+   */
+  void injectNexthopStatuses(const std::vector<NexthopStatus>& nexthopStatuses);
+
+  /*
+   * Verify nexthop route count in RIB's nexthopInfoMap_
+   * Thread-safe: runs check on RIB's event base
+   *
+   * @param nexthopIp IP address of the nexthop to check
+   * @param expectedRouteCount Expected number of routes using this nexthop.
+   *                           If std::nullopt, verifies nexthop does NOT exist.
+   *                           If has_value(), verifies nexthop exists with
+   *                           exactly that many routes.
+   * @return true if verification passes, false otherwise
+   */
+  bool verifyNexthopRouteCount(
+      const folly::IPAddress& nexthopIp,
+      std::optional<size_t> expectedRouteCount = std::nullopt);
+
+  /*
+   * Get the bestpath for a prefix from RIB
+   * Thread-safe: runs check on RIB's event base
+   *
+   * @param prefix The prefix to query
+   * @return shared_ptr to RouteInfo if bestpath exists, nullptr otherwise
+   */
+  std::shared_ptr<RouteInfo> getBestPath(const folly::CIDRNetwork& prefix);
+
+  /*
+   * Get the weighted nexthops for a prefix from the FIB
+   * Used for ECMP verification - checks what nexthops were programmed to FIB
+   *
+   * @param prefixStr Prefix string in CIDR notation (e.g., "10.0.0.0/8")
+   * @return shared_ptr to WeightedNexthopMap if found, nullptr otherwise
+   */
+  std::shared_ptr<const WeightedNexthopMap> getFibWeightedNexthops(
+      const std::string& prefixStr);
+
+  /*
+   * Get the cached RIB version for a peer.
+   * Thread-safe: runs check on PeerManager's event base.
+   *
+   * @param peerAddr The peer's IP address
+   * @return The peer's cached RIB version, or 0 if peer not found
+   */
+  uint64_t getPeerCachedRibVersion(const folly::IPAddress& peerAddr);
+
+ public:
+  /*
+   * Route specification for batch operations
+   */
+  struct RouteSpec {
+    std::string prefix;
+    uint8_t prefixLen;
+    std::string nexthop;
+    std::string asPath;
+    std::string community;
+    uint32_t addPathId = 0;
+    uint32_t localPref = 100;
+    uint32_t med = 0;
+  };
+
+  /*
+   * Verification specification for batch route verification
+   */
+  struct VerifySpec {
+    std::string prefix;
+    uint8_t prefixLen;
+    std::string expectedNexthop;
+    std::string expectedAsPath;
+    std::string expectedCommunity;
+    uint32_t addPathId = 0;
+  };
+
+  /*
+   * Withdrawal specification for batch withdrawal verification
+   */
+  struct WithdrawSpec {
+    std::string prefix;
+    uint8_t prefixLen;
+    uint32_t addPathId = 0;
+  };
+
+  struct PeerQueues {
+    std::shared_ptr<AdjRib::AdjRibInQueueT> adjRibInQ;
+    std::shared_ptr<AdjRib::AdjRibOutQueueT> adjRibOutQ;
+    std::shared_ptr<AdjRib::BoundedAdjRibOutQueueT> boundedAdjRibOutQ;
+  };
+
+  /*
+   * Look up the per-peer queues.
+   *
+   * Base impl reads from peerQueues_ (populated at establishSession). Derived
+   * fixtures whose underlying SessionManager owns the queues (e.g.
+   * E2ESessionTestFixture, where TestSessionManager swaps queues on hard
+   * reset) override these to read fresh from the session manager so callers
+   * never see stale shared_ptr refs to closed queues. T270956942.
+   */
+  virtual std::optional<PeerQueues> getPeerQueues(
+      const BgpPeerId& peerId) const;
+
+  virtual std::unordered_map<BgpPeerId, PeerQueues> getAllPeerQueues() const;
+
+  /*
+   * Find the BgpPeerId for a given peer address. Walks the source-of-truth
+   * directly (no temporary map copy), unlike the older
+   * findPeerIdByAddress(getAllPeerQueues(), ...) pattern. Override in
+   * derived fixtures whose source-of-truth differs from peerQueues_.
+   */
+  virtual std::optional<BgpPeerId> findPeerIdByAddress(
+      const folly::IPAddress& peerAddr) const;
+
+ protected:
+  /*
+   * Add multiple routes from a peer
+   */
+  void addRoutes(
+      const std::string& protocol,
+      const folly::IPAddress& peer,
+      const std::vector<RouteSpec>& routes);
+
+  /*
+   * Delete multiple routes from a peer
+   */
+  void deleteRoutes(
+      const std::string& protocol,
+      const folly::IPAddress& peer,
+      const std::vector<RouteSpec>& routes);
+
+  /*
+   * Verify multiple route announcements from a peer
+   */
+  bool verifyRoutes(
+      const std::string& protocol,
+      const folly::IPAddress& peer,
+      const std::vector<VerifySpec>& routes);
+
+  /*
+   * Verify multiple route withdrawals from a peer
+   */
+  bool verifyRouteWithdraws(
+      const std::string& protocol,
+      const folly::IPAddress& peer,
+      const std::vector<WithdrawSpec>& routes);
+
+  /*
+   * Enable UCMP weight calculation from LBW extended community.
+   * Call before createRib() to enable UCMP weight calculation.
+   */
+  void enableComputeUcmpFromLbw(bool enable = true);
+
+  /*
+   * Enable eiBGP multipath feature.
+   * Call before createRib() to enable eiBGP multipath.
+   * When enabled, EXTERNAL_ROUTE preference filter is skipped in best path
+   * selection, equalizing eBGP and iBGP paths.
+   */
+  void enableEiBgpMultipath(bool enable = true);
+
+  /*
+   * Override the update group config used by createPeerManager().
+   * Call before createPeerManager() to set slow peer thresholds, etc.
+   */
+  void setUpdateGroupConfig(const thrift::UpdateGroupConfig& cfg) {
+    updateGroupConfigOverride_ = cfg;
+  }
+
+  /*
+   * Override graceful_restart_convergence_seconds in the BgpConfig.
+   */
+  void setGrConvergenceSeconds(uint32_t seconds) {
+    grConvergenceSecondsOverride_ = seconds;
+  }
+
+  /*
+   * Sets the peer's negotiated GR capability and remote restart time used
+   * when establishing sessions. Call before bringUpPeer().
+   */
+  void setPeerGrRestartTimeSeconds(uint16_t seconds) {
+    peerGrRestartTimeSeconds_ = seconds;
+  }
+
+  /* Helper to build config with peers from peers_ vector */
+  std::shared_ptr<Config> getConfig(
+      bool enableUpdateGroup = false,
+      bool enableSerializeGroupPdu = false);
+
+  // Message queues for RIB/PeerManager communication
+  nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ_{
+      nettools::bgplib::kMaxIngressQueueSize};
+  MonitoredMPMCQueue<RibOutMessage> ribOutQ_;
+  std::optional<MonitoredMPMCQueue<NeighborWatcherMessage>> nbrRouteChangeQ_ =
+      std::make_optional<MonitoredMPMCQueue<NeighborWatcherMessage>>();
+
+  // Configuration
+  std::shared_ptr<Config> config_;
+  std::shared_ptr<ConfigManager> configManager_;
+
+  // Nexthop tracking configuration (shared between RIB and PeerManager)
+  bool enableNexthopTracking_ = false;
+
+  // UCMP configuration: compute UCMP weights from LBW extended community
+  bool enableComputeUcmpFromLbw_ = false;
+
+  // eiBGP configuration: equalize eBGP and iBGP paths
+  bool enableEiBgpMultipath_ = false;
+
+  // Update group config override (call setUpdateGroupConfig before
+  // createPeerManager to override slow peer thresholds etc.)
+  std::optional<thrift::UpdateGroupConfig> updateGroupConfigOverride_;
+
+  /*
+   * Parent confederation AS, set when any peer added via addPeer() supplies
+   * BgpPeerSpec::localConfedAsn. Plumbed into
+   * thriftConfig.local_confed_as_4_byte() in getConfig().
+   */
+  std::optional<uint32_t> pendingLocalConfedAsn_;
+
+  // GR convergence override
+  std::optional<uint32_t> grConvergenceSecondsOverride_;
+
+  // Per-peer GR restart time advertised in negotiated capabilities
+  std::optional<uint16_t> peerGrRestartTimeSeconds_;
+
+  // Dynamically added peers (via addPeer)
+  std::vector<thrift::BgpPeer> peers_;
+
+  // ADD-PATH capabilities per peer address (set via addPeer with BgpPeerSpec)
+  std::unordered_map<
+      folly::IPAddress,
+      std::optional<nettools::bgplib::BgpAddPathSendRec>>
+      peerAddPathCapabilities_;
+
+  // Dynamically added local routes (via addLocalRoute)
+  std::unordered_map<folly::CIDRNetwork, thrift::BgpNetwork> localRoutes_;
+
+  // Policy configuration (via setPolicyConfig or helper methods)
+  std::optional<bgp_policy::BgpPolicies> policyConfig_;
+
+  // Policy statement name to be set on peers (auto-set by policy helpers)
+  std::optional<std::string> ingressPolicyName_;
+
+  // Component instances
+  std::unique_ptr<TestRib> rib_;
+  std::thread ribThread_;
+
+  std::unique_ptr<PeerManager> peerManager_;
+  std::thread peerMgrThread_;
+
+  std::shared_ptr<MockSessionManager> sessionManager_;
+  std::shared_ptr<std::thread> sessionMgrThread_;
+
+  // Per-peer message queues
+  std::unordered_map<BgpPeerId, PeerQueues> peerQueues_;
+
+  // Blocked peers (for testing backpressure scenarios)
+  std::unordered_set<folly::IPAddress> blockedPeers_;
+
+  // Default queue sizes for peers (can be overridden via setDefaultQueueSizes)
+  int defaultQueueCapacity_{8};
+  int defaultQueueHighWm_{6};
+  int defaultQueueLowWm_{2};
+};
+
+/*
+ * E2ERibTestFixture
+ * Common base class for RIB-focused E2E tests that use 3 peers (peer3, peer4,
+ * peer5). Provides common SetUp and helper methods to reduce code duplication.
+ */
+class E2ERibTestFixture : public E2ETestFixture {
+ protected:
+  void SetUp() override {
+    addPeer(kDefaultPeerSpec3);
+    addPeer(kDefaultPeerSpec4);
+    addPeer(kDefaultPeerSpec5);
+    createRib();
+    createPeerManager(/*enableUpdateGroup=*/false,
+                      /*enableEgressBackpressure=*/true);
+  }
+
+  /*
+   * Bring up all 3 peers (without EoR)
+   */
+  void bringUpAllPeers() {
+    bringUpPeer(kPeerAddr3);
+    bringUpPeer(kPeerAddr4);
+    bringUpPeer(kPeerAddr5);
+  }
+
+  /*
+   * Bring up all 3 peers and send EoR to all of them
+   */
+  void bringUpAllPeersWithEor() {
+    bringUpAllPeers();
+    sendEoRToAllPeers();
+  }
+
+  /*
+   * Send EoR to all 3 peers and wait for confirmation
+   */
+  void sendEoRToAllPeers() {
+    BgpPeerId peerId3{kPeerAddr3, kPeerAddr3.asV4().toLongHBO()};
+    BgpPeerId peerId4{kPeerAddr4, kPeerAddr4.asV4().toLongHBO()};
+    BgpPeerId peerId5{kPeerAddr5, kPeerAddr5.asV4().toLongHBO()};
+    sendEoRToPeer(peerId3);
+    sendEoRToPeer(peerId4);
+    sendEoRToPeer(peerId5);
+    EXPECT_TRUE(waitForEoR(peerId3));
+    EXPECT_TRUE(waitForEoR(peerId4));
+    EXPECT_TRUE(waitForEoR(peerId5));
+  }
+};
+
+} // namespace bgp
+} // namespace facebook

@@ -1,0 +1,388 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <folly/coro/BlockingWait.h>
+
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRib.h"
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroup.h"
+#include "neteng/fboss/bgp/cpp/adjrib/UpdateGroupManager.h"
+
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRibStructs.h"
+#include "neteng/fboss/bgp/cpp/common/Types.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
+
+#include <fb303/ThreadCachedServiceData.h>
+
+#include <folly/Singleton.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include <chrono>
+#include <utility>
+
+using facebook::neteng::fboss::bgp_attr::AdvertiseLinkBandwidth;
+using facebook::neteng::fboss::bgp_attr::ReceiveLinkBandwidth;
+using ::testing::IsNull;
+using ::testing::NotNull;
+
+namespace facebook::bgp {
+
+/*
+ * DO NOT add a singleton declaration here.
+ *
+ * This test now links against AdjRib.cpp which already contains the production
+ * singleton declaration for AdjRibPolicyCache. Adding it here causes a double
+ * registration error.
+ *
+ * The singleton is declared in fbcode/neteng/fboss/bgp/cpp/adjrib/AdjRib.cpp
+ * as: folly::Singleton<AdjRibPolicyCache> adjRibPolicyCacheSingleton;
+ *
+ * If you see a merge conflict here, do not re-add the singleton declaration.
+ */
+
+namespace {
+int64_t getNumUpdateGroupsCounter() {
+  fb303::ThreadCachedServiceData::get()->publishStats();
+  return fb303::ThreadCachedServiceData::getShared()->getCounter(
+      BgpStats::kNumUpdateGroups);
+}
+} // namespace
+
+class UpdateGroupManagerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    folly::SingletonVault::singleton()->registrationComplete();
+    BgpStats::initCounters();
+  }
+};
+
+UpdateGroupKey createTestKey(
+    std::string policyName = "policy1",
+    std::string routeFilterStmtName = "peer_group",
+    std::chrono::seconds outDelay = std::chrono::seconds(30),
+    BgpSessionType sessionType = BgpSessionType::IBGP,
+    bool afiIpv4Negotiated = true,
+    bool afiIpv6Negotiated = false,
+    bool isConfedPeer = false,
+    bool isRrClient = false,
+    AdvertiseLinkBandwidth advertiseLinkBandwidth =
+        AdvertiseLinkBandwidth::DISABLE,
+    ReceiveLinkBandwidth receiveLinkBandwidth = ReceiveLinkBandwidth::DISABLE,
+    uint64_t linkBandwidthBps = 0,
+    bool removePrivateAsn = false,
+    bool sendAddPath = false,
+    bool as4ByteCapable = true,
+    bool extNhEncodingCapable = false,
+    std::string peerGroupName = "",
+    bool peerOverride = false) {
+  return UpdateGroupKey::buildUpdateGroupKey(
+      std::move(policyName),
+      std::move(routeFilterStmtName),
+      outDelay,
+      sessionType,
+      afiIpv4Negotiated,
+      afiIpv6Negotiated,
+      isConfedPeer,
+      isRrClient,
+      advertiseLinkBandwidth,
+      receiveLinkBandwidth,
+      linkBandwidthBps,
+      removePrivateAsn,
+      sendAddPath,
+      as4ByteCapable,
+      extNhEncodingCapable,
+      std::move(peerGroupName),
+      peerOverride);
+}
+
+TEST_F(UpdateGroupManagerTest, InitialStateEmpty) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+  UpdateGroupKey key = createTestKey();
+
+  EXPECT_EQ(manager.getGroupCount(), 0);
+  EXPECT_FALSE(manager.hasGroup(key));
+  EXPECT_EQ(manager.getGroup(key), nullptr);
+}
+
+TEST_F(UpdateGroupManagerTest, CreateAndFindGroup) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+  auto key = createTestKey();
+
+  /*
+   * Initially no groups exist
+   */
+  EXPECT_EQ(0, manager.getGroupCount());
+  EXPECT_FALSE(manager.hasGroup(key));
+  EXPECT_THAT(manager.getGroup(key), IsNull());
+  EXPECT_EQ(0, getNumUpdateGroupsCounter());
+
+  /*
+   * findOrCreateGroup creates a new group
+   */
+  auto group1 = manager.findOrCreateGroup(key);
+  EXPECT_THAT(group1, NotNull());
+  EXPECT_EQ(1, manager.getGroupCount());
+  EXPECT_TRUE(manager.hasGroup(key));
+  EXPECT_EQ(1, getNumUpdateGroupsCounter());
+
+  /*
+   * findOrCreateGroup returns existing group for same key
+   * Counter should not change
+   */
+  auto group2 = manager.findOrCreateGroup(key);
+  EXPECT_THAT(group2, NotNull());
+  EXPECT_EQ(group1.get(), group2.get());
+  EXPECT_EQ(1, manager.getGroupCount());
+  EXPECT_EQ(1, getNumUpdateGroupsCounter());
+}
+
+TEST_F(UpdateGroupManagerTest, MultipleGroups) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+
+  auto key1 = createTestKey("policy1");
+  auto key2 = createTestKey("policy2");
+
+  /*
+   * Create first group
+   */
+  auto group1 = manager.findOrCreateGroup(key1);
+  EXPECT_THAT(group1, NotNull());
+  EXPECT_EQ(1, manager.getGroupCount());
+  EXPECT_TRUE(manager.hasGroup(key1));
+  EXPECT_FALSE(manager.hasGroup(key2));
+
+  /*
+   * Create second group with different key
+   */
+  auto group2 = manager.findOrCreateGroup(key2);
+  EXPECT_THAT(group2, NotNull());
+  EXPECT_EQ(2, manager.getGroupCount());
+  EXPECT_TRUE(manager.hasGroup(key1));
+  EXPECT_TRUE(manager.hasGroup(key2));
+
+  /*
+   * Groups should be different
+   */
+  EXPECT_NE(group1.get(), group2.get());
+}
+
+TEST_F(UpdateGroupManagerTest, GroupNameGeneration) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+
+  auto key1 = createTestKey("policy1");
+  auto key2 = createTestKey("policy2");
+
+  /*
+   * Create groups and verify they have unique names
+   */
+  auto group1 = manager.findOrCreateGroup(key1);
+  auto group2 = manager.findOrCreateGroup(key2);
+
+  EXPECT_THAT(group1, NotNull());
+  EXPECT_THAT(group2, NotNull());
+
+  auto name1 = group1->getAdjRibGroupName();
+  auto name2 = group2->getAdjRibGroupName();
+
+  /*
+   * Names should be non-empty and different
+   */
+  EXPECT_FALSE(name1.empty());
+  EXPECT_FALSE(name2.empty());
+  EXPECT_NE(name1, name2);
+}
+
+TEST_F(UpdateGroupManagerTest, MaybeDestroyUpdateGroup) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+  auto key = createTestKey();
+
+  /*
+   * Calling maybeDestroyUpdateGroup on non-existent group should not crash
+   */
+  folly::coro::blockingWait(manager.maybeDestroyUpdateGroup(key));
+  EXPECT_EQ(0, manager.getGroupCount());
+}
+
+TEST_F(UpdateGroupManagerTest, SetUpdateGroupState) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+  auto key = createTestKey();
+
+  /*
+   * Calling setUpdateGroupState on non-existent group should not crash
+   */
+  manager.setUpdateGroupState(key, UpdateGroupState::UNINITIALIZED);
+  EXPECT_EQ(0, manager.getGroupCount());
+}
+
+TEST_F(UpdateGroupManagerTest, PolicyManagerPassedToConstructor) {
+  folly::EventBase evb;
+
+  /*
+   * Test that UpdateGroupManager can be created with nullptr policyManager
+   * This is the common case when policyManager is not needed
+   */
+  UpdateGroupManager manager1(evb, UpdateGroupConfig{}, nullptr, nullptr);
+  EXPECT_EQ(0, manager1.getGroupCount());
+
+  /*
+   * Test that UpdateGroupManager can be created with explicit nullptr
+   * for all optional parameters
+   */
+  UpdateGroupManager manager2(
+      evb,
+      UpdateGroupConfig{},
+      nullptr, // shadowRibEntries
+      nullptr, // policyManager
+      nullptr); // isRibInitDone
+  EXPECT_EQ(0, manager2.getGroupCount());
+}
+
+TEST_F(
+    UpdateGroupManagerTest,
+    GetPostPolicyAttributesPolicyTermAndInfoWithPolicyManager) {
+  folly::EventBase evb;
+
+  /*
+   * Create a policy manager with a simple "match all, set MED" policy
+   */
+  const std::string policyName = "test_egress_policy";
+  auto policyManager = setupMatchAllSetMedPolicy(policyName);
+  ASSERT_NE(nullptr, policyManager);
+
+  /*
+   * Create UpdateGroupManager with the policyManager
+   */
+  UpdateGroupManager manager(
+      evb,
+      UpdateGroupConfig{},
+      nullptr, // shadowRibEntries
+      policyManager,
+      nullptr); // isRibInitDone
+
+  /*
+   * Create an update group with egress policy configured
+   * This verifies that UpdateGroupManager successfully passes the
+   * policyManager to the AdjRibOutGroup during construction
+   */
+  auto key = createTestKey(
+      policyName, // egressPolicyName
+      "peer_group", // routeFilterStmtName
+      std::chrono::seconds(30), // outDelay
+      BgpSessionType::IBGP,
+      true, // afiIpv4Negotiated
+      false, // afiIpv6Negotiated
+      false, // isConfedPeer
+      false, // isRrClient
+      AdvertiseLinkBandwidth::DISABLE,
+      ReceiveLinkBandwidth::DISABLE,
+      0, // linkBandwidthBps
+      false, // removePrivateAsn
+      false, // sendAddPath
+      true, // as4ByteCapable
+      false); // extNhEncodingCapable
+
+  auto group = manager.findOrCreateGroup(key);
+  ASSERT_NE(nullptr, group);
+  EXPECT_EQ(1, manager.getGroupCount());
+
+  /*
+   * Verify the group was created successfully and has a valid name
+   * This confirms that UpdateGroupManager correctly initializes groups
+   * with the policyManager, allowing the group to function properly
+   */
+  EXPECT_FALSE(group->getAdjRibGroupName().empty());
+  EXPECT_EQ(0, group->getGroupId());
+}
+
+TEST_F(UpdateGroupManagerTest, ToThriftConvertsAllFields) {
+  auto key = createTestKey(
+      "egress_policy",
+      "route_filter",
+      std::chrono::seconds(10),
+      BgpSessionType::EBGP,
+      /*afiIpv4Negotiated=*/true,
+      /*afiIpv6Negotiated=*/true,
+      /*isConfedPeer=*/false,
+      /*isRrClient=*/true,
+      AdvertiseLinkBandwidth::BEST_PATH,
+      ReceiveLinkBandwidth::DISABLE,
+      /*linkBandwidthBps=*/100000,
+      /*removePrivateAsn=*/true,
+      /*sendAddPath=*/false,
+      /*as4ByteCapable=*/true,
+      /*extNhEncodingCapable=*/true,
+      "spine_peers",
+      /*peerOverride=*/true);
+
+  auto thriftKey = key.toThrift();
+
+  EXPECT_EQ("egress_policy", thriftKey.egress_policy_name().value());
+  EXPECT_EQ("route_filter", thriftKey.route_filter_stmt_name().value());
+  EXPECT_EQ(10, thriftKey.out_delay_seconds().value());
+  EXPECT_EQ("EBGP", thriftKey.session_type().value());
+  EXPECT_TRUE(thriftKey.afi_ipv4_negotiated().value());
+  EXPECT_TRUE(thriftKey.afi_ipv6_negotiated().value());
+  EXPECT_FALSE(thriftKey.is_confed_peer().value());
+  EXPECT_TRUE(thriftKey.is_rr_client().value());
+  EXPECT_EQ(
+      AdvertiseLinkBandwidth::BEST_PATH,
+      thriftKey.advertise_link_bandwidth().value());
+  EXPECT_EQ(
+      ReceiveLinkBandwidth::DISABLE,
+      thriftKey.receive_link_bandwidth().value());
+  EXPECT_EQ(100000, thriftKey.link_bandwidth_bps().value());
+  EXPECT_TRUE(thriftKey.remove_private_asn().value());
+  EXPECT_FALSE(thriftKey.send_add_path().value());
+  EXPECT_TRUE(thriftKey.as4_byte_capable().value());
+  EXPECT_TRUE(thriftKey.ext_nh_encoding_capable().value());
+  EXPECT_EQ("spine_peers", thriftKey.peer_group_name().value());
+  EXPECT_TRUE(thriftKey.peer_override().value());
+}
+
+TEST_F(UpdateGroupManagerTest, ToThriftOmitsUnsetOptionals) {
+  auto key = createTestKey();
+  key.advertiseLinkBandwidth = std::nullopt;
+  key.receiveLinkBandwidth = std::nullopt;
+
+  auto thriftKey = key.toThrift();
+
+  EXPECT_FALSE(thriftKey.advertise_link_bandwidth().has_value());
+  EXPECT_FALSE(thriftKey.receive_link_bandwidth().has_value());
+  EXPECT_FALSE(thriftKey.link_bandwidth_bps().has_value());
+}
+
+TEST_F(UpdateGroupManagerTest, InitialDumpTimestampAndDiscrepancies) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+  auto key = createTestKey();
+  auto group = manager.findOrCreateGroup(key);
+
+  EXPECT_FALSE(group->getInitialDumpCompletionTimeMs().has_value());
+  EXPECT_EQ(0, group->getTotalDiscrepancies());
+
+  group->incrTotalDiscrepancies();
+  group->incrTotalDiscrepancies();
+  EXPECT_EQ(2, group->getTotalDiscrepancies());
+}
+
+} // namespace facebook::bgp

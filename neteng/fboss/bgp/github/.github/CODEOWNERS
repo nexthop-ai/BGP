@@ -1,0 +1,61 @@
+# .github/CODEOWNERS
+#
+# BGP++ GitHub Repository — Code Owners
+# ======================================
+#
+# This file defines the default reviewers for pull requests based on
+# which files are modified. GitHub will automatically request reviews
+# from the listed owners when a PR touches matching paths.
+#
+# Rules:
+#   - Later patterns take precedence over earlier ones.
+#   - Any ONE listed owner can approve unless branch protection
+#     requires multiple approvals.
+#
+# Team membership is managed via GitHub Teams
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# ──────────────────────────────────────────────────────────────────────
+# Default — catches any file not matched by a more specific rule below.
+# ──────────────────────────────────────────────────────────────────────
+*                                       @facebook/fboss-bgp
+
+# ──────────────────────────────────────────────────────────────────────
+# Core Daemon — the main BGP++ service including session management,
+# peer handling, route processing, and ASIC programming integration.
+# Path: cpp/
+# ──────────────────────────────────────────────────────────────────────
+/cpp/                                   @facebook/fboss-bgp
+
+# ──────────────────────────────────────────────────────────────────────
+# Thrift Interfaces — Thrift IDL definitions for the BGP++ service,
+# including BGP structs, BMP structs, and streaming interfaces.
+# Path: if/
+# ──────────────────────────────────────────────────────────────────────
+/if/                                    @facebook/fboss-bgp
+
+# ──────────────────────────────────────────────────────────────────────
+# Libraries — shared libraries used across BGP++ components.
+# Path: lib/
+# ──────────────────────────────────────────────────────────────────────
+/lib/                                   @facebook/fboss-bgp
+
+# ──────────────────────────────────────────────────────────────────────
+# Documentation — protocol guides, developer guides, and design docs.
+# Path: docs/
+# ──────────────────────────────────────────────────────────────────────
+/docs/                                  @facebook/fboss-bgp
+
+# ──────────────────────────────────────────────────────────────────────
+# Tools — operational and development tooling for BGP++.
+# Path: tools/
+# ──────────────────────────────────────────────────────────────────────
+/tools/                                 @facebook/fboss-bgp
+
+# ──────────────────────────────────────────────────────────────────────
+# GitHub / Build — open-source build infrastructure, CI workflows,
+# and GitHub-specific packaging.
+# Path: github/
+# ──────────────────────────────────────────────────────────────────────
+/github/                                @facebook/fboss-bgp

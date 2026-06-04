@@ -1,0 +1,3832 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <algorithm>
+
+#include <fstream>
+
+#include <boost/filesystem.hpp>
+#include <boost/lexical_cast.hpp>
+#include <folly/FileUtil.h>
+#include <folly/IPAddress.h>
+#include <folly/Likely.h>
+#include <folly/Overload.h>
+#include <folly/coro/Sleep.h>
+#include <folly/coro/WithCancellation.h>
+#include <folly/logging/xlog.h>
+
+#include "fboss/agent/AddressUtil.h"
+#include "fboss/lib/AlertLogger.h"
+#include "magic_enum/magic_enum.hpp"
+#include "neteng/fboss/bgp/cpp/BgpProfiler.h"
+#include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRib.h"
+#include "neteng/fboss/bgp/cpp/adjrib/RouteFilterLogger.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
+#include "neteng/fboss/bgp/cpp/common/RibMessage.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
+#include "neteng/fboss/bgp/cpp/facebook/ScubaLoggerFactory.h"
+#include "neteng/fboss/bgp/cpp/peer/PeerManager.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
+#include "neteng/fboss/bgp/cpp/rib/Utils.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/BgpStructs_types.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
+
+using namespace facebook::neteng::fboss::bgp_attr;
+using namespace facebook::neteng::fboss::bgp::thrift;
+using namespace facebook::nettools::bgplib;
+using namespace facebook::bgp::BgpStats;
+using std::chrono::milliseconds;
+using std::chrono::seconds;
+
+DEFINE_int32(
+    validity_time_stateful_gr_s,
+    180,
+    "Validity time in seconds for saved GR state");
+DEFINE_int32(
+    peer_start_delay_ms,
+    50,
+    "Duration in milliseconds between start of two peers. T81178121");
+DEFINE_int32(
+    thrift_stream_publish_gap_ms,
+    100,
+    "Gap in milliseconds between thrift stream publisher loop");
+
+// Connection retry parameters
+DEFINE_int32(
+    min_conn_retry_time_ms,
+    500,
+    "Minimum TCP connection retry time in milliseconds");
+DEFINE_int32(
+    max_conn_retry_time_ms,
+    2000,
+    "Maximum TCP connection retry time in milliseconds");
+DEFINE_int32(
+    conn_timeout_ms,
+    500,
+    "Timeout for TCP connection in milliseconds");
+DEFINE_int32(
+    min_session_retry_time_ms,
+    1000,
+    "Minimum BGP session retry time in milliseconds");
+DEFINE_int32(
+    max_session_retry_time_ms,
+    60000,
+    "Maximum BGP session retry time in milliseconds");
+DEFINE_int32(
+    max_session_dampen_time_ms,
+    300000,
+    "BGP sessions (regardless previously established or not) if retried "
+    "to established during this window, backoff upto max_session_retry_time");
+DEFINE_int32(
+    counter_update_time_s,
+    300,
+    "Update counters every X seconds. Default is 5 minutes.");
+DEFINE_string(
+    gr_state_file,
+    "/dev/shm/bgp_gr_state.txt",
+    "File in which GR state is stored across bgp restarts");
+DEFINE_string(
+    stream_peer_tag,
+    "BGP_MONITOR",
+    "Peer tag for stream subscriber peer config");
+DEFINE_string(
+    safemode_file,
+    "/dev/shm/safemode.txt",
+    "Empty file to persist safe mode across BGP restarts");
+
+namespace facebook {
+namespace bgp {
+
+using nettools::bgplib::DeDuplicatedBgpPath;
+
+PeerManager::PeerManager(
+    std::shared_ptr<ConfigManager> configManager,
+    const std::shared_ptr<PolicyManager> policyManager,
+    MonitoredBackPressuredQueue<RibInMessage>& ribInQ,
+    MonitoredMPMCQueue<RibOutMessage>& ribOutQ,
+    std::optional<MonitoredMPMCQueue<NeighborWatcherMessage>>& nbrRouteChangeQ,
+    bool requireNexthopResolution,
+    std::chrono::milliseconds minConnRetryDur,
+    std::chrono::milliseconds maxConnRetryDur,
+    std::chrono::milliseconds connTimeout,
+    std::chrono::milliseconds minSessionRetryDur,
+    std::chrono::milliseconds maxSessionRetryDur,
+    std::chrono::milliseconds maxSessionDampenDur)
+    : BgpModuleBase(kModulePeerManager),
+      configManager_(configManager),
+      policyManager_(policyManager),
+      ribInQ_(ribInQ),
+      ribOutQ_(ribOutQ),
+      nbrRouteChangeQ_(nbrRouteChangeQ),
+      minConnRetryDur_(minConnRetryDur),
+      maxConnRetryDur_(maxConnRetryDur),
+      connTimeout_(connTimeout),
+      minSessionRetryDur_(minSessionRetryDur),
+      maxSessionRetryDur_(maxSessionRetryDur),
+      maxSessionDampenDur_(maxSessionDampenDur),
+      nexthopResolutionReceived_(!requireNexthopResolution),
+      switchLimitConfig_(
+          configManager_->getConfig()->getBgpSwitchLimitConfig()) {
+  // Sanity check
+  CHECK_GE(maxConnRetryDur_.count(), minConnRetryDur_.count());
+  CHECK_GE(maxSessionRetryDur_.count(), minSessionRetryDur_.count());
+  CHECK(configManager_->getConfig()) << "encountered nullptr of BGP Config";
+
+  // initialize config knobs
+  UpdateGroupConfig updateGroupConfig;
+  if (auto globalConfig = configManager_->getConfig()->getBgpGlobalConfig()) {
+    enableDynamicPolicyEvaluation_ =
+        globalConfig->enableDynamicPolicyEvaluation;
+    enableUpdateGroup_ = globalConfig->enableUpdateGroup;
+    enableSerializeGroupPdu_ =
+        globalConfig->updateGroupConfig.enableSerializeGroupPdu;
+    enableRibAllocatedPathId_ = globalConfig->enableRibAllocatedPathId;
+    updateGroupConfig = globalConfig->updateGroupConfig;
+  }
+
+  if (enableUpdateGroup_) {
+    updateGroupManager_ = std::make_unique<UpdateGroupManager>(
+        evb_, updateGroupConfig, &shadowRibEntries_, policyManager_, [this]() {
+          return ribInitialAnnouncementDone_;
+        });
+  }
+
+  // receives from fromAdjRibQ_, so the direction is IN
+  monitorQueue(
+      kQueueNameFromAdjRib, fromAdjRibQ_, MonitorableQueueTrace::Direction::IN);
+  if (nbrRouteChangeQ_) {
+    // receives from nbrRouteChangeQ_, so the direction is IN
+    monitorQueue(
+        kQueueNameFromNeighborWatcher,
+        *nbrRouteChangeQ_,
+        MonitorableQueueTrace::Direction::IN);
+  }
+
+  /*
+   * A global tracker tracking changes from the RIB
+   * Every changes to the ShadowRib must be published to this change list
+   * tracker
+   */
+  changeListTracker_ = std::make_shared<ChangeTracker<ShadowRibEntry>>(
+      "A tracker for tracking ShadowRibEntries_ updates");
+  changeListTracker_->setGlobalOnChangeProcessedCallback(
+      [this](TrackableObject<ShadowRibEntry>* trackedObject) {
+        processChangeItemCompleteCallback(trackedObject);
+      });
+
+  // Read about BGP global config
+  auto config = configManager_->getConfig();
+  auto globalConfig = config->getBgpGlobalConfig();
+
+  // Create a timer to schedule EoR notification
+  // ATTN: this is the max-cap duration of EoR notification
+  eorTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
+    if (ribInitPathComputationNotified_) {
+      return;
+    }
+
+    // Log BGP++ initialization event
+    BgpStats::logInitializationEvent(
+        "PeerManager", BgpInitializationEvent::EOR_TIMER_EXPIRED);
+
+    // Notify RIB since we hit max-cap duration
+    notifyRibInitialPathComputation(/*timerFired=*/true);
+
+    // Log pending peers from initialization sequence
+    std::vector<std::string> pendingStaticPeers{};
+    for (const auto& [peerAddr, eorRcvd] : staticPeerEoRReceived_) {
+      if (!eorRcvd.first) {
+        pendingStaticPeers.emplace_back(peerAddr.str());
+      }
+    }
+
+    XLOGF(
+        ERR,
+        "[Initialization] Still awaits the EoR from static peers: {}",
+        folly::join(", ", pendingStaticPeers));
+
+    std::vector<std::string> pendingDynamicPeers{};
+    for (const auto& [peerId, eorRcvd] : dynamicPeerEoRReceived_) {
+      if (!eorRcvd.first) {
+        pendingDynamicPeers.emplace_back(peerId.str());
+      }
+    }
+
+    XLOGF(
+        ERR,
+        "[Initialization] Still awaits the EoR from dynamic peers: {}",
+        folly::join(", ", pendingDynamicPeers));
+  });
+
+  initializedSignalTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
+    if (initialized_) {
+      return;
+    }
+
+    BgpStats::setPeerManagerReachesInitializedTimeout(true);
+
+    // Check totalSendPrefixCount
+    if (totalSentPrefixCount == 0) {
+      BgpStats::setNoPrefixSent();
+    }
+
+    // Log BGP++ initialization event
+    BgpStats::logInitializationEvent(
+        "PeerManager", BgpInitializationEvent::INITIALIZED);
+
+    // Mark initialized_ variable for internal access
+    initialized_ = true;
+
+    // Log peers still pending egress EoR. The ingress EoR should have been
+    // caught logged when eorTimer_ expired
+    logEoRPeers(false /* check egressEoR */);
+  });
+
+  // Get stream subscriber peering parameters
+  auto p = getStreamPeeringParams();
+  if (p.second) {
+    streamPeerAddr_ = p.first;
+    streamPeeringParams_ = std::move(p.second);
+    XLOGF(
+        INFO,
+        "Stream subscribers will use peerAddr: {}",
+        streamPeerAddr_.str());
+  } else {
+    XLOG(ERR, "Did not get stream peering params");
+  }
+
+  scubaLogger_ = createRouteFilterScubaLogger();
+  // if safemode file exists, then we are in safemode
+  if (boost::filesystem::exists(FLAGS_safemode_file)) {
+    XLOGF(
+        INFO,
+        "Safemode file {} exists, setting isSafeModeOn_ to true",
+        FLAGS_safemode_file);
+    *isSafeModeOn_ = true;
+    BgpStats::setIsSafeModeOn(true);
+  }
+}
+
+PeerManager::~PeerManager() {
+  /**
+   * Invoke destructor to cleanly stop all of the adjRib fibers and trees
+   *
+   *
+   * 1. Clear adjRibOutGroup_ RadixTrees BEFORE destroying AdjRibs
+   *    - These trees are shared across peers
+   *    - With isDaemonShutdown_ set, AdjRibs won't access them
+   *
+   * 2. Destroy AdjRibs (they'll skip tree cleanup since isDaemonShutdown_=true)
+   *
+   * 3. Destroy adjRibOutGroups (trees already cleared, so fast)
+   */
+
+  // Step 1: Clear adjRibOutGroups_ RadixTrees before destruction
+  XLOGF(
+      INFO,
+      "[Exit] Clearing adjRibOutGroups_ ({} groups)...",
+      adjRibOutGroups_.size());
+  for (auto& [_, group] : adjRibOutGroups_) {
+    if (group) {
+      group->PathTree_.clear();
+      group->LiteTree_.clear();
+    }
+  }
+  XLOG(INFO, "[Exit] adjRibOutGroups_ trees cleared");
+
+  // Step 2: Destroy AdjRibs
+  for (auto& [_, adjRib] : adjRibs_) {
+    if (adjRib) {
+      adjRib->resetChangeListConsumer();
+      adjRib.reset();
+    }
+  }
+  adjRibs_.clear();
+  RibStats::setAdjRibCount(0);
+
+  // Step 3: Destroy adjRibOutGroups (trees already cleared)
+  for (size_t i = 0; i < adjRibOutGroups_.size(); ++i) {
+    BgpStats::decrAdjRibOutGroupsCount();
+  }
+  adjRibOutGroups_.clear();
+
+  // terminate evb to deterministically shutdown PeerManager evb
+  evb_.terminateLoopSoon();
+
+  changeListTracker_.reset();
+  XLOG(INFO, "[Exit] Successfully destructed PeerManager object");
+}
+
+void PeerManager::run() noexcept {
+  XLOG(DBG1, "Start running PeerManager...");
+  CHECK(sessionMgr_) << "setSessionManager() must be called before run()";
+
+  addPeersToSessionMgr();
+  scheduleCoroTasks();
+  scheduleTimers();
+
+  XLOG(INFO, "Start PeerManager event-base loop");
+  evb_.loop();
+  XLOG(INFO, "[Exit] Successfully terminated PeerManager event-base.");
+}
+
+void PeerManager::scheduleCoroTasks() noexcept {
+  asyncScope_.add(co_withExecutor(&evb_, processPeerEventLoop()));
+  asyncScope_.add(co_withExecutor(&evb_, processAdjRibMsgLoop()));
+  asyncScope_.add(co_withExecutor(&evb_, processRibOutMsgLoop()));
+  if (nbrRouteChangeQ_) {
+    asyncScope_.add(co_withExecutor(&evb_, processNeighborRouteChangeLoop()));
+  }
+  asyncScope_.add(co_withExecutor(&evb_, publishUpdatesRoutine()));
+  asyncScope_.add(
+      co_withExecutor(&evb_, startPeriodicPolicyCacheEvictionRoutine()));
+  asyncScope_.add(
+      co_withExecutor(&evb_, startPeriodicUpdatePeerCountersRoutine()));
+  asyncScope_.add(co_withExecutor(&evb_, periodicEvictFromDeduplicatorLoop()));
+}
+
+void PeerManager::scheduleTimers() noexcept {
+  XLOG(DBG1, "Start EoR Timer.");
+  eorTimer_->scheduleTimeout(
+      std::chrono::seconds(
+          *configManager_->getConfig()->getConfig().eor_time_s()));
+}
+
+void PeerManager::addPeersToSessionMgr() {
+  /*
+   * [GR State]
+   *
+   * Load Graceful-Restart(GR) state if any.
+   */
+  auto grLoadResult = readGrState();
+  if (grLoadResult.loaded) {
+    grStateLoaded_ = true;
+    BgpStats::setStatefulGR(true);
+  } else {
+    BgpStats::setStatefulGR(false);
+  }
+
+  // Delay in milliseconds for starting peer after it is added. This increment
+  // by `peer_start_delay` on every peer addition.
+  std::chrono::milliseconds startDelay{0};
+
+  /*
+   * [Static Peers]
+   *
+   * Static peers are BGP peers that have a configured local and remote address.
+   * The actual BGP(TCP) session that gets established will have the same local
+   * and remote addresses.
+   */
+  auto config = configManager_->getConfig();
+  const auto& peerToConfigs = config->getPeerToConfig();
+  for (const auto& [peerAddr, peerConfigPtr] : peerToConfigs) {
+    auto params = config->getPeeringParamsForPeer(*peerConfigPtr);
+    const auto startAfterDelay = startDelay;
+
+    // Increment delay for subsequent peer addition
+    startDelay += milliseconds(FLAGS_peer_start_delay_ms);
+
+    // Add peer
+    auto addPeerExpected = sessionMgr_->addPeer(
+        peerAddr,
+        params,
+        ConnTimeParams(
+            startAfterDelay,
+            minConnRetryDur_,
+            maxConnRetryDur_,
+            connTimeout_,
+            minSessionRetryDur_,
+            maxSessionRetryDur_,
+            maxSessionDampenDur_));
+
+    if (addPeerExpected.hasError()) {
+      XLOGF(
+          ERR,
+          "Error adding peer: {}, Error: {}",
+          peerAddr.str(),
+          magic_enum::enum_name(addPeerExpected.error()));
+    }
+    // Expect to receive EoR from all static peers, if GR capable.
+    // Initialize to false for all static peers if no saved stateful GR state.
+    // If valid saved GR state exists, wait for only saved (stateful) peers.
+    if (!grLoadResult.loaded) {
+      XLOGF(
+          INFO,
+          "[Initialization] Will wait for EoR against {} from config.",
+          peerAddr.str());
+
+      staticPeerEoRReceived_.emplace(peerAddr, std::make_pair(false, false));
+    } else {
+      for (const auto& savedBgpPeerId : *(grLoadResult.peers)) {
+        if (savedBgpPeerId.peerAddr == peerAddr) {
+          XLOGF(
+              INFO,
+              "[Initialization] Will wait for EoR against {} from stateful GR file.",
+              peerAddr.str());
+
+          staticPeerEoRReceived_.emplace(
+              peerAddr, std::make_pair(false, false));
+          break;
+        }
+      }
+    }
+  }
+
+  /*
+   * [Dynamic Peers]
+   *
+   * Unlike static peers, dynamic peers do NOT have a specific local + remote
+   * address. Instead the config specifies a subnet as peer address. The switch
+   * will accept a TCP connection to peer from any address that belongs to that
+   * subnet.
+   *
+   * NOTE: dynamic peers can have multiple peerings with same ip address with
+   * different remote bgp peer ID's. So the stored key will be:
+   *
+   * `nettools::bgplib::BgpPeerId`
+   *
+   * instead of
+   *
+   * `folly::IPAddress` for static peers.
+   */
+  auto dynamicPeerToConfigs = config->getDynamicPeerToConfig();
+  for (const auto& [peerPrefix, peerConfigPtr] : dynamicPeerToConfigs) {
+    auto params = config->getPeeringParamsForDynamicPeer(*peerConfigPtr);
+    auto peerAddExpected = sessionMgr_->addDynamicPeer(peerPrefix, params);
+
+    if (peerAddExpected.hasError()) {
+      // Output the error and the peer where the error occurs
+      XLOGF(
+          ERR,
+          "Add peer to session manager failed for {}. Error code: {}",
+          peerPrefix.first.str(),
+          magic_enum::enum_name(peerAddExpected.error()));
+    }
+    if (!grLoadResult.loaded) {
+      continue;
+    }
+
+    // Mark all previously Established peers belonging to the configured dynanic
+    // peer subnet, to wait for EOR.
+    for (const auto& savedBgpPeerId : *(grLoadResult.peers)) {
+      if (savedBgpPeerId.peerAddr.inSubnet(
+              peerPrefix.first, peerPrefix.second)) {
+        XLOGF(
+            INFO,
+            "[Initialization] Will wait for EoR against {} from stateful GR file.",
+            savedBgpPeerId.peerAddr.str());
+
+        dynamicPeerEoRReceived_.emplace(
+            savedBgpPeerId, std::make_pair(false, false));
+      }
+    }
+  }
+
+  BgpStats::logInitializationEvent(
+      "PeerManager", BgpInitializationEvent::PEER_INFO_LOADED);
+}
+
+folly::coro::Task<folly::Expected<folly::Unit, FiberBgpPeerManager::ErrorCode>>
+PeerManager::addPeers(
+    const std::vector<std::shared_ptr<BgpPeerConfig>>& peerConfigs) {
+  std::chrono::milliseconds startDelay{0};
+  for (const auto& peerConfigPtr : peerConfigs) {
+    const auto& peerConfig = *peerConfigPtr;
+    auto params =
+        configManager_->getConfig()->getPeeringParamsForPeer(peerConfig);
+    auto result = co_await sessionMgr_->co_addPeer(
+        peerConfig.peerAddr,
+        params,
+        ConnTimeParams(
+            startDelay,
+            minConnRetryDur_,
+            maxConnRetryDur_,
+            connTimeout_,
+            minSessionRetryDur_,
+            maxSessionRetryDur_,
+            maxSessionDampenDur_));
+    if (result.hasError()) {
+      co_return folly::makeUnexpected(result.error());
+    }
+    startDelay += milliseconds(FLAGS_peer_start_delay_ms);
+  }
+  co_return folly::unit;
+}
+
+folly::coro::Task<folly::Expected<folly::Unit, FiberBgpPeerManager::ErrorCode>>
+PeerManager::delPeers(const std::vector<folly::IPAddress>& peerAddrs) {
+  for (const auto& peerAddr : peerAddrs) {
+    co_await folly::coro::co_safe_point;
+    auto result =
+        co_await sessionMgr_->co_dropPeer(peerAddr, /*peerDelete=*/true);
+    if (result.hasError()) {
+      if (result.error() ==
+          FiberBgpPeerManager::ErrorCode::PEER_DOES_NOT_EXIST) {
+        XLOGF(
+            INFO, "delPeers: peer {} does not exist, skipping", peerAddr.str());
+        continue;
+      }
+      co_return folly::makeUnexpected(result.error());
+    }
+
+    // Fallback: shutdownPeer skips peer->stop() when activeSessionInfo is
+    // null (IDLE peers, GR helper mode), so no BgpSessionStop fires ->
+    // sessionTerminated -> cleanupPeerState chain never runs. Drive cleanup
+    // inline for any non-established peerId for this address.
+    auto addrIt = peerAddrToIds_.find(peerAddr);
+    if (addrIt != peerAddrToIds_.end()) {
+      std::vector<nettools::bgplib::BgpPeerId> peerIds(
+          addrIt->second.begin(), addrIt->second.end());
+      for (const auto& peerId : peerIds) {
+        co_await folly::coro::co_safe_point;
+        auto adjRib = findAdjRib(peerId);
+        if (adjRib && adjRib->isStateEstablished()) {
+          continue;
+        }
+        co_await cleanupPeerState(peerId, peerAddr);
+      }
+    }
+  }
+  co_return folly::unit;
+}
+
+void PeerManager::stop() noexcept {
+  auto task = [&]() -> folly::coro::Task<void> {
+    XLOG(INFO, "Signaling all peer manager fibers to stop ...");
+
+    // Mark daemon shutdown first to enable fast cleanup paths in
+    // adjribs' sessionTerminated() before shutdownWithGR triggers them
+    markDaemonShutdown();
+
+    saveGrState();
+
+    // reset all of the timers
+    eorTimer_.reset();
+    initializedSignalTimer_.reset();
+
+    // stop Session Manager fibers -> all AdjRib sessionTerminated()
+    // -> stop processPeerEvent loop
+    // Null check needed because stop() can be called without run() (e.g. in
+    // test cleanup where PeerManager is driven manually without a session mgr)
+    if (sessionMgr_) {
+      sessionMgr_->shutdownWithGR(GracefulRestartFlag{false});
+    }
+
+    for (const auto& [_, adjRib] : adjRibs_) {
+      if (adjRib) {
+        adjRib->deactivateChangeListConsumer();
+        co_await adjRib->stop();
+      }
+    }
+
+    // Unregister peers from update groups and cleanup
+    if (enableUpdateGroup_ && updateGroupManager_) {
+      for (const auto& [_, adjRib] : adjRibs_) {
+        if (adjRib) {
+          auto updateGroup = adjRib->getUpdateGroup();
+          if (updateGroup) {
+            updateGroup->unregisterPeer(adjRib);
+            const auto& updateGroupKey = adjRib->getUpdateGroupKey();
+            co_await updateGroupManager_->maybeDestroyUpdateGroup(
+                updateGroupKey);
+          }
+        }
+      }
+    }
+
+    // When shutting down BGP instance, in case BGP has not yet finished
+    // initialization sequence. Record the pending peer EoR to receive
+    // from (ingressEoR) or send to (egressEoR) GR Helpers.
+    if (!ribInitPathComputationNotified_ || eorTimerExpired_) {
+      // Case 1: still waiting for ingress EoR from all GR Helpers
+      // case 2: EOR_TIMER_EXPIRED. Log the ingress EoR it is still waiting for
+      logEoRPeers(true);
+    } else if (!allEgressEoRSent_) {
+      // case 3: ALL_EOR_RECEIVED while not all egressEoR sent to
+      logEoRPeers(false);
+    }
+    co_return;
+  };
+
+  folly::coro::blockingWait(folly::coro::co_withExecutor(&evb_, task()));
+
+  folly::coro::blockingWait(asyncScope_.cancelAndJoinAsync());
+  XLOG(INFO, "[Exit] All coro tasks finished.");
+}
+
+void PeerManager::markDaemonShutdown() noexcept {
+  XLOG(INFO, "Marking BGP daemon shutdown for all AdjRibs...");
+  for (const auto& [_, adjRib] : adjRibs_) {
+    if (adjRib) {
+      adjRib->setDaemonShutdown();
+    }
+  }
+}
+
+folly::coro::Task<void> PeerManager::processPeerEventLoop() noexcept {
+  XLOG(INFO, "Starting peer event processing coro task...");
+
+  auto& notifyQueue = sessionMgr_->getNotifyCoroQueue();
+  while (true) {
+    // when cancelAndJoinAsync is called, guaranteed to exit
+    co_await folly::coro::co_safe_point;
+
+    auto evt = co_await co_awaitTry(notifyQueue.pop());
+    if (!evt.hasValue()) {
+      XLOG(
+          INFO, "[Exit] Coro task cancelled. Terminating processPeerEventLoop");
+      break;
+    }
+    // Only process ObservableStateT (session up/down events)
+    if (std::holds_alternative<FiberBgpPeer::ObservableStateT>(*evt)) {
+      auto stateEvt = std::get<FiberBgpPeer::ObservableStateT>(std::move(*evt));
+      if (stateEvt.state == BgpSessionState::ESTABLISHED) {
+        co_await sessionEstablished(std::move(stateEvt));
+      } else {
+        co_await sessionTerminated(stateEvt);
+      }
+    }
+    // ObservableMessageT is not expected via notifyQueue_
+  }
+}
+
+folly::coro::Task<void> PeerManager::processAdjRibEvent(
+    AdjRib::ObservableMessageT&& evt) noexcept {
+  const auto& peerId = evt.peerId;
+
+  // We cannot set "static" here as the content varies according to peerId
+  auto overload = folly::overload(
+      [this,
+       peerId](AdjRib::EoR /*rcvEoRForAllAfi*/) -> folly::coro::Task<void> {
+        // process ingress EoRs
+        XLOGF(
+            INFO,
+            "{}Received EoR from {}",
+            facebook::fboss::BGPAlert().str(),
+            peerId.str());
+        processPeerEoR(peerId);
+        co_return;
+      },
+      [this,
+       peerId](AdjRib::EgressEoR /*rcvEoRFromRib*/) -> folly::coro::Task<void> {
+        // process egress EoRs
+        XLOGF(
+            INFO,
+            "{}Received EgressEoR from {}",
+            facebook::fboss::BGPAlert().str(),
+            peerId.str());
+        processEgressEoR(peerId);
+        co_return;
+      },
+      [this, peerId](AdjRib::Shutdown /*shutdown*/) -> folly::coro::Task<void> {
+        XLOGF(
+            INFO,
+            "{}Received AdjRib shutdown due to received route limit reached",
+            facebook::fboss::BGPAlert().str(),
+            peerId.str());
+        co_await sessionMgr_->co_shutdownPeer(peerId.peerAddr);
+      },
+      // process TriggerSafeMode generated internally from AdjRib when total
+      // path scale or unique prefix limit is reached.
+      [this, &peerId](AdjRib::TriggerSafeMode /*triggerSafeMode*/)
+          -> folly::coro::Task<void> {
+        XLOGF(
+            INFO,
+            "{}Received trigger safe mode for {}",
+            facebook::fboss::BGPAlert().str(),
+            peerId.str());
+        processTriggerSafeMode();
+        co_return;
+      });
+  co_await std::visit(overload, evt.message);
+}
+
+folly::coro::Task<void> PeerManager::publishUpdatesRoutine() {
+  XLOG(DBG1, "Start periodic stream updates coro task...");
+
+  while (true) {
+    // when cancelAndJoinAsync is called, loop will be broken to exit
+    co_await folly::coro::co_safe_point;
+
+    co_await folly::coro::sleepReturnEarlyOnCancel(
+        milliseconds(FLAGS_thrift_stream_publish_gap_ms));
+    co_await publishUpdates();
+  }
+
+  XLOG(INFO, "[Exit] PeerManager stream updates coroutine stopped");
+  co_return;
+}
+
+folly::coro::Task<void> PeerManager::publishUpdates() {
+  for (auto& [subscriberName, subscriber] : streamSubscribers_) {
+    while (!subscriber.peerInputQ->empty()) {
+      auto maybeMsg = co_await co_awaitTry(subscriber.peerInputQ->pop());
+      if (!maybeMsg.hasValue() || !(*maybeMsg).has_value()) {
+        XLOGF(
+            WARN,
+            "Received an empty message from AdjRib to subscriber {}",
+            subscriberName);
+        co_return;
+      }
+
+      TBgpRouteDelta delta;
+      auto& publisher = subscriber.publisher;
+      // drop messages if subscriber is not established
+      if (subscriber.state != TBgpPeerState::ESTABLISHED) {
+        XLOGF(
+            DBG2,
+            "Subscriber {} connection is not ESTABLISHED",
+            subscriberName);
+        continue;
+      }
+      folly::variant_match(
+          **maybeMsg, // dereference folly::Try<T> and std::optional
+          [&](std::shared_ptr<const nettools::bgplib::BgpUpdate2>
+                  update) mutable {
+            delta.update2OrEor()->update2() = *update;
+            delta.onDeviceTimeStampMs() =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            publisher->next(delta);
+          },
+          [&](const nettools::bgplib::UpdateDescriptor& /*not used*/) {
+            // No-op: UpdateDescriptor is handled directly in I/O thread
+            // for zero-copy serialization path
+          },
+          [&](const BgpEndOfRib& eor) {
+            delta.update2OrEor()->eor() = eor;
+            delta.onDeviceTimeStampMs() =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            publisher->next(delta);
+          },
+          [&](const BgpNotification& /*not used*/) {
+            // Do nothing
+          },
+          [&](const BgpRouteRefresh& /*not used*/) {
+            // TO BE IMPLEMENTED
+          });
+    }
+  }
+}
+
+void PeerManager::markRibInitialAnnouncementDone() noexcept {
+  if (ribInitialAnnouncementDone_) {
+    return;
+  }
+
+  ribInitialAnnouncementDone_ = true;
+
+  if (enableUpdateGroup_ && updateGroupManager_) {
+    /*
+     * BGP initialization complete - trigger group-level initial dumps
+     * for any update groups in UNINITIALIZED state
+     */
+    updateGroupManager_->triggerInitialDumpsForUninitializedGroups();
+  } else {
+    /*
+     * Non-update-group mode: handle all pending RibDumpReqs
+     */
+    asyncScope_.add(co_withExecutor(&evb_, handleBufferedRibDumpReqs()));
+  }
+}
+
+folly::coro::Task<void> PeerManager::processAdjRibMsgLoop() noexcept {
+  XLOG(INFO, "Starting adjRib msg processing coro task...");
+
+  while (true) {
+    // when cancelAndJoinAsync is called, guaranteed to exit
+    co_await folly::coro::co_safe_point;
+
+    auto msg = co_await co_awaitTry(fromAdjRibQ_.pop());
+    if (!msg.hasValue()) {
+      XLOG(
+          INFO, "[Exit] Coro task cancelled. Terminating processAdjRibMsgLoop");
+      break;
+    }
+    ScopedProfile profile("PeerManager::processAdjRibMsg");
+    co_await processAdjRibEvent(std::move(*msg));
+  }
+}
+
+folly::coro::Task<void> PeerManager::processRibOutMsgLoop() noexcept {
+  XLOG(INFO, "Starting ribOutMsg processing coro task...");
+  auto msgsProcessed = 0;
+
+  while (true) {
+    // when cancelAndJoinAsync is called, guaranteed to exit
+    co_await folly::coro::co_safe_point;
+
+    /*
+     * DO NOT REMOVE THIS SLEEP CALL!
+     *
+     * co_await will automatically yield the execution of coro tasks without
+     * explicit sleep call. However, the current consumption rate from adjrib
+     * can't match up with PeerManager production rate. This speed mismatch can
+     * cause severe queue build-up situation to accumulate memory.
+     *
+     * In case of changeList enabled, process more messages from the egress rib
+     * queue before yielding
+     */
+    if (!ribInitialAnnouncementDone_ ||
+        (msgsProcessed > announcmentsProcessBatch_)) {
+      /**
+       * Process more announcements once RIB is already initialized,
+       * then yield to avoid queue build-up
+       */
+      co_await folly::coro::sleep(std::chrono::milliseconds(1));
+      msgsProcessed = 0;
+    }
+
+    auto msg = co_await co_awaitTry(ribOutQ_.pop());
+    if (!msg.hasValue()) {
+      XLOG(
+          INFO, "[Exit] Coro task cancelled. Terminating processRibOutMsgLoop");
+      break;
+    }
+    ScopedProfile profile("PeerManager::processRibOutMsg");
+    msgsProcessed++;
+    /*
+     * Make an equality check. If queue size is going down then it must hit
+     * the lower watermark. Thus making this singular eqaulity check should
+     * be sufficient
+     */
+    if (ribOutQ_.size() == ribOutQLowWatermark_) {
+      XLOGF(INFO, "Resume RIB as ribOutQ size : {}", ribOutQ_.size());
+      co_await ribInQ_.push(
+          ResumeBestPathAndFibProgramming(RibPauseResumeCause::BACKPRESSURE));
+    }
+
+    folly::variant_match(
+        *msg,
+        [&](const RibOutAnnouncement& announcement) {
+          /*
+           * Incremental announcements come to PeerManager, which will be pushed
+           * to the individual AdjRibs. The number of RibOutAnnouncement updates
+           * may be large, and may go into multiple chunks with kRibChunkSize
+           * each. The last of these chunks will be flagged with sendWithEoR.
+           */
+          XLOG(DBG3, "Passing RibOutAnnouncement to all established peers.");
+
+          // Handle announcement to keep Rib and ShadowRib entries in-sync.
+          handleShadowRibEntryAnnouncement(announcement);
+
+          // Prepare RibOut structure sending to multiple adjRibs
+          // We copy the announcement once to make a shared_ptr.
+          if (enableUpdateGroup_ == false) {
+            distributeRibOutAnnouncementToAdjRibs(announcement);
+          }
+
+          /**
+           * Now that we have completed the initial announcement, mark
+           * initial announcement done flag and handle any processing
+           * if required with this state transition
+           */
+          if (announcement.sendWithEoR) {
+            markRibInitialAnnouncementDone();
+          }
+        },
+        [this](const RibOutWithdrawal& withdrawal) {
+          XLOG(DBG3, "Passing RibOutWithdrawal to all established peers.");
+
+          // Withdrawals go through changeList only.
+          // Handle withdrawal to keep Rib and ShadowRib entries in-sync.
+          handleShadowRibEntryWithdrawal(withdrawal);
+        },
+        [](const ShadowRibOutAnnouncement&) {
+          XLOG(DBG3, "Processing ShadowRibOutAnnoucement");
+        },
+        [](const ShadowRibOutWithdrawal&) {
+          XLOG(DBG3, "Processing ShadowRibOutWithdrawal");
+        },
+        [this](const RibInitialAnnouncementStart&) {
+          XLOG(
+              INFO,
+              "[Initialization] Received RibInitialAnnouncementStart message.");
+
+          ribInitialAnnouncementStarted_ = true;
+          maybeMarkInitialized();
+        },
+        [this](const RibOutNexthopResolutionReceived&) {
+          handleRibOutNexthopResolutionReceived();
+        });
+  }
+  co_return;
+}
+
+folly::coro::Task<void> PeerManager::processRibDumpReqCoro(
+    RibDumpReq ribDumpReq) {
+  auto adjrib = adjRibs_.find(ribDumpReq.peerId);
+  if (adjrib == adjRibs_.cend()) {
+    XLOGF(
+        ERR,
+        "Skip sending announcement since adjRib {} does not exist.",
+        ribDumpReq.peerId.str());
+    co_return;
+  }
+  if (FOLLY_UNLIKELY(adjrib->second->testOnlyDeferInitDump)) {
+    XLOGF(
+        INFO,
+        "testOnlyDeferInitDump: re-buffering RibDumpReq for peer {}",
+        ribDumpReq.peerId.str());
+    maybeBufferRibDumpReq(adjrib->second);
+    co_return;
+  }
+
+  processRibDumpReq(adjrib->second, ribDumpReq.sendAddPath);
+  co_return;
+}
+
+void PeerManager::processRibDumpReq(
+    const std::shared_ptr<AdjRib>& adjRib,
+    bool sendAddPath) {
+  [[maybe_unused]] ScopedProfile profile("PeerManager::processRibDumpReq");
+  XLOGF(
+      DBG1,
+      "Handling RibDumpReq inside ShadowRib from peer {}",
+      adjRib->getRemotePeerId().str());
+
+  if (!adjRib->getBoundedAdjRibOutQueue()) {
+    XLOGF(
+        ERR,
+        "Skip RibDumpReq since session queues not initialized for {}.",
+        adjRib->getRemotePeerId().str());
+    return;
+  }
+
+  RibOutAnnouncement announcement;
+  announcement.initialDump = true;
+
+  for (const auto& [prefix, trackedShadowRibEntry] : shadowRibEntries_) {
+    /*
+     * If this shadow rib entry is already on a changeList for this
+     * specific consumer, skip this entry from Rib Dump
+     */
+    auto trackedObject = trackedShadowRibEntry.get();
+    if (changeListTracker_->isConsumerSetOnTrackableObject(
+            trackedObject, adjRib->getChangeListConsumer())) {
+      continue;
+    }
+
+    /*
+     * NOTE: we want to pack all paths from one prefix inside the same
+     * announcement even if can over the packing limit with add-path enabled.
+     */
+    auto& shadowRibEntry = trackedShadowRibEntry->get();
+
+    if (!sendAddPath) {
+      // send out bestpath only.
+      const auto bestpath = shadowRibEntry.bestpath;
+      if (bestpath) {
+        if (isShadowRibRouteInWithdraw(bestpath->flags)) {
+          continue;
+        }
+        announcement.entries.emplace_back(
+            prefix,
+            kDefaultPathID,
+            bestpath->peer,
+            bestpath->attrs,
+            shadowRibEntry.switchId,
+            shadowRibEntry.multiPathSize,
+            shadowRibEntry.aggregateReceivedUcmpWeight,
+            shadowRibEntry.aggregateLocalUcmpWeight,
+            shadowRibEntry.ribPolicyUcmpWeight);
+      }
+    } else {
+      // send out all multipaths with add-path capable peer
+      for (const auto& [_, multipath] : shadowRibEntry.multipaths) {
+        if (multipath) {
+          if (isShadowRibRouteInWithdraw(multipath->flags)) {
+            continue;
+          }
+          announcement.addPathEntries.emplace_back(
+              prefix,
+              multipath->pathIdToSend,
+              multipath->peer,
+              multipath->attrs,
+              shadowRibEntry.switchId,
+              shadowRibEntry.multiPathSize,
+              shadowRibEntry.aggregateReceivedUcmpWeight,
+              shadowRibEntry.aggregateLocalUcmpWeight,
+              shadowRibEntry.ribPolicyUcmpWeight);
+        }
+      }
+    }
+  }
+
+  // Last RibOutAnnouncement with `sendWithEoR` flag set to indicate End-of-Rib.
+  announcement.sendWithEoR = true;
+
+  XLOGF(DBG1, "{}", formatRibOutAnnouncementLog(announcement));
+
+  /**
+   * TODO: Once we change the stateful GR behavior to send all initial
+   * full dump to adjRib and let adjRib to decide when to send to socket
+   * we can then call processRibMessage for each prefix as we walk
+   * through shadowRib table
+   */
+  adjRib->processRibMessage(announcement);
+  /*
+   * changeList consumers are to be registered to the tracker
+   * library only after initial dump with EoR flag is sent to
+   * adjRibOut.
+   *
+   * consumers must be registered right away as soon EoR flag
+   * is sent so as to not miss any further incremental changes
+   * to routes
+   *
+   * NOTE: With update groups enabled, only detached peers need their
+   * consumer activated here. IN_SYNC peers rely on the group's
+   * change list consumer.
+   */
+  if (!enableUpdateGroup_ || adjRib->isDetachedPeer()) {
+    adjRib->activateChangeListConsumer();
+  }
+}
+
+void PeerManager::maybeBufferRibDumpReq(const std::shared_ptr<AdjRib>& adjRib) {
+  const auto& peerId = adjRib->getRemotePeerId();
+  /**
+   *    Start     Rib is announcing...    Done
+   *      | [A1, A2,    ....,          AN] |
+   * -----|--------------------------------|--------------> PeerMgr timeline
+   *      |                                |
+   */
+  if (!ribInitialAnnouncementStarted_) {
+    /*
+     * For peers that come up before Start
+     * (i.e. ribInitialAnnouncementStart_ = false),
+     * they can rely on PeerMgr to send [A1, ..., AN] regularly through
+     * processRibOutMsgLoop. No need to entertain RibDumpReq
+     */
+    XLOGF(
+        DBG1,
+        "Not sending RibDumpReq for {}; Rib has not started initial announcement.",
+        peerId.str());
+    return;
+  }
+
+  /*
+   * For peers that come up after ribInitialAnnouncementStart_, buffer
+   * them in the pending list to be served
+   */
+  XLOGF(INFO, "Insert RibDumpReq in pending list for {}", peerId.str());
+
+  auto [it, inserted] =
+      pendingRibDumpReqs_.insert_or_assign(peerId, adjRib->sendAddPath());
+  if (inserted) {
+    BgpStats::incrPendingRibDumpReqsCount();
+  }
+  if (ribInitialAnnouncementDone_ && !handleRibDumpsScheduled_) {
+    asyncScope_.add(co_withExecutor(&evb_, handleBufferedRibDumpReqs()));
+    handleRibDumpsScheduled_ = true;
+  }
+}
+
+folly::coro::Task<void> PeerManager::handleBufferedRibDumpReqs() {
+  // Skip handling ribDumpReq since EoR is not sent yet.
+  if (!isRibInitialAnnouncementStart()) {
+    XLOG(
+        INFO, "Skip handling buffered RibdumpReqs with ongoing initialization");
+    BgpStats::decrPendingRibDumpReqsCount(pendingRibDumpReqs_.size());
+    pendingRibDumpReqs_.clear();
+    handleRibDumpsScheduled_ = false;
+    co_return;
+  }
+
+  XLOG(INFO, "Handling all buffered RibDumpReqs");
+
+  folly::F14NodeMap<nettools::bgplib::BgpPeerId, bool /* sendAddPath */>
+      curPendingRibDumpReqs_ = folly::copy(pendingRibDumpReqs_);
+  BgpStats::decrPendingRibDumpReqsCount(pendingRibDumpReqs_.size());
+  pendingRibDumpReqs_.clear();
+
+  /**
+   * Iterate over the buffered RibDumpReqs and schedule processRibDumpReq.
+   * Here we do not need synchronization or lock because only one fiber
+   * or coro is running at once on PeerManager event base. This
+   * can change in the future if we make PeerManager multi-threaded.
+   */
+  for (auto& req : curPendingRibDumpReqs_) {
+    auto& peerId = req.first;
+    auto& sendAddPath = req.second;
+
+    XLOGF(INFO, "Processing pending RibDumpReq for peer {}", peerId.str());
+
+    co_await processRibDumpReqCoro(RibDumpReq(peerId, sendAddPath));
+    co_await folly::coro::sleep(std::chrono::milliseconds(1));
+  }
+
+  if (!pendingRibDumpReqs_.empty()) {
+    XLOG(INFO, "pending RibDumps non-empty, schedule another task");
+    asyncScope_.add(co_withExecutor(&evb_, handleBufferedRibDumpReqs()));
+  } else {
+    handleRibDumpsScheduled_ = false;
+  }
+
+  co_return;
+}
+
+/*
+ * @brief  This is the callback from changeList tracker indicating
+ *         that a specific shadowRibEntry that was earlier published
+ *         to the tracker has been consumed by all the registered
+ *         consumers. And this callback is a trigger to commit all
+ *         pending work. For example, if a path or an entry is meant
+ *         to be withdrawn/removed, withdraw/remove that specific
+ *         path or an entry
+ *
+ * @param  trackedObject  the object that is being tracked by tracker
+ *                        (which is a wrapper for a specific shadow
+ *                        rib entry)
+ *
+ * @return void
+ */
+void PeerManager::processChangeItemCompleteCallback(
+    TrackableObject<ShadowRibEntry>* trackedObject) {
+  ShadowRibEntry& srEntry = trackedObject->get();
+  if (srEntry.bestpath) {
+    resetShadowRibRouteState(srEntry.bestpath, SHADOWRIBROUTE_IN_UPDATE);
+    /*
+     * If it is withdraw, just set bestpath to nullptr for now
+     * (to not remove the whole shadow rib entry yet) because
+     * other multipath entries still may be in process of being
+     * consumed
+     */
+    if (isShadowRibRouteInWithdraw(srEntry.bestpath->flags)) {
+      resetShadowRibRouteState(srEntry.bestpath, SHADOWRIBROUTE_IN_WITHDRAW);
+      srEntry.bestpath = nullptr;
+    }
+  }
+
+  for (auto it = srEntry.multipaths.begin(); it != srEntry.multipaths.end();) {
+    resetShadowRibRouteState(it->second, SHADOWRIBROUTE_IN_UPDATE);
+    /*
+     * If it is withdraw, just erase this specific multipath
+     */
+    if (isShadowRibRouteInWithdraw(it->second->flags)) {
+      it = srEntry.multipaths.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  /*
+   * If bestpath and all multipaths have been removed then remove
+   * the shadow rib entry
+   */
+  if (!srEntry.multipaths.size() && !srEntry.bestpath) {
+    shadowRibEntries_.erase(srEntry.prefix);
+  }
+}
+
+void PeerManager::updateShadowRibEntryUtil(
+    ShadowRibEntry& srEntry,
+    const RibOutAnnouncementEntry& entry) {
+  srEntry.switchId = entry.switchId;
+  srEntry.multiPathSize = entry.multiPathSize;
+  srEntry.aggregateReceivedUcmpWeight = entry.aggregateReceivedUcmpWeight;
+  srEntry.aggregateLocalUcmpWeight = entry.aggregateLocalUcmpWeight;
+  srEntry.ribPolicyUcmpWeight = entry.ribPolicyUcmpWeight;
+  srEntry.newlyInstalledInLocalRib = entry.newlyInstalledInLocalRib;
+  srEntry.installTimeStamp = entry.installTimeStamp;
+  srEntry.ribVersion = entry.ribVersion;
+}
+
+const ConsumerBitmap& PeerManager::getConsumerBitmapForChange(
+    bool isBestpathChange) {
+  // Simply return the appropriate bitmap based on change type
+  // ChangeTracker will handle ORing if item is already on changelist
+  return isBestpathChange ? nonAddPathConsumerBitmap_ : addPathConsumerBitmap_;
+}
+
+void PeerManager::handleShadowRibEntryAnnouncement(
+    const RibOutAnnouncement& announcement) {
+  for (const auto& entry : announcement.entries) {
+    // bestpath only advertisement, hence the pathId will always be 0
+    auto srRouteInfo = std::make_shared<ShadowRibRouteInfo>(
+        entry.peer, entry.attrs, kDefaultPathID);
+    setShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_UPDATE);
+    resetShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_WITHDRAW);
+
+    // process bestpath announcement if any
+    auto srEntryIter = shadowRibEntries_.find(entry.prefix);
+    if (srEntryIter == shadowRibEntries_.end()) {
+      auto trackableShadowRibEntry =
+          std::make_unique<TrackableObject<ShadowRibEntry>>(ShadowRibEntry(
+              entry.prefix,
+              std::move(srRouteInfo), /* bestpath */
+              {} /* multipath */,
+              entry.switchId,
+              entry.multiPathSize,
+              entry.aggregateReceivedUcmpWeight,
+              entry.aggregateLocalUcmpWeight,
+              entry.ribPolicyUcmpWeight,
+              entry.newlyInstalledInLocalRib,
+              entry.installTimeStamp,
+              entry.ribVersion));
+      auto trackedObject = trackableShadowRibEntry.get();
+      shadowRibEntries_.emplace(
+          entry.prefix, std::move(trackableShadowRibEntry));
+      changeListTracker_->publishChange(
+          trackedObject,
+          getConsumerBitmapForChange(true /* isBestpathChange */));
+      trackedObject->get().publishCount++;
+    } else {
+      auto trackedObject = srEntryIter->second.get();
+      auto& srEntry = trackedObject->get();
+      // update common entry attribute from RibOutAnnoucement
+      // TODO: optimize RibOutAnnoucement to send only one time of common update
+      updateShadowRibEntryUtil(srEntry, entry);
+
+      // update "bestpath" attribute
+      srEntry.bestpath = std::move(srRouteInfo);
+      changeListTracker_->publishChange(
+          trackedObject,
+          getConsumerBitmapForChange(true /* isBestpathChange */));
+      srEntry.publishCount++;
+    }
+  }
+
+  for (const auto& entry : announcement.addPathEntries) {
+    // check before access
+    if (!entry.attrs) {
+      continue;
+    }
+
+    // process multi-path entries if it exists
+    auto pathId = getPathId(entry);
+    auto srEntryIter = shadowRibEntries_.find(entry.prefix);
+    if (srEntryIter == shadowRibEntries_.end()) {
+      // create the first multi-paths of this prefix with ShadowRibRouteInfo
+      ShadowRibRouteInfos multipaths = {
+          {pathId,
+           std::make_shared<ShadowRibRouteInfo>(
+               entry.peer, entry.attrs, entry.pathIdToSend)}};
+      setShadowRibRouteState(
+          multipaths.begin()->second, SHADOWRIBROUTE_IN_UPDATE);
+      auto trackableShadowRibEntry =
+          std::make_unique<TrackableObject<ShadowRibEntry>>(ShadowRibEntry(
+              entry.prefix,
+              nullptr,
+              std::move(multipaths),
+              entry.switchId,
+              entry.multiPathSize,
+              entry.aggregateReceivedUcmpWeight,
+              entry.aggregateLocalUcmpWeight,
+              entry.ribPolicyUcmpWeight,
+              entry.newlyInstalledInLocalRib,
+              entry.installTimeStamp,
+              entry.ribVersion));
+      auto trackedObject = trackableShadowRibEntry.get();
+      shadowRibEntries_.emplace(
+          entry.prefix, std::move(trackableShadowRibEntry));
+      changeListTracker_->publishChange(
+          trackedObject,
+          getConsumerBitmapForChange(false /* isBestpathChange */));
+      trackedObject->get().publishCount++;
+    } else {
+      // find the existing shadow ribEntry
+      auto trackedObject = srEntryIter->second.get();
+      auto& srEntry = trackedObject->get();
+      auto srRouteInfo = std::make_shared<ShadowRibRouteInfo>(
+          entry.peer, entry.attrs, entry.pathIdToSend);
+      setShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_UPDATE);
+      resetShadowRibRouteState(srRouteInfo, SHADOWRIBROUTE_IN_WITHDRAW);
+
+      auto multipathIter = srEntry.multipaths.find(pathId);
+      if (multipathIter == srEntry.multipaths.end()) {
+        // create path entry
+        srEntry.multipaths.emplace(pathId, std::move(srRouteInfo));
+      } else {
+        // update existing path entry
+        multipathIter->second = std::move(srRouteInfo);
+      }
+
+      // update common entry attribute from RibOutAnnoucement
+      updateShadowRibEntryUtil(srEntry, entry);
+      changeListTracker_->publishChange(
+          trackedObject,
+          getConsumerBitmapForChange(false /* isBestpathChange */));
+      srEntry.publishCount++;
+    }
+  }
+
+  // publish shadow rib collection size
+  RibStats::publishShadowRibSize(shadowRibEntries_.size());
+}
+
+void PeerManager::handleShadowRibEntryWithdrawal(
+    const RibOutWithdrawal& withdrawal) {
+  // process bestpath withdrawal
+  for (const auto& entry : withdrawal.entries) {
+    auto srEntryIter = shadowRibEntries_.find(entry.prefix);
+    if (srEntryIter == shadowRibEntries_.end()) {
+      XLOGF(
+          DBG4,
+          "Skip processing withdrawal for non-existent prefix in shadowRibEntries: {}",
+          folly::IPAddress::networkToString(entry.prefix));
+      continue;
+    }
+    auto trackedObject = srEntryIter->second.get();
+    auto& srEntry = trackedObject->get();
+    if (srEntry.bestpath) {
+      setShadowRibRouteState(srEntry.bestpath, SHADOWRIBROUTE_IN_WITHDRAW);
+      resetShadowRibRouteState(srEntry.bestpath, SHADOWRIBROUTE_IN_UPDATE);
+    }
+    changeListTracker_->publishChange(
+        trackedObject, getConsumerBitmapForChange(true /* isBestpathChange */));
+  }
+
+  // process multipath withdrawal
+  for (const auto& entry : withdrawal.addPathEntries) {
+    auto srEntryIter = shadowRibEntries_.find(entry.prefix);
+    if (srEntryIter == shadowRibEntries_.end()) {
+      // skip processing since this prefix does not exist
+      continue;
+    }
+
+    auto trackedObject = srEntryIter->second.get();
+    auto& srEntry = trackedObject->get();
+    // TODO: once rib-allocated path ID is rolled out, there's not a case where
+    // a RibOutWithdrawal entry has no valid pathID value, so at that point we
+    // could remove this block
+    auto maybePathId = getPathId(entry);
+    if (!maybePathId.has_value()) {
+      XLOGF(
+          ERR,
+          "Skip erasing path from ShadowRib with unknown path ID for prefix: {}",
+          folly::IPAddress::networkToString(entry.prefix));
+      continue;
+    }
+
+    // skip processing since this path ID does not exist
+    auto pathId = maybePathId.value();
+    if (!srEntry.multipaths.contains(pathId)) {
+      auto isUint = std::holds_alternative<uint32_t>(pathId);
+      XLOGF(
+          ERR,
+          "Skip erasing path from ShadowRib as multipaths of entry for pfx {} does not contain path ID {}",
+          folly::IPAddress::networkToString(entry.prefix),
+          isUint ? std::to_string(std::get<uint32_t>(pathId))
+                 : std::get<folly::IPAddress>(pathId).toJson());
+      continue;
+    }
+
+    setShadowRibRouteState(
+        srEntry.multipaths.at(pathId), SHADOWRIBROUTE_IN_WITHDRAW);
+    resetShadowRibRouteState(
+        srEntry.multipaths.at(pathId), SHADOWRIBROUTE_IN_UPDATE);
+    const auto& bitmap =
+        getConsumerBitmapForChange(false /* isBestpathChange */);
+    changeListTracker_->publishChange(trackedObject, bitmap);
+  }
+
+  // publish shadow rib collection size
+  RibStats::publishShadowRibSize(shadowRibEntries_.size());
+}
+
+PathId PeerManager::getPathId(const RibOutAnnouncementEntry& entry) {
+  if (enableRibAllocatedPathId_) {
+    return uint32_t(entry.pathIdToSend);
+  } else {
+    return folly::IPAddress(entry.attrs->getNexthop());
+  }
+}
+
+std::optional<PathId> PeerManager::getPathId(
+    const RibOutWithdrawalEntry& entry) {
+  if (enableRibAllocatedPathId_) {
+    return uint32_t(entry.pathIdToSend);
+  } else if (entry.nh.has_value()) {
+    return folly::IPAddress(*entry.nh);
+  } else {
+    return std::nullopt;
+  }
+}
+
+void PeerManager::processNeighborRouteChangeDuringInitialization(
+    const nettools::bgplib::BgpPeerId& peerId) noexcept {
+  // Remove neighbor from static/dynamic EOR waiting list if present
+  // It is a no-op if the key is not present in the unordered maps.
+  bool removedPeer = (staticPeerEoRReceived_.erase(peerId.peerAddr) > 0);
+
+  removedPeer |= (dynamicPeerEoRReceived_.erase(peerId) > 0);
+
+  /*
+   * If peer was not removed, do nothing
+   * Peer could have not been removed under the following cases
+   * 1. Case 1: Peer was already removed from the static/dynamic EOR waiting
+   *    list
+   * 2. Case 2: Static/Dynamic EOR waiting list was empty as GR state was not
+   *    loaded
+   * 3. Case 3: Static/Dynamic EOR waiting list was empty, GR state was loaded
+   *    but completely empty.
+   *            This can happen if two peers that support GR start restart
+   *            procedure at the same time. This happens quite often in
+   *            emulation and here the RIB is notified as soon as EoR is
+   *            received from any peer.
+   */
+  if (!removedPeer) {
+    return;
+  }
+
+  // Peer was removed, exclude peer from initialization
+  XLOGF(
+      INFO,
+      "[Initialization] Session down. Exclude peer: {} from initialization",
+      peerId.str());
+
+  // Check if all EORs have been received and notify RIB if not already
+  // notified.
+  checkAndNotifyAllEoRReceived();
+
+  // Check if we can now move to Initialized state
+  maybeMarkInitialized();
+}
+
+folly::coro::Task<void> PeerManager::handleNeighborEventMsg(
+    const NeighborEventMsg& msg) noexcept {
+  if (!msg.isUp) {
+    XLOGF(
+        INFO,
+        "Neighbor [{}] disappeared. Bringing session down...",
+        msg.nbrAddr.str());
+    /* If a peer is currently undergoing graceful restart, for example
+     * during an admin down to update BGP during push, we will have
+     * marked all routes learned from that peer as "stale" and they will
+     * still be used in forwarding.  Since we just received nbrDown for
+     * that peer, we need to clean up these stale routes and send
+     * "withdraw" to RIB so that RIB recomputes best paths. Calling
+     * sessionMgr_->stopPeer() does not work in this case because BGP
+     * session is already down and FiberBgpPeer has lost communication
+     * with AdjRib.  Therefore, if peer is in GR state, we call
+     * adjRib->stop() directly do this clean up.  See T107593063 /
+     * S254616 for motivation.
+     */
+    for (auto [peerId, adjRib] : adjRibs_) {
+      if (peerId.peerAddr == msg.nbrAddr) {
+        if (adjRib && adjRib->isPeerGracefulRestarting()) {
+          XLOGF(INFO, "Received {} DOWN while nbr in GR state", peerId.str());
+          co_await adjRib->stop();
+        }
+        // If BGP is in initialization and the NeighborWatcher thread
+        // reports a neighbor as down, remove the neighbor from static
+        // or dynamic EOR waiting lists. This optimization improves
+        // convergence time.
+        if (!initialized_) {
+          processNeighborRouteChangeDuringInitialization(peerId);
+        }
+      }
+    }
+    co_await sessionMgr_->co_stopPeer(msg.nbrAddr, false /*withGR*/);
+  }
+}
+
+folly::coro::Task<void> PeerManager::handleNeighborReachabilityMsg() noexcept {
+  XLOG(INFO, "Received NeighborReachabilityMsg. Stopping all peers.");
+  BgpStats::incDsfFastTearDownCount();
+
+  for (auto [peerId, adjRib] : adjRibs_) {
+    auto peerConfig =
+        configManager_->getConfig()->getConfigOfAPeer(peerId.peerAddr);
+    // HACK: We have hardcoded the DSF roles in a set. This is a very
+    // rough shortcut in order to satisfy DSF requirements. We
+    // add this check here with the knowledge that this is a
+    // tradeoff to unblock DSF.
+    if (!peerConfig || !peerConfig->peerTag ||
+        !kDsfSwitchRoles.contains(*peerConfig->peerTag)) {
+      // We will only stop peers that are in DSF zone.
+      continue;
+    }
+    if (adjRib && adjRib->isPeerGracefulRestarting()) {
+      XLOGF(INFO, "Stopping peer while peer in GR state: {}", peerId.str());
+      co_await adjRib->stop();
+    } else {
+      XLOGF(INFO, "Stopping peer: {}", peerId.str());
+    }
+    co_await sessionMgr_->co_stopPeer(peerId.peerAddr, false /*withGR*/);
+  }
+}
+
+folly::coro::Task<void> PeerManager::processNeighborRouteChangeLoop() noexcept {
+  XLOG(DBG1, "Starting neighbor event processing coro task...");
+  while (true) {
+    // when cancelAndJoinAsync is called, guaranteed to exit
+    co_await folly::coro::co_safe_point;
+
+    auto msg = co_await co_awaitTry(nbrRouteChangeQ_->pop());
+    if (!msg.hasValue()) {
+      XLOG(
+          INFO,
+          "[Exit] Coro task cancelled. Terminating processNeighborRouteChangeLoop.");
+      break;
+    }
+
+    // using static as we only need to define it once
+    static auto overload = folly::overload(
+        [this](const NeighborEventMsg& neighborEventMsg)
+            -> folly::coro::Task<void> {
+          co_await handleNeighborEventMsg(neighborEventMsg);
+        },
+        [this](const NeighborReachabilityMsg&) -> folly::coro::Task<void> {
+          co_await handleNeighborReachabilityMsg();
+        });
+
+    co_await std::visit(overload, *msg);
+  }
+  co_return;
+}
+
+// peerAddr state (established/terminated) has changed, update non graceful
+// counter for peer_tag of this peer
+void PeerManager::updateNonGracefulCounters(
+    const folly::IPAddress& peerAddr,
+    bool isTerminated) noexcept {
+  auto peerConfig = configManager_->getConfig()->getConfigOfAPeer(peerAddr);
+  if (!peerConfig) {
+    XLOGF(INFO, "Cannot find config for peer {}", peerAddr.str());
+    return;
+  }
+  if (isTerminated) {
+    BgpStats::decNonGrPeers(*(peerConfig->peerTag));
+  } else {
+    BgpStats::incNonGrPeers(*(peerConfig->peerTag));
+  }
+}
+
+folly::coro::Task<void> PeerManager::waitForSessionTerminateBaton(
+    const BgpPeerId& peerId) noexcept {
+  /*
+   * Wait till adjRib sees the terminate notification. This ensures that
+   * peerManager doesn't move adjRib to established when it's already in
+   * established state.
+   *
+   * Even though co_await here suspends, this should not suspend long as, one
+   * round robin to AdjRib task will ensure that NULL in the front is read
+   * immediately and session is terminated from adjRib. Under stable conditions
+   * number of such occurrences should be very minimal. If successive flaps are
+   * from same peer, we will skip over those because of version number.
+   */
+  XLOGF(
+      DBG1,
+      "Peer Manager waiting for adjRib of [{}] to terminate",
+      peerId.str());
+
+  auto terminateBaton = sessionTerminateBatons_[peerId];
+  auto startTime = std::chrono::steady_clock::now();
+
+  /*
+   * co_await *terminateBaton is safe from cancellation.
+   *
+   * folly::coro::Baton is explicitly NOT cancellation-aware (Baton.h):
+   *
+   * co_await *baton will:
+   *  - Pass through immediately if already posted (latch semantics)
+   *  - Suspend until post() is called — cancellation requests are ignored
+   *  - Never throw OperationCancelled
+   *
+   * The latch semantics also prevent hangs during rapid session flaps with
+   * version compression (S619541): if the baton was posted by a previous
+   * session termination and not yet reset (due to a stale version causing
+   * early return), subsequent co_await calls pass through immediately.
+   *
+   * Note: the old code used co_withCancellation(CancellationToken{}, ...)
+   * to shield BatchSemaphore::co_wait() from outer cancellation. With
+   * folly::coro::Baton, this shielding is unnecessary — the primitive
+   * itself ignores cancellation by design.
+   */
+  co_await *terminateBaton;
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - startTime);
+  XLOGF_IF(
+      DBG1,
+      duration.count() > 1,
+      "Peer Manager blocked waiting for adjRib of [{}] to terminate for {}ms",
+      peerId.str(),
+      duration.count());
+  co_return;
+}
+
+folly::coro::Task<void> PeerManager::cleanupPeerState(
+    const BgpPeerId& peerId,
+    const folly::IPAddress& peerAddr) noexcept {
+  XLOGF(
+      INFO,
+      "cleanupPeerState: starting cleanup for peer {} addr {}",
+      peerId.str(),
+      peerAddr.str());
+
+  // Capture AdjRib pointer before baton wait. In the common case
+  // sessionEstablished reuses the existing AdjRib for a given peerId, so
+  // findAdjRib(peerId) == expectedAdjRib after the wait. Mismatch is rare
+  // and requires concurrent delPeers for the same peer plus an interleaved
+  // add: del_1 and del_2 both capture expected = adjRib_1 (overlapping so
+  // both see the same pointer before either erases), del_2 resumes first
+  // and erases, the add then runs sessionEstablished which sees an empty
+  // slot and creates a fresh adjRib_2 via createAdjRib. When del_1 resumes
+  // it finds adjRib_2 — skip the erase to avoid destroying it.
+  auto expectedAdjRib = findAdjRib(peerId);
+
+  // 1. Wait for AdjRib message loops to exit (baton posted by
+  // postTerminateBaton after both processPeerMessageLoop and
+  // processRibMessageLoop signal the semaphore).
+  // Only wait if an AdjRib exists (peer was ever established).
+  if (expectedAdjRib) {
+    co_await waitForSessionTerminateBaton(peerId);
+  }
+
+  // 2. AdjRib erasure
+  auto adjRib = findAdjRib(peerId);
+  if (adjRib && adjRib != expectedAdjRib) {
+    XLOGF(
+        INFO,
+        "cleanupPeerState: AdjRib for {} was replaced by a new session, "
+        "skipping erase",
+        peerId.str());
+    co_return;
+  } else if (adjRib) {
+    // Always call stop() before erasing. It forces the deferred GR
+    // withdrawal (when in GR helper mode) and drains in-flight pushes from
+    // the GR timer callbacks.
+    co_await adjRib->stop();
+    // Re-check identity after suspension.
+    if (findAdjRib(peerId) != expectedAdjRib) {
+      XLOGF(
+          INFO,
+          "cleanupPeerState: AdjRib for {} was replaced during stop(), "
+          "skipping erase",
+          peerId.str());
+      co_return;
+    }
+    stopMonitoring(peerId.toOdsKey());
+    PeerStats::clearPeerCounters(adjRib->getStats().getPeerIdOdsStr());
+    adjRib->resetChangeListConsumer();
+    adjRibs_.erase(peerId);
+    RibStats::decrAdjRibCount();
+    XLOGF(INFO, "cleanupPeerState: erased AdjRib for {}", peerId.str());
+
+    // 3. Erase per-peer states
+    // Note: dynamicPeerEoRReceived_ not erased since we do not support
+    // removal of dynamic peers
+    auto addrIt = peerAddrToIds_.find(peerAddr);
+    if (addrIt != peerAddrToIds_.end()) {
+      if (addrIt->second.erase(peerId) > 0) {
+        BgpStats::decrPeerAddrToIdsCount();
+      }
+      if (addrIt->second.empty()) {
+        peerAddrToIds_.erase(addrIt);
+      }
+    }
+    sessionTerminateBatons_.erase(peerId);
+    staticPeerEoRReceived_.erase(peerAddr);
+    if (establishedGrPeers_.erase(peerId) > 0) {
+      BgpStats::decrEstablishedGrPeersCount();
+    }
+    if (pendingRibDumpReqs_.erase(peerId) > 0) {
+      BgpStats::decrPendingRibDumpReqsCount(1);
+    }
+  }
+  XLOGF(
+      INFO,
+      "cleanupPeerState: completed cleanup for peer {} addr {}",
+      peerId.str(),
+      peerAddr.str());
+  co_return;
+}
+
+folly::coro::Task<void> PeerManager::sessionEstablished(
+    FiberBgpPeer::ObservableStateT evt) noexcept {
+  ScopedProfile profile("PeerManager::sessionEstablished");
+  const auto& peerId = evt.peerId;
+  const auto& versionNumber = evt.versionNumber;
+  const auto& sessionInfo = evt.sessionInfo;
+
+  XLOGF(
+      INFO,
+      "Session ESTABLISHED for [{}] version {}",
+      peerId.str(),
+      versionNumber);
+
+  const auto& peerAddr = peerId.peerAddr;
+  auto adjRib = findAdjRib(peerId);
+  XLOGF(
+      INFO,
+      "BGP_PEER_EVENT peer={} incarnation={} phase={} src={}",
+      peerAddr.str(),
+      adjRib ? adjRib->flapCounter() : 0,
+      "SESSION_ESTABLISH_NOTIFIED",
+      BGP_LOG_SRC());
+  if (adjRib) {
+    /* Wait for all coroutines spawned from previous session to finish. */
+    co_await waitForSessionTerminateBaton(peerId);
+    adjRib->logPeerEvent("SESSION_PREV_TEARDOWN_COMPLETE", BGP_LOG_SRC());
+    co_await adjRib->ensureAsyncScopeInitialized();
+  }
+
+  // count peers with which we negotiated graceful restart capability.
+  // in the case of static peer without GR capability, treat EoR is received
+  // immediately.
+  const auto& peerInfo = sessionInfo->peerInfo;
+  CHECK(peerInfo.has_value());
+  // if SET_LINK_BPS is set for UCMP, link bandwidth Bps must be a valid
+  // value
+  if ((peerInfo->peeringParams.advertiseLinkBandwidth.has_value() &&
+       *peerInfo->peeringParams.advertiseLinkBandwidth ==
+           AdvertiseLinkBandwidth::SET_LINK_BPS) ||
+      (peerInfo->peeringParams.receiveLinkBandwidth.has_value() &&
+       *peerInfo->peeringParams.receiveLinkBandwidth ==
+           ReceiveLinkBandwidth::SET_LINK_BPS)) {
+    CHECK(peerInfo->peeringParams.linkBandwidthBps.has_value()) << fmt::format(
+        "UCMP SET_LINK_BPS is specified for peer {}, but linkBandwidthBps does not have a value.",
+        peerId.peerAddr.str());
+  }
+
+  // check whether add path capabilities are the same for each address family
+  std::optional<nettools::bgplib::BgpAddPathSendRec> cachedCapa{std::nullopt};
+
+  for (const auto& addPathCapa :
+       *peerInfo.value().negotiatedCapabilities.addPathCapabilities()) {
+    if (!cachedCapa.has_value()) {
+      cachedCapa = *addPathCapa.sor();
+    }
+    if (cachedCapa.value() != *addPathCapa.sor()) {
+      XLOG(
+          ERR,
+          "We don't support different add path capability for different "
+          "address family over one peering");
+      co_return;
+    }
+  }
+
+  bool inInitialAnnouncement = !isRibInitialAnnouncementStart();
+
+  /* get bgp peer output queue, aka, adjRibInQueue */
+  auto& oqueue = sessionInfo->outputQueue;
+  CHECK(oqueue != nullptr);
+
+  /* get bgp peer input queue, aka, adjRibOutQueue */
+  auto& iqueue = sessionInfo->inputQueue;
+  CHECK(iqueue != nullptr);
+
+  /* Get bgp bounded peer input queue, aka, boundedAdjRibOutQueue. */
+  auto& boundedIqueue = sessionInfo->boundedInputQueue;
+  CHECK(boundedIqueue != nullptr);
+
+  { // start of the critical section, protected by versionLock
+    auto versionLock = sessionInfo->currentVersion->grabScopedLock();
+
+    // The act of putting RibDumpReq message on ribInQ_ above requires
+    // acquiring a fiber-aware lock. If RIB thread is accessing this queue
+    // at the same time, this current Fiber may have to suspend. Thus, we
+    // need to re-check if FiberBgpPeerManager has flapped the session or
+    // moved on to a new incarnation of that session while this fiber was
+    // suspended. If either of those events happened, then we must ignore
+    // the Establish event.
+    if (sessionInfo->currentVersion->getWithoutLock() != versionNumber) {
+      XLOGF(
+          INFO,
+          "Ignoring session establishment notification for peer [{}] "
+          "version {}: State no longer valid",
+          peerAddr.str(),
+          versionNumber);
+      co_return;
+    }
+
+    // create AdjRib fiber for this peer
+    if (!adjRib) {
+      adjRib = createAdjRib(peerId, peerInfo->peeringParams);
+      // set route filter statement and golden prefix policy before this
+      // peer starts
+      setRouteFilterStatement(adjRib);
+      setGoldenPrefixPolicy(adjRib, true /* initializeAdjRib */);
+      auto changeListConsumer = std::make_shared<AdjRibOutConsumer>(
+          changeListTracker_,
+          adjRib,
+          "ChangeList Consumer",
+          evb_,
+          addPathConsumerBitmap_,
+          nonAddPathConsumerBitmap_);
+      adjRib->setChangeListConsumer(changeListConsumer);
+    } else if (!adjRib->getChangeListConsumer()) {
+      /*
+       * Recreate change list consumer for reconnecting peers.
+       * When a peer leaves an update group (session down), its
+       * changeListConsumer is reset to nullptr. When the peer reconnects
+       * (session up again), we need to recreate the consumer so it can
+       * catch up independently before rejoining the group
+       * (DETACHED_INIT_DUMP state).
+       */
+      auto changeListConsumer = std::make_shared<AdjRibOutConsumer>(
+          changeListTracker_,
+          adjRib,
+          "ChangeList Consumer",
+          evb_,
+          addPathConsumerBitmap_,
+          nonAddPathConsumerBitmap_);
+      adjRib->setChangeListConsumer(changeListConsumer);
+      XLOGF(
+          INFO,
+          "Recreated change list consumer for reconnecting peer {}",
+          peerId.str());
+    }
+
+    adjRib->sessionEstablished(
+        std::optional<uint16_t>(peerInfo->remoteGrRestartTime),
+        oqueue, /* aka adjRibInQueue */
+        iqueue, /* aka adjRibOutQueue */
+        boundedIqueue, /* aka, boundedAdjRibOutQueue */
+        AfiIpv4Negotiated{*peerInfo->negotiatedCapabilities.mpExtV4Unicast()},
+        AfiIpv6Negotiated{*peerInfo->negotiatedCapabilities.mpExtV6Unicast()},
+        V4OverV6Nexthop{
+            !peerInfo->negotiatedCapabilities.extNHEncodingCapabilities()
+                 ->empty()},
+        EnhancedRouteRefreshNegotiated{
+            *peerInfo->negotiatedCapabilities.enhancedRouteRefresh()},
+        RouteRefreshNegotiated{
+            *peerInfo->negotiatedCapabilities.routeRefresh()},
+        cachedCapa,
+        *peerInfo->negotiatedCapabilities.as4byte(),
+        !peerInfo->negotiatedCapabilities.extNHEncodingCapabilities()->empty());
+    adjRib->logPeerEvent("SESSION_ADJRIB_ESTABLISHED", BGP_LOG_SRC());
+
+    /*
+     * Update group association.
+     *
+     * When the update_group feature is enabled, associate this peer with an
+     * update group based on its "UpdateGroupKey". Members in the same group
+     * will share generated update.
+     */
+    if (!enableUpdateGroup_) {
+      // Only buffer RibDumpReq when update groups are disabled
+      // With update groups enabled, decision is made after peer state is
+      // determined
+      maybeBufferRibDumpReq(adjRib);
+    } else {
+      /*
+       * Attention: adjRibOutGroup will be first created when adjRib is
+       * created based on configuration. When updateGroup feature is
+       * enabled, this will be overridden to a DIFFERENT group keyed by the
+       * "UpdateGroupKey".
+       */
+      const auto& updateGroupKey = adjRib->getUpdateGroupKey();
+      auto updateGroup = updateGroupManager_->findOrCreateGroup(updateGroupKey);
+
+      /*
+       * Set change list consumer on the update group if not already set.
+       * The group needs its own consumer to receive incremental changes
+       * from the change tracker after initial dump completes.
+       */
+      if (!updateGroup->getChangeListConsumer()) {
+        XLOGF(
+            INFO,
+            "Setting change list consumer on update group [{}]",
+            updateGroup->getGroupDescriptor());
+        auto groupConsumer = std::make_shared<AdjRibOutGroupConsumer>(
+            changeListTracker_,
+            updateGroup,
+            fmt::format("UpdateGroup-{}", updateGroup->getAdjRibGroupName()),
+            evb_,
+            addPathConsumerBitmap_,
+            nonAddPathConsumerBitmap_);
+        updateGroup->setChangeListConsumer(groupConsumer);
+        updateGroup->setChangeListTracker(
+            changeListTracker_,
+            addPathConsumerBitmap_,
+            nonAddPathConsumerBitmap_);
+      } else {
+        XLOGF(
+            DBG1,
+            "Update group [{}] already has change list consumer",
+            updateGroup->getGroupDescriptor());
+      }
+
+      adjRib->setUpdateGroup(updateGroup);
+
+      XLOGF(
+          DBG1,
+          "Peer [{}] associated with update group [{}]",
+          peerId.str(),
+          updateGroup->getGroupDescriptor());
+
+      // Register peer with the update group
+      updateGroup->registerPeer(adjRib);
+
+      // Handle BGP initialization sequence and group-level initial dump
+      if (updateGroup->getState() == UpdateGroupState::UNINITIALIZED) {
+        if (!ribInitialAnnouncementDone_) {
+          /*
+           * Case 1: BGP initialization not complete
+           * Defer initial dump until markRibInitialAnnouncementDone()
+           * triggers all groups
+           */
+          XLOGF(
+              INFO,
+              "Peer [{}] in group [{}]: BGP initialization not complete, "
+              "deferring initial dump",
+              peerId.str(),
+              updateGroup->getGroupDescriptor());
+        } else {
+          // Case 2: BGP initialization already complete
+          // Trigger group-level initial dump immediately for this new group
+          XLOGF(
+              INFO,
+              "Peer [{}] in group [{}]: Triggering group-level initial dump",
+              peerId.str(),
+              updateGroup->getGroupDescriptor());
+          updateGroup->scheduleInitialDump();
+        }
+      }
+
+      // Check if peer needs independent initial dump (detached mode)
+      auto peerState = adjRib->getPeerState();
+      if (peerState == PeerUpdateState::DETACHED_INIT_DUMP) {
+        // Peer must catch up independently before joining group
+        XLOGF(
+            INFO,
+            "Peer [{}] in DETACHED_INIT_DUMP state, buffering independent RibDumpReq",
+            peerId.str());
+        maybeBufferRibDumpReq(adjRib);
+      }
+      // else: peer is in INIT state, group handles the initial dump
+    }
+  } // end of the critical section, protected by versionLock
+
+  if (inInitialAnnouncement) {
+    adjRib->setInInitialAnnouncement();
+  }
+
+  // Update statistics
+  adjRib->logPeerEvent("SESSION_UPDATE_GROUP_JOINED", BGP_LOG_SRC());
+  adjRib->markStateEstablished();
+  runningSessions_ += 1;
+  setRunningSessions(runningSessions_);
+  addSessionStateChanges();
+  if (peerInfo->peeringParams.remoteAs == kVipAsn) {
+    runningVipSessions_ += 1;
+    setRunningVipSessions(runningVipSessions_);
+  }
+  if (peerAddrToIds_[peerAddr].insert(peerId).second) {
+    BgpStats::incrPeerAddrToIdsCount();
+  }
+
+  // Track peers which have negotiated graceful restart for stateful GR
+  if (*peerInfo->negotiatedCapabilities.gracefulRestart()) {
+    if (establishedGrPeers_.insert(peerId).second) {
+      BgpStats::incrEstablishedGrPeersCount();
+    }
+  } else {
+    updateNonGracefulCounters(peerAddr, false /* isTerminated */);
+  }
+
+  auto grSupported = *peerInfo->negotiatedCapabilities.gracefulRestart();
+  auto isRestarting = *peerInfo->negotiatedCapabilities.isRestarting();
+  if (!grSupported || isRestarting) {
+    // Don't wait for EoR if peer does not support GR or is itself
+    // restarting
+    if (!grSupported) {
+      XLOGF(
+          INFO,
+          "{}Peer [{}] does not support GR capability, not waiting for EoR",
+          facebook::fboss::BGPAlert().str(),
+          peerAddr.str());
+    }
+    if (isRestarting) {
+      XLOGF(
+          INFO,
+          "{}Peer [{}] is restarting, not waiting for EoR",
+          facebook::fboss::BGPAlert().str(),
+          peerAddr.str());
+    }
+    // pretend we got EoR from this peer
+    processPeerEoR(peerId);
+  }
+  adjRib->startMessageProcessingLoop();
+  co_return;
+}
+
+folly::coro::Task<void> PeerManager::sessionTerminated(
+    const FiberBgpPeer::ObservableStateT& evt) noexcept {
+  ScopedProfile profile("PeerManager::sessionTerminated");
+  const auto& peerId = evt.peerId;
+  const auto& peerAddr = peerId.peerAddr;
+  const auto& versionNumber = evt.versionNumber;
+
+  const auto adjRib = findAdjRib(peerId);
+  if ((!adjRib) || (!adjRib->isStateEstablished())) {
+    // This can happen if there are rapid transitions between establish and
+    // terminate, if we did not see establish by the time peer transitioned
+    // to terminate, we would have ignored the establish notification, so,
+    // for this terminate notification nothing needs to be done.
+    XLOGF(
+        DBG2,
+        "Ignoring session terminate for peer {} version {}: "
+        "Previously session down.",
+        peerId.str(),
+        versionNumber);
+    co_return;
+  }
+
+  XLOGF(
+      INFO,
+      "Session TERMINATED for [{}] version {}",
+      peerId.str(),
+      versionNumber);
+  adjRib->logPeerEvent("SHUTDOWN_INITIATED", BGP_LOG_SRC());
+
+  // Handle update group cleanup if enabled (Scenario E)
+  if (enableUpdateGroup_) {
+    auto updateGroup = adjRib->getUpdateGroup();
+    if (updateGroup) {
+      /* Check if peer is in detached state when going down (Scenario E) */
+      if (adjRib->isDetachedPeer()) {
+        XLOGF(
+            INFO,
+            "Session terminated for detached peer {}, triggering handleDetachedPeerDown",
+            peerId.str());
+
+        updateGroup->handleDetachedPeerDown(adjRib);
+
+        /* Maybe destroy group if no members remain */
+        const auto& updateGroupKey = adjRib->getUpdateGroupKey();
+        co_await updateGroupManager_->maybeDestroyUpdateGroup(updateGroupKey);
+      } else {
+        // Non-detached peer termination
+        // Unregister from update group and maybe destroy group if no
+        // members
+        XLOGF(
+            INFO,
+            "Session terminated for peer {}, unregistering from update group",
+            peerId.str());
+
+        updateGroup->unregisterPeer(adjRib);
+
+        // Maybe destroy group if no members remain
+        const auto& updateGroupKey = adjRib->getUpdateGroupKey();
+        co_await updateGroupManager_->maybeDestroyUpdateGroup(updateGroupKey);
+      }
+    }
+  }
+
+  adjRib->markStateTerminated();
+  adjRib->resetInInitialAnnouncement();
+  adjRib->deactivateChangeListConsumer();
+
+  // Remove peer's request from pendingRibDumpReqs_ if a RibDumpReq
+  // was made during initialization.
+  if (pendingRibDumpReqs_.erase(peerId) > 0) {
+    BgpStats::decrPendingRibDumpReqsCount(1);
+  }
+
+  // when a session goes down, remove it from the static and dynamic peer
+  // EoR waiting collection. This will be a no-op if the key is not
+  // populated.
+  if (!initialized_) {
+    staticPeerEoRReceived_.erase(peerAddr);
+    dynamicPeerEoRReceived_.erase(peerId);
+
+    XLOGF(
+        INFO,
+        "[Initialization] Session terminated. Exclude peer: {} from initialization",
+        peerId.str());
+
+    maybeMarkInitialized();
+  }
+
+  // Session terminated when queue get's null. This ensures no
+  // OOB order issues
+  runningSessions_ -= 1;
+  setRunningSessions(runningSessions_);
+  addSessionStateChanges();
+  if (adjRib->getPeeringParams().remoteAs == kVipAsn) {
+    runningVipSessions_ -= 1;
+    setRunningVipSessions(runningVipSessions_);
+  }
+
+  if (evt.lastResetReason == ResetReason::HOLD_TIMER_EXPIRE) {
+    PeerStats::incrTotalHoldTimerExpiry();
+  }
+
+  if (establishedGrPeers_.find(peerId) != establishedGrPeers_.end()) {
+    establishedGrPeers_.erase(peerId);
+    BgpStats::decrEstablishedGrPeersCount();
+  } else {
+    updateNonGracefulCounters(peerAddr, true /* isTerminated */);
+  }
+  adjRib->logPeerEvent("SHUTDOWN_COMPLETE", BGP_LOG_SRC());
+
+  if (evt.peerDelete) {
+    XLOGF(
+        INFO,
+        "sessionTerminated for {}: peerDelete set, running cleanupPeerState",
+        peerId.str());
+    co_await cleanupPeerState(peerId, peerAddr);
+  }
+  co_return;
+}
+
+void PeerManager::notifyRibInitialPathComputation(bool timerFired) noexcept {
+  if (ribInitPathComputationNotified_) {
+    XLOG(INFO, "Rib already notified about best-path start");
+    return;
+  }
+
+  ribInitPathComputationNotified_ = true;
+  /*
+   * Use forcePush instead of fiberPush to avoid blocking the EventBase
+   * thread. fiberPush uses folly::fibers::Semaphore::wait() which requires
+   * a FiberManager to yield cooperatively. notifyRibInitialPathComputation
+   * is called from both timer callbacks and plain coroutines (no
+   * FiberManager), so fiberPush would block the entire OS thread if ribInQ_
+   * is full.
+   *
+   * forcePush is safe here because this is a one-shot control signal
+   * (guarded by ribInitPathComputationNotified_), not a data-path operation
+   * at scale.
+   */
+  ribInQ_.forcePush(RibInInitialPathComputation());
+  eorTimerExpired_ = timerFired;
+  BgpStats::setEorTimerExpired(timerFired);
+
+  // Once we've notified RIB to program FIB, we are not in restarting mode
+  // anymore.  Let sessionMgr know about this so that it can set GR
+  // Capability accordingly
+  sessionMgr_->setRestartingState(false);
+
+  // Reset EoR timer since either we 1) received all EoRs, or 2) timed out
+  eorTimer_.reset();
+
+  // Start a max-cap counting-down timer for initiailized signal publication
+  // NOTE: this is the last line of defense to publish INITIALIZED signal in
+  // case there are bad peers can't send egressEoR towards.
+  initializedSignalTimer_->scheduleTimeout(
+      5 *
+      std::chrono::seconds(
+          *configManager_->getConfig()->getConfig().eor_time_s()));
+}
+
+void PeerManager::processPeerEoR(
+    const nettools::bgplib::BgpPeerId& peerId) noexcept {
+  XLOGF(INFO, "Process EoR from {}", peerId.str());
+
+  if (staticPeerEoRReceived_.size() != 0 ||
+      dynamicPeerEoRReceived_.size() != 0) {
+    // in case there are any static OR dynamic peers try to match
+    // peerId. In case there is no match, do nothing.
+    auto staticIt = staticPeerEoRReceived_.find(peerId.peerAddr);
+    if (staticIt != staticPeerEoRReceived_.end()) {
+      staticIt->second.first = true;
+    } else {
+      auto dynamicIt = dynamicPeerEoRReceived_.find(peerId);
+      if (dynamicIt != dynamicPeerEoRReceived_.end()) {
+        dynamicIt->second.first = true;
+      } else {
+        /**
+         * It is possible that static or dynamic peer may have been removed
+         * from staticPeerEoRReceived_() and/or dynamicPeerEoRReceived_()
+         *
+         * Fallthrough to check if we can declare all EoR received for
+         * expected static and dynamic peers
+         */
+      }
+    }
+  } else {
+    // if we have no static and dynamic peers and GR state was not loaded do
+    // nothing.
+    if (!grStateLoaded_) {
+      return;
+    }
+
+    // it is possible that GR state file exists but is completely empty (no
+    // peers) this can happen if two peers that support GR start restart
+    // procedure at the same time. This happens quite often in emulation. In
+    // this case rib will be notified as soon as this node receives EoR from
+    // any peer.
+  }
+
+  // Check if we received EoR from all expected peers
+  // and notify RIB if not already notified
+  checkAndNotifyAllEoRReceived();
+}
+
+void PeerManager::checkAndNotifyAllEoRReceived() noexcept {
+  if (allPeerEorsReceived_) {
+    // Already observed once; skip O(N) recomputation.
+    return;
+  }
+
+  auto received = [](const auto& kv) { return kv.second.first; };
+  if (!std::all_of(
+          staticPeerEoRReceived_.begin(),
+          staticPeerEoRReceived_.end(),
+          received) ||
+      !std::all_of(
+          dynamicPeerEoRReceived_.begin(),
+          dynamicPeerEoRReceived_.end(),
+          received)) {
+    return;
+  }
+
+  allPeerEorsReceived_ = true;
+
+  // Log BGP++ initializationn event
+  BgpStats::logInitializationEvent(
+      "PeerManager", BgpInitializationEvent::ALL_EOR_RECEIVED);
+
+  // Defer notifyRibInitialPathComputation until NDP signal also arrives.
+  maybeNotifyRibInitialPathComputation();
+}
+
+void PeerManager::handleRibOutNexthopResolutionReceived() noexcept {
+  if (nexthopResolutionReceived_) {
+    // Defensive: RIB only pushes this signal once per daemon lifetime, but
+    // tolerate repeats.
+    return;
+  }
+  nexthopResolutionReceived_ = true;
+  XLOG(
+      INFO,
+      "[Initialization] Received RibOutNexthopResolutionReceived signal "
+      "from RIB; NDP precondition satisfied for initial path computation.");
+  maybeNotifyRibInitialPathComputation();
+}
+
+void PeerManager::maybeNotifyRibInitialPathComputation() noexcept {
+  if (ribInitPathComputationNotified_) {
+    return;
+  }
+  if (!allPeerEorsReceived_ || !nexthopResolutionReceived_) {
+    XLOGF(
+        DBG1,
+        "Deferring notifyRibInitialPathComputation: allPeerEorsReceived={}, "
+        "nexthopResolutionReceived={}",
+        allPeerEorsReceived_,
+        nexthopResolutionReceived_);
+    return;
+  }
+  notifyRibInitialPathComputation(/*timerFired=*/false);
+}
+
+void PeerManager::maybeMarkInitialized() noexcept {
+  if (initialized_) {
+    return;
+  }
+
+  /*
+   * If state machine has not reached to ribInitialAnnouncementStarted_
+   * then not ready to move to initialization state yet
+   * FIB_SYNCED indirectly represented by ribInitialAnnouncementStarted_
+   * must happen first
+   */
+  if (!ribInitialAnnouncementStarted_) {
+    return;
+  }
+
+  if (!checkAllEoRSent()) {
+    // yet confirm the last egressEoR sent. Just return.
+    return;
+  }
+
+  allEgressEoRSent_ = true;
+
+  // Log BGP++ initializationn event
+  BgpStats::logInitializationEvent(
+      "PeerManager", BgpInitializationEvent::INITIALIZED);
+
+  // Reset the initializedSignalTimer for max-cap purpose
+  initializedSignalTimer_.reset();
+
+  // Set convergence time
+  int64_t duration = BgpStats::getInitializationDurationMs();
+  if (!eorTimerExpired_) {
+    BgpStats::setConvergenceTime(duration);
+  }
+
+  /*
+   * Check totalSendPrefixCount
+   * ATTN:
+   *  - `totalSentPrefixCount` is updated inside AdjRib;
+   *  - This is an alerting sign indicating no prefixes is sent after
+   * INITIALIZED;
+   */
+  if (totalSentPrefixCount == 0) {
+    BgpStats::setNoPrefixSent();
+  }
+
+  // Mark initialized_ variable for internal access
+  initialized_ = true;
+  BgpStats::setPeerManagerReachesInitializedTimeout(false);
+
+  XLOGF(
+      INFO,
+      "{}Successfully sent EoR to all peers. Convergence time {}ms{}",
+      facebook::fboss::BGPAlert().str(),
+      duration,
+      eorTimerExpired_ ? " (EoR Timer Expired)" : "");
+}
+
+void PeerManager::processEgressEoR(
+    const nettools::bgplib::BgpPeerId& peerId) noexcept {
+  XLOGF(INFO, "Process EgressEoR towards {}", peerId.str());
+
+  if (allEgressEoRSent_) {
+    XLOGF(
+        DBG2,
+        "[Initialization] EgressEoR already received from {}. Skip.",
+        peerId.str());
+
+    return;
+  }
+
+  if (staticPeerEoRReceived_.size() != 0 ||
+      dynamicPeerEoRReceived_.size() != 0) {
+    // Match static peer's peerAddr or dynamic peer's peerId.
+    // In case there is no match, do nothing.
+    auto staticIt = staticPeerEoRReceived_.find(peerId.peerAddr);
+    if (staticIt != staticPeerEoRReceived_.end()) {
+      // Mark egressEoR(NOT ingressEoR) being sent out
+      staticIt->second.second = true;
+    } else {
+      auto dynamicIt = dynamicPeerEoRReceived_.find(peerId);
+      if (dynamicIt != dynamicPeerEoRReceived_.end()) {
+        dynamicIt->second.second = true;
+      } else {
+        /**
+         * It is possible that static or dynamic peer may have been removed
+         * from staticPeerEoRReceived_() and/or dynamicPeerEoRReceived_()
+         *
+         * Fallthrough to check if EoR for expected static and dynamic peers
+         * have been sent and if so move to initialized_
+         */
+      }
+    }
+  }
+
+  maybeMarkInitialized();
+}
+
+void PeerManager::processTriggerSafeMode() noexcept {
+  XLOG(INFO, "Process TriggerSafeMode message");
+  // write the safemode file
+  try {
+    XLOGF(DBG1, "Writing safemode file {}", FLAGS_safemode_file);
+    folly::writeFileAtomic(FLAGS_safemode_file, "");
+  } catch (const std::exception& ex) {
+    XLOGF(
+        ERR,
+        "Could not create safemode file {}. Exception: {}",
+        FLAGS_safemode_file,
+        folly::exceptionStr(ex));
+  }
+  // Schedule a coro task to re-evaluate AdjRibs
+  asyncScope_.add(co_withExecutor(
+      &evb_, startAdjRibReEvaluationRoutine(RibPauseResumeCause::SAFE_MODE)));
+}
+
+bool PeerManager::checkAllEoRSent() {
+  bool isAllEoRSent = true;
+  for (const auto& [peerAddr, eoR] : staticPeerEoRReceived_) {
+    if (!eoR.first) {
+      // Case 1: skip waiting peer if no ingress EoR received
+      continue;
+    }
+    if (!peerAddrToIds_.contains(peerAddr)) {
+      // Case 2: skip waiting peer where no session established at all
+      continue;
+    }
+    for (const auto& peerId : peerAddrToIds_.at(peerAddr)) {
+      // Case 3: skip waiting peer is session flapped, aka, adjRib down
+      if (adjRibs_.contains(peerId) &&
+          adjRibs_.at(peerId)->isStateEstablished()) {
+        // Only wait for session EoR if adjRib has session established.
+        isAllEoRSent &= eoR.second;
+      }
+    }
+  }
+  for (const auto& [peerId, eoR] : dynamicPeerEoRReceived_) {
+    if (!eoR.first) {
+      // Case 1: skip waiting peer if no ingress EoR received
+      continue;
+    }
+    // Case 2: skip waiting peer where no session established at all
+    // Case 3: skip waiting peer is session flapped, aka, adjRib down
+    if (adjRibs_.contains(peerId) &&
+        adjRibs_.at(peerId)->isStateEstablished()) {
+      // Only wait for session EoR if adjRib has session established.
+      isAllEoRSent &= eoR.second;
+    }
+  }
+  return isAllEoRSent;
+}
+
+/**
+ * @brief  RibDumpReq is successful only when RIB has a confirmed state that
+ *         conveys fib sync is done. This state in RIB is initialEorSent_.
+ *         When RIB has finished enqueuing the last announcement from the
+ *         initial Fib sync, PeerManager will eventually dequeue it and set
+ *         ribInitialAnnouncementDone_ to true.
+ *
+ * @return bool
+ */
+bool PeerManager::isRibInitialAnnouncementStart() {
+  return ribInitialAnnouncementStarted_;
+}
+
+/**
+ * @brief Creates peering parameters for thrift stream subscribers.
+ *
+ * This function constructs a PeeringParams object with default values
+ * suitable for stream-based BGP route subscribers. These subscribers
+ * receive route updates via thrift streaming rather than actual BGP
+ * protocol sessions.
+ *
+ * The peer address is set to localhost (::1)
+ */
+std::pair<folly::IPAddress, std::unique_ptr<PeeringParams>>
+PeerManager::getStreamPeeringParams() {
+  // Use localhost as the peer address for stream subscribers
+  auto peerAddr = folly::IPAddress("::1");
+  auto peeringParams = std::make_unique<PeeringParams>();
+
+  peeringParams->peerAddr = peerAddr;
+
+  /**
+   * The following peering parameters are irrelevant for stream subscribers
+   * since they don't establish actual BGP sessions
+   *
+   * peeringParams->peerPrefix, globalAs, localAs, remoteAs, localBgpId,
+   * peerPort, nexthopV4, nexthopV6
+   */
+
+  /**
+   * The following only parameters are explicitly initialized, since they
+   * are the only relevant ones
+   */
+  peeringParams->isRrClient = RrClientConfigured{true};
+  peeringParams->isAfiIpv4Configured = AfiIpv4Configured{true};
+  peeringParams->isAfiIpv6Configured = AfiIpv6Configured{true};
+  peeringParams->isShutdown = false;
+  peeringParams->advertiseLinkBandwidth = AdvertiseLinkBandwidth::BEST_PATH;
+  peeringParams->addPath = AddPath::SEND; // Enable ADD-PATH for multiple paths
+
+  return std::pair<folly::IPAddress, std::unique_ptr<PeeringParams>>(
+      peerAddr, std::move(peeringParams));
+}
+
+/**
+ * @brief  subscriber state and stats management as result of reset,
+ *         mark adjRib terminated
+ *
+ * @params subscriber  StreamSubscriber handle
+ */
+void PeerManager::resetSubscriberAdjRib(StreamSubscriber& subscriber) {
+  // Sent stop signal to corresponding AdjRib
+  subscriber.peerOutputQ->forcePush(FiberBgpPeer::BgpSessionStop{false});
+
+  auto adjRib = findAdjRib(subscriber.peerId);
+  if (!adjRib) {
+    XLOGF(ERR, "Could not find AdjRib for {}", subscriber.peerId.str());
+    return;
+  }
+
+  XLOGF(INFO, "Terminating {}", subscriber.peerId.str());
+
+  adjRib->markStateTerminated();
+  subscriber.state = TBgpPeerState::IDLE;
+  subscriber.numFlaps += 1;
+  runningSessions_ -= 1;
+  setRunningSessions(runningSessions_);
+  addSessionStateChanges();
+  /*
+   * Make sure to do it after state is set to IDLE
+   * Any outstanding messages for this AdjRibOut are ignored only if
+   * state had transitioned to IDLE
+   */
+  adjRib->deactivateChangeListConsumer();
+
+  return;
+}
+
+/**
+ * @brief  subscriber state and stats management as result of setup,
+ *         mark adjRib established
+ *
+ * @params subscriber  StreamSubscriber handle
+ * @params adjRib      subscriber related adjRib
+ */
+void PeerManager::setSubscriberAdjRib(
+    StreamSubscriber& subscriber,
+    std::shared_ptr<AdjRib>& adjRib) {
+  auto addPathCapa = nettools::bgplib::BgpAddPathSendRec::SEND;
+  /* Egress backpressure is NOT enabled for stream subscribers. */
+  adjRib->enableEgressQueueBackpressure(false);
+  adjRib->sessionEstablished(
+      std::nullopt, /* GR disabled */
+      subscriber.peerOutputQ, /* aka adjRibInQueue */
+      subscriber.peerInputQ, /* aka adjRibOutQueue */
+      subscriber.boundedPeerInputQ, /* aka boundedAdjRibOutQueue */
+      AfiIpv4Negotiated{true}, /* default argument */
+      AfiIpv6Negotiated{true}, /* default argument */
+      V4OverV6Nexthop{true}, /* isV4OverV6NexthopNegotiated */
+      EnhancedRouteRefreshNegotiated{false}, /* Disabled until ERR support is
+                                                added for stream subscriber*/
+      RouteRefreshNegotiated{
+          false}, /* Disabled until RR support is added for stream subscriber */
+      addPathCapa);
+  adjRib->markStateEstablished();
+  runningSessions_ += 1;
+  setRunningSessions(runningSessions_);
+  addSessionStateChanges();
+  adjRib->startMessageProcessingLoop();
+  subscriber.publisherId++;
+
+  return;
+}
+
+/**
+ * @brief  This is a lambda function executed when invoked as a
+ *         result when subscriber channel is going away
+ *
+ * @params peerId  bgp formed local identifier for subscriber session
+ * @params subscriberName  string name of a subscriber
+ * @params publisherId     unique id assigned when subscriber was created
+ */
+void PeerManager::cancelSubscriberStream(
+    nettools::bgplib::BgpPeerId peerId,
+    const std::string& subscriberName,
+    uint32_t publisherId) {
+  auto adjRib = findAdjRib(peerId);
+  if (!adjRib) {
+    XLOGF(ERR, "Could not find AdjRib for {}", peerId.str());
+    return;
+  }
+  if (!streamSubscribers_.contains(subscriberName)) {
+    XLOGF(ERR, "Could not find subscriber info for {}", subscriberName);
+    return;
+  }
+  auto& subscriber = streamSubscribers_.at(subscriberName);
+  if (subscriber.state != TBgpPeerState::ESTABLISHED) {
+    XLOGF(INFO, "subscriber {} is not in ESTABLISHED state", subscriberName);
+    return;
+  }
+
+  if (publisherId < subscriber.publisherId) {
+    XLOGF(
+        INFO,
+        "subscriber {} established with newer publisher, ignore this lamda call",
+        subscriberName);
+    return;
+  }
+
+  resetSubscriberAdjRib(subscriber);
+}
+
+/**
+ * Number of established subscriber sessions.
+ *
+ * @return Number of established subscriber sessions.
+ */
+uint32_t PeerManager::numStreamSubscribers(void) {
+  uint32_t establishedSessions = 0;
+  for (const auto& [subscriberName, subscriber] : streamSubscribers_) {
+    if (subscriber.state == TBgpPeerState::ESTABLISHED) {
+      establishedSessions++;
+    }
+  }
+  return establishedSessions;
+}
+
+/**
+ * Checks if the number of established stream peers exceeds the stream
+ * susbscriber limit.
+ *
+ * @return true if the number of established stream peers exceeds the stream
+ * subscriber limit, false otherwise.
+ */
+bool PeerManager::exceedsStreamSubscriberLimit() {
+  auto globalConfig = configManager_->getConfig()->getBgpGlobalConfig();
+
+  // If subscriber limit is not set, treat limit as infinite.
+  if (!globalConfig->streamSubscriberLimit.has_value()) {
+    return false;
+  }
+  return numStreamSubscribers() >= globalConfig->streamSubscriberLimit;
+}
+
+apache::thrift::ServerStream<TBgpRouteDelta> PeerManager::subscribe(
+    const std::unique_ptr<std::string>& subscriberName_p) {
+  std::unique_ptr<apache::thrift::ServerStream<TBgpRouteDelta>> result_stream{
+      nullptr};
+  bool failed_already = false;
+  std::string exception_msg("Undefined exception");
+  auto subscriberName = *subscriberName_p;
+
+  XLOGF(INFO, "Received stream subscribe request from {}", subscriberName);
+  if (!streamPeeringParams_) {
+    exception_msg =
+        "Subscription failed: stream peering params not initialized";
+    failed_already = true;
+  } else if (exceedsStreamSubscriberLimit()) {
+    XLOGF(
+        INFO,
+        "Max stream subscribers reached: Rejecting connection from {}",
+        subscriberName);
+    exception_msg = "Subscription failed: Max stream subscribers reached";
+    failed_already = true;
+    BgpStats::incStreamingSessionsRejected();
+  } else {
+    if (streamSubscribers_.contains(subscriberName)) {
+      auto& subscriber = streamSubscribers_.at(subscriberName);
+      if (subscriber.state != TBgpPeerState::IDLE) {
+        XLOGF(
+            INFO,
+            "subscription already exists in non IDLE state for peer {}",
+            subscriber.peerId.peerAddr.str());
+        if (subscriber.peerId.peerAddr != streamPeerAddr_) {
+          XLOGF(
+              INFO,
+              "duplicate subscription request for {}",
+              streamPeerAddr_.str());
+          exception_msg =
+              "Subscription failed: duplicate subscription attempted";
+          failed_already = true;
+        } else {
+          /**
+           * Must run in blocking mode. The baton in the code below
+           * confirms only execution of BgpSessionStop message. It
+           * does not confirm resetSubscriberAdjRib() is fully
+           * executed, and hence blocking call to complete the call
+           */
+          evb_.runInEventBaseThreadAndWait(
+              [&]() { resetSubscriberAdjRib(subscriber); });
+          std::move(*subscriber.publisher.get()).complete();
+        }
+      }
+    }
+  }
+
+  if (failed_already) {
+    XLOGF(ERR, "{}", exception_msg);
+    throw TBgpServiceException(exception_msg);
+  }
+
+  if (!streamSubscribers_.contains(subscriberName)) {
+    uint32_t remoteBgpId = ++lastStreamPeerId_;
+    const BgpPeerId peerId{streamPeerAddr_, remoteBgpId};
+    XLOGF(
+        INFO,
+        "Assign peerId {} to subscriber {}",
+        peerId.str(),
+        subscriberName);
+    StreamSubscriber subscriber(peerId);
+    streamSubscribers_.emplace(subscriberName, std::move(subscriber));
+  }
+
+  auto& subscriber = streamSubscribers_.at(subscriberName);
+  auto peerId = subscriber.peerId;
+  auto publisherId = subscriber.publisherId + 1;
+
+  /**
+   * If there already is an existing adjRib that means 2 possibilities
+   * 1) Either previous channel has already been closed by registered
+   *    lambda call-back
+   * 2) Or in this call, we found adjrib non-idle and forcefully
+   *    completed channel in earlier blocking
+   *
+   * In both the cases, baton has been posted and thus for the case
+   * of existing adjrib, we can wait here for the baton.
+   *
+   * The baton has latch semantics: it stays posted between post() and
+   * reset(), so multiple waiters pass through without consuming the signal.
+   * The baton is reset only when we commit to starting new message loops.
+   *
+   * NOTE: Waiting for baton inside runInEventBaseThreadAndWait() can
+   *       freeze evb_ from running any other peer-manager events.
+   *       This has occured before, and thus an important note for
+   *       the future reader
+   */
+  std::shared_ptr<AdjRib> adjRib = nullptr;
+  evb_.runInEventBaseThreadAndWait([&]() { adjRib = findAdjRib(peerId); });
+
+  if (adjRib) {
+    auto terminateBaton = sessionTerminateBatons_[peerId];
+    XLOGF(INFO, "Pre-baton wait for {}", peerId.str());
+    auto startTime = std::chrono::steady_clock::now();
+    // Baton has latch semantics: if already posted, passes through
+    // immediately.
+    folly::coro::blockingWait([&]() -> folly::coro::Task<void> {
+      co_await *terminateBaton;
+      co_await adjRib->ensureAsyncScopeInitialized();
+    }());
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startTime);
+    XLOGF(INFO, "Post-baton wait for {}", peerId.str());
+    XLOGF(
+        INFO,
+        "Peer Manager blocked waiting for baton for {}",
+        duration.count());
+  }
+
+  auto streamAndPublisher =
+      apache::thrift::ServerStream<TBgpRouteDelta>::createPublisher(
+          [this, peerId, subscriberName, publisherId]() {
+            // This lamdba is called when channel is closed on client side
+            evb_.runInEventBaseThreadAndWait(
+                [this, peerId, subscriberName, publisherId]() {
+                  cancelSubscriberStream(peerId, subscriberName, publisherId);
+                  XLOGF(
+                      INFO,
+                      "Channel for subscriber {} has been closed",
+                      peerId.str());
+                });
+          });
+
+  /**
+   * It is necessary to run this block of the code to the completion
+   * before returning from this function call. And since it has to
+   * be run in the context of peer-manager thread, use of evb_ and
+   * blocking call.
+   */
+  evb_.runInEventBaseThreadAndWait([&]() {
+    if (!adjRib) {
+      auto peeringParams = *streamPeeringParams_;
+      peeringParams.description = subscriberName;
+      adjRib = createAdjRib(peerId, peeringParams);
+      auto changeListConsumer = std::make_shared<AdjRibOutConsumer>(
+          changeListTracker_,
+          adjRib,
+          "ChangeList Consumer",
+          evb_,
+          addPathConsumerBitmap_,
+          nonAddPathConsumerBitmap_);
+      adjRib->setChangeListConsumer(changeListConsumer);
+    }
+
+    if (!isRibInitialAnnouncementStart()) {
+      adjRib->setInInitialAnnouncement();
+    } else {
+      adjRib->resetInInitialAnnouncement();
+    }
+
+    subscriber.publisher =
+        std::make_unique<apache::thrift::ServerStreamPublisher<
+            neteng::fboss::bgp::thrift::TBgpRouteDelta>>(
+            std::move(streamAndPublisher.second));
+    subscriber.state = TBgpPeerState::ESTABLISHED;
+    subscriber.upSince = std::chrono::steady_clock::now();
+
+    if (!adjRib->inInitialAnnouncement()) {
+      // Request RIB for full dump
+      asyncScope_.add(co_withExecutor(
+          &evb_,
+          processRibDumpReqCoro(RibDumpReq(peerId, true /* sendAddPath */))));
+    }
+
+    setSubscriberAdjRib(subscriber, adjRib);
+
+    result_stream =
+        std::make_unique<apache::thrift::ServerStream<TBgpRouteDelta>>(
+            std::move(streamAndPublisher.first));
+    XLOGF(INFO, "Start publishing to peer {}", peerId.str());
+  });
+
+  if (!result_stream) {
+    XLOGF(ERR, "{}", exception_msg);
+    throw TBgpServiceException(exception_msg);
+  }
+  // Return the stream
+  return std::move(*result_stream);
+}
+
+/**
+ * @brief  Build a Group Name as a key for a specific peer
+ *
+ * @params peerId peer for which to build groupName key
+ * @params peeringParams peering parameters for passed in peer
+ *
+ * @return std::string
+ */
+std::string PeerManager::buildAdjRibOutGroupName(
+    const nettools::bgplib::BgpPeerId& peerId,
+    const PeeringParams& peeringParams) noexcept {
+  if (peeringParams.peerGroupName.has_value()) {
+    return *peeringParams.peerGroupName;
+  }
+
+  return peerId.peerAddr.str();
+}
+
+/**
+ * @brief  Find AdjRibOutGroup given a group name
+ *
+ * @params groupName  Name of the group to be looked up
+ *
+ * @return std::shared_ptr<AdjRibOutGroup>
+ */
+std::shared_ptr<AdjRibOutGroup> PeerManager::findAdjRibOutGroup(
+    const std::string& groupName) noexcept {
+  auto match = adjRibOutGroups_.find(groupName);
+  if (match == adjRibOutGroups_.cend()) {
+    return nullptr;
+  }
+
+  return match->second;
+}
+
+/**
+ * @brief  Create AdjRibOutGroup given a group name
+ *
+ * @params groupName  Name of the group to be created
+ *
+ * @return std::shared_ptr<AdjRibOutGroup>
+ */
+std::shared_ptr<AdjRibOutGroup> PeerManager::createAdjRibOutGroup(
+    const std::string& groupName) noexcept {
+  std::shared_ptr<AdjRibOutGroup> adjRibOutGroup;
+
+  XLOGF(INFO, "Create Adjacency Out Group: {}", groupName);
+  adjRibOutGroup = std::make_shared<AdjRibOutGroup>(evb_, groupName);
+  adjRibOutGroups_.emplace(groupName, adjRibOutGroup);
+  BgpStats::incrAdjRibOutGroupsCount();
+  return adjRibOutGroup;
+}
+
+std::shared_ptr<AdjRib> PeerManager::createAdjRib(
+    const BgpPeerId& peerId,
+    const PeeringParams& peeringParams) noexcept {
+  std::shared_ptr<AdjRib> adjRib;
+  auto sessionTerminateBaton = std::make_shared<folly::coro::Baton>();
+  sessionTerminateBatons_.insert_or_assign(peerId, sessionTerminateBaton);
+
+  const auto& peerAddr = peerId.peerAddr;
+
+  auto peerConfig = configManager_->getConfig()->getConfigOfAPeer(peerAddr);
+
+  auto outGroupName = buildAdjRibOutGroupName(peerId, peeringParams);
+  auto adjRibOutGroup = findAdjRibOutGroup(outGroupName);
+  if (!adjRibOutGroup) {
+    adjRibOutGroup = createAdjRibOutGroup(outGroupName);
+  }
+
+  adjRib = std::make_shared<AdjRib>(
+      peerId,
+      peeringParams,
+      evb_,
+      ribInQ_, /* write to ribInQ */
+      fromAdjRibQ_, /* write to fromAdjRibQ */
+      sessionTerminateBaton,
+      policyManager_,
+      isSafeModeOn_,
+      peerConfig ? peerConfig->ingressPolicyName : std::nullopt,
+      peerConfig ? peerConfig->egressPolicyName : std::nullopt,
+      adjRibOutGroup,
+      peerConfig ? peerConfig->outDelay : std::nullopt,
+      configManager_);
+
+  monitorModule(peerId.toOdsKey(), *adjRib);
+
+  if (adjRibs_.emplace(peerId, adjRib).second) {
+    RibStats::incrAdjRibCount();
+  }
+  return adjRib;
+}
+
+std::shared_ptr<AdjRib> PeerManager::findAdjRib(
+    const BgpPeerId& peerId) noexcept {
+  auto match = adjRibs_.find(peerId);
+  if (match == adjRibs_.cend()) {
+    return nullptr;
+  } else {
+    return match->second;
+  }
+}
+
+/**
+ * @brief Determine if this is a dynamic peer.
+ *
+ * @param peerAddr The IP address of the peer.
+ *
+ * @return True if the peer is dynamic, false otherwise.
+ */
+bool PeerManager::isPeerDynamic(const folly::IPAddress& peerAddr) {
+  auto dynamicPeerToConfigs =
+      configManager_->getConfig()->getDynamicPeerToConfig();
+
+  for (const auto& [peerPrefix, peerConfigPtr] : dynamicPeerToConfigs) {
+    if (peerAddr.inSubnet(peerPrefix.first, peerPrefix.second)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+folly::coro::Task<void> PeerManager::updatePeerCounters() {
+  auto sessions = co_await sessionMgr_->co_getAllEstablishedPeerDisplayInfo();
+  uint32_t establishedNoRoutePeers = 0;
+
+  for (const auto& sessionInfo : sessions) {
+    const auto& peerAddr = sessionInfo.peeringParams.peerAddr;
+    BgpPeerId bgpPeerId{peerAddr, sessionInfo.remoteBgpId};
+    auto it = adjRibs_.find(bgpPeerId);
+    if (it != adjRibs_.end()) {
+      const auto stats = it->second->getStats();
+      if (stats.getPreInPrefixCount() + stats.getPostOutPrefixCount() > 0) {
+        continue;
+      }
+      // VIP injector sessions can be in established state without any
+      // routes.
+      if (isPeerDynamic(peerAddr)) {
+        continue;
+      }
+    }
+    // Did not find any advertised prefixes for this peer
+    XLOGF(
+        WARN, "{} is established but no routes are exchanged", peerAddr.str());
+    establishedNoRoutePeers++;
+  }
+  PeerStats::setTotalPeerWithNoRouteExchange(establishedNoRoutePeers);
+}
+
+void PeerManager::setSessionManager(
+    std::shared_ptr<SessionManager> sessionManager) {
+  if (sessionManager != nullptr) {
+    if (sessionMgr_) {
+      stopMonitoring(kModuleSessionManager);
+    }
+
+    sessionMgr_ = std::move(sessionManager);
+
+    // Start monitoring of FiberBgpPeerManager
+    // TODO: move this to Main.cpp once FiberBgpPeerManager is running
+    // separately
+    monitorModule(kModuleSessionManager, *sessionMgr_);
+  }
+}
+
+void PeerManager::updateEntryStats(TEntryStats& stats) const noexcept {
+  stats.total_adj_ribs() = adjRibs_.size();
+  stats.total_shadow_rib_entries() = shadowRibEntries_.size();
+}
+
+void PeerManager::saveGrState() noexcept {
+  std::ofstream grFile;
+
+  if (!configManager_->getConfig()->getBgpGlobalConfig()->supportStatefulGr) {
+    XLOG(INFO, "Stateful GR disabled");
+    return;
+  }
+
+  // We will save only once. We need to save before sessions are brought
+  // down, For SIGTERM (bgp updation) this method will be called only once.
+  // For call to restartSessionsAndExit (agent updation) this method will be
+  // called twice, once before sessions go down and once after SIGTERM is
+  // raised. Ignoring the 2nd call.
+  if (grStateSaved_) {
+    XLOG(INFO, "GR state file was already saved");
+    return;
+  }
+  grStateSaved_ = true;
+  // If we have not yet notified RIB about EOR and we are trying to
+  // terminate, there is no need to store GR state information.
+  if (!ribInitPathComputationNotified_) {
+    XLOG(
+        INFO,
+        "Daemon restarting before reaching stable state. Not saving GR state");
+    return;
+  }
+
+  grFile.open(FLAGS_gr_state_file, std::ios::out | std::ios::trunc);
+  if (!grFile.is_open()) {
+    XLOG(ERR, "Could not open GR state file for writing");
+    return;
+  }
+
+  const auto nowInSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+
+  // Start with epoch time
+  grFile << nowInSec << "\n";
+
+  // All the established GR peers
+  for (const auto& peerId : establishedGrPeers_) {
+    grFile << peerId.peerAddr.str() << " " << peerId.remoteBgpId << "\n";
+  }
+
+  // Sign termination (signature) to indicate properly terminated.
+  grFile << kGrStateFileTermination;
+  grFile.close();
+  XLOGF(INFO, "Saved GR state to {}", FLAGS_gr_state_file);
+}
+
+void PeerManager::logEoRPeers(const bool isIngressEoR) noexcept {
+  if (isIngressEoR) { // Case 1
+    // Log static peer addresses of the pending ingress EoR
+    std::vector<std::string> staticEorNotRcvdFrom;
+    for (const auto& [peerId, eoRRcvd] : staticPeerEoRReceived_) {
+      if (!eoRRcvd.first) {
+        staticEorNotRcvdFrom.emplace_back(peerId.str());
+      }
+    }
+    XLOGF_IF(
+        INFO,
+        staticEorNotRcvdFrom.size(),
+        "Still awaits receiving the EoR markers from {} static peers: [{}]",
+        staticEorNotRcvdFrom.size(),
+        folly::join(", ", staticEorNotRcvdFrom));
+
+    // Log dynamic peer addresses of the pending ingress EoR
+    std::vector<std::string> dynamicEorNotRcvdFrom;
+    for (const auto& [peerId, eoRRcvd] : dynamicPeerEoRReceived_) {
+      if (!eoRRcvd.first) {
+        dynamicEorNotRcvdFrom.emplace_back(peerId.str());
+      }
+    }
+    XLOGF_IF(
+        INFO,
+        dynamicEorNotRcvdFrom.size(),
+        "Still awaits receiving the EoR marker from {} dynamic peers: [{}]",
+        dynamicEorNotRcvdFrom.size(),
+        folly::join(", ", dynamicEorNotRcvdFrom));
+
+  } else { // Case 2
+    // Log the static peer addresses of the pending egress EoR.
+    std::vector<std::string> staticEorNotSentBackTo;
+    for (const auto& [peerId, eoRRcvd] : staticPeerEoRReceived_) {
+      if (!eoRRcvd.second) {
+        staticEorNotSentBackTo.emplace_back(peerId.str());
+      }
+    }
+    XLOGF_IF(
+        INFO,
+        staticEorNotSentBackTo.size(),
+        "Still awaits sending EoR marker back to {} static peers: [{}]",
+        staticEorNotSentBackTo.size(),
+        folly::join(", ", staticEorNotSentBackTo));
+    // Log the dynamic peer addresses of the pending egress EoR.
+    std::vector<std::string> dynamicEorNotSentBackTo;
+    for (const auto& [peerId, eoRRcvd] : dynamicPeerEoRReceived_) {
+      if (!eoRRcvd.second) {
+        dynamicEorNotSentBackTo.emplace_back(peerId.str());
+      }
+    }
+    XLOGF_IF(
+        INFO,
+        dynamicEorNotSentBackTo.size(),
+        "Still awaits sending EoR marker back to {} dynamic peers: [{}]",
+        dynamicEorNotSentBackTo.size(),
+        folly::join(", ", dynamicEorNotSentBackTo));
+  }
+}
+
+GrLoadResult PeerManager::readGrState() const noexcept {
+  std::string line;
+  std::vector<std::string> lines;
+  std::ifstream grFile;
+
+  if (!configManager_->getConfig()->getBgpGlobalConfig()->supportStatefulGr) {
+    XLOG(INFO, "Stateful GR disabled");
+    return GrLoadResult::NotLoaded();
+  }
+
+  grFile.open(FLAGS_gr_state_file);
+  if (!grFile.is_open()) {
+    XLOGF(
+        INFO,
+        "Could not open GR state file {} for reading",
+        FLAGS_gr_state_file);
+    return GrLoadResult::NotLoaded();
+  }
+
+  const auto nowInSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+
+  while (getline(grFile, line)) {
+    lines.emplace_back(line);
+  }
+  grFile.close();
+  std::remove(FLAGS_gr_state_file.c_str());
+
+  if (lines.size() < 2) {
+    XLOGF(ERR, "Invalid lines size {}", lines.size());
+    return GrLoadResult::NotLoaded();
+  }
+
+  if (lines.back() != kGrStateFileTermination) {
+    XLOGF(ERR, "Invalid last line: {}", lines.back());
+    return GrLoadResult::NotLoaded();
+  }
+
+  auto storeTimeInSec = std::stol(lines[0], nullptr, 10);
+  if ((nowInSec < storeTimeInSec) ||
+      ((nowInSec - storeTimeInSec) > FLAGS_validity_time_stateful_gr_s)) {
+    XLOG(INFO, "Stale GR state file for reading");
+    return GrLoadResult::NotLoaded();
+  }
+
+  auto establishedPeers = std::make_unique<std::unordered_set<BgpPeerId>>();
+
+  // Remove header time stamp and tail signature
+  lines.pop_back();
+  lines.erase(lines.begin());
+
+  if (lines.size() == 0) {
+    XLOG(WARN, "GR state file contains no peers");
+  }
+
+  for (const auto& peerAddrStr : lines) {
+    std::vector<std::string> peerElems;
+    folly::split(' ', peerAddrStr, peerElems);
+
+    if (peerElems.size() != 2) {
+      // We can not trust this file
+      XLOG(ERR, "GR state file has invalid peerId details");
+      return GrLoadResult::NotLoaded();
+    }
+
+    if (!folly::IPAddress::validate(peerElems[0])) {
+      // We can not trust this file
+      XLOGF(ERR, "GR state file has invalid IP address {}", peerElems[0]);
+      return GrLoadResult::NotLoaded();
+    }
+
+    try {
+      establishedPeers->insert(BgpPeerId(
+          folly::IPAddress(peerElems[0]),
+          boost::lexical_cast<uint32_t>(peerElems[1])));
+      XLOGF(
+          INFO,
+          "Added peer with addr {} and bgpId {} to list of established peers.",
+          peerElems[0],
+          peerElems[1]);
+    } catch (const boost::bad_lexical_cast& e) {
+      XLOGF(
+          ERR,
+          "GR state file has invalid remoteBgpId for peer addr {} and bgpId {} Error {}",
+          peerElems[0],
+          peerElems[1],
+          e.what());
+    }
+  }
+
+  XLOG(INFO, "GR state read successfully");
+  return GrLoadResult{
+      .loaded = true,
+      .peers = std::move(establishedPeers),
+  };
+}
+
+void PeerManager::setRouteFilterPolicy(
+    std::unique_ptr<RouteFilterPolicy> policy) noexcept {
+  evb_.runInEventBaseThread([policy = std::move(policy), this]() mutable {
+    if (routeFilterPolicy_ && policy &&
+        routeFilterPolicy_->getVersion() >= policy->getVersion()) {
+      XLOGF(
+          WARNING,
+          "Route filter policy update ignored: version {} <= {}",
+          policy->getVersion(),
+          routeFilterPolicy_->getVersion());
+      return;
+    }
+    // Determine scope before overwriting: use the new policy if setting,
+    // or the old policy if clearing, so the scope matches the operation.
+    // When both are null, defaults to PEER_GROUP, but this is a no-op
+    // since no AdjRibs would be affected.
+    auto& scopePolicy = policy ? policy : routeFilterPolicy_;
+    auto scope = (scopePolicy && !scopePolicy->matchAgainstPeerGroupName())
+        ? PolicyChangeScope::PEER
+        : PolicyChangeScope::PEER_GROUP;
+
+    routeFilterPolicy_ = std::move(policy);
+
+    // Mark affected adjRibs and count changes
+    size_t ingressAffectedCount = 0;
+    size_t egressAffectedCount = 0;
+
+    for (auto& [peerId, adjRib] : adjRibs_) {
+      auto [ingressChanged, egressChanged] = setRouteFilterStatement(adjRib);
+
+      /**
+       * Mark adjRib as pending policy update if new policy changed in the
+       * ingress or egress.
+       *
+       * These flags will be cleared after policy re-evaluation:
+       * - Ingress flag: cleared in processAdjRibReEvaluationTask() after
+       *  calling adjRib->processAdjRibReEvaluation()
+       * - Egress flag: cleared in processRibDumpReqForEgressPolicyUpdate()
+       *  after processRibDumpReq() completes
+       *
+       */
+
+      adjRib->setPendingIngressPolicyUpdate(ingressChanged);
+      adjRib->setPendingEgressPolicyUpdate(egressChanged);
+
+      // Collect stats for number of adjRibs affected by the policy change
+      if (adjRib->isPendingIngressPolicyUpdate()) {
+        ingressAffectedCount++;
+      }
+      if (adjRib->isPendingEgressPolicyUpdate()) {
+        egressAffectedCount++;
+      }
+      setGoldenPrefixPolicy(adjRib);
+    }
+
+    // Record stats for number of peers affected by the route filter policy
+    // change
+    BgpStats::setIngressRouteFilterPolicyAffectedPeers(ingressAffectedCount);
+    BgpStats::setEgressRouteFilterPolicyAffectedPeers(egressAffectedCount);
+
+    // Only call processIngressAndEgressRouteFilterUpdate if any adjRib's
+    // route filter policy updated
+    if (ingressAffectedCount == 0 && egressAffectedCount == 0) {
+      XLOG(INFO, "Route filter policy update: no adjRibs affected");
+      return;
+    }
+
+    XLOGF(
+        INFO,
+        "Route filter policy update for : {} ingress, {} egress adjRibs",
+        ingressAffectedCount,
+        egressAffectedCount);
+
+    asyncScope_.add(co_withExecutor(
+        &evb_,
+        processIngressAndEgressRouteFilterUpdate(
+            ingressAffectedCount, egressAffectedCount, scope)));
+  });
+}
+
+void PeerManager::clearIngressEgressRouteFiltersPolicy() noexcept {
+  evb_.runInEventBaseThread([this]() mutable {
+    std::vector<BgpPeerId> affectedAdjRibs;
+    affectedAdjRibs.reserve(adjRibs_.size());
+    for (auto& [peerId, adjRib] : adjRibs_) {
+      adjRib->setRouteFilterStatement(nullptr);
+      affectedAdjRibs.emplace_back(peerId);
+    }
+    // send RibDumpReq for affectedAdjRibs
+    for (const auto& peerId : affectedAdjRibs) {
+      const auto& adjRib = adjRibs_[peerId];
+      if (!adjRib->inInitialAnnouncement()) {
+        asyncScope_.add(co_withExecutor(
+            &evb_,
+            processRibDumpReqCoro(RibDumpReq(peerId, adjRib->sendAddPath()))));
+      }
+    }
+  });
+}
+
+void PeerManager::clearGoldenPrefixesPolicy() noexcept {
+  goldenPrefixesPolicyActive_ = false;
+  evb_.runInEventBaseThread([this]() mutable {
+    std::vector<BgpPeerId> affectedAdjRibs;
+    for (auto& [peerId, adjRib] : adjRibs_) {
+      adjRib->setGoldenPrefixPolicy(nullptr);
+    }
+    // If safe mode is on, because safe mode removes adjrib entries, there
+    // is no need to send RibDumpReq for affectedAdjRibs. If safe mode is
+    // off, Golden Prefixes policy isn't applied, also needn't send
+    // RibDumpReq
+  });
+}
+
+void PeerManager::updateIngressEgressPolicyNames(
+    std::unique_ptr<PeerToPolicyMap> peerToPolicyNames,
+    PolicyChangeScope scope) noexcept {
+  evb_.runInEventBaseThread([peerToPolicyNames = std::move(peerToPolicyNames),
+                             scope,
+                             this]() mutable {
+    // Query current config version when executing (not when posting)
+    auto currentVersion = configManager_->getConfigVersion();
+
+    // Skip stale updates - if version hasn't changed since last applied,
+    // another update with newer config has already been processed
+    if (currentVersion <= lastAppliedPolicyVersion_) {
+      XLOGF(
+          INFO,
+          "Skipping stale policy update: config version {} <= last applied {}",
+          currentVersion,
+          lastAppliedPolicyVersion_);
+      return;
+    }
+
+    // Mark affected adjRibs and count changes
+    size_t ingressAffectedCount = 0;
+    size_t egressAffectedCount = 0;
+
+    for (auto& [peerId, adjRib] : adjRibs_) {
+      auto [ingressChanged, egressChanged] =
+          updateIngressEgressPolicyNamesForAdjRib(adjRib, *peerToPolicyNames);
+
+      // Set pending ingress and egress policy update flags if
+      // ingressChanged or egressChanged
+      adjRib->setPendingIngressPolicyUpdate(ingressChanged);
+      adjRib->setPendingEgressPolicyUpdate(egressChanged);
+
+      // Collect stats for number of adjRibs affected by the policy change
+      if (adjRib->isPendingIngressPolicyUpdate()) {
+        ingressAffectedCount++;
+      }
+      if (adjRib->isPendingEgressPolicyUpdate()) {
+        egressAffectedCount++;
+      }
+    }
+
+    // Record this version as applied
+    lastAppliedPolicyVersion_ = currentVersion;
+
+    // Record stats for number of peers affected by the policy change
+    BgpStats::setIngressRoutingPolicyAffectedPeers(ingressAffectedCount);
+    BgpStats::setEgressRoutingPolicyAffectedPeers(egressAffectedCount);
+
+    // Only call processIngressAndEgressRouteFilterUpdate if any adjRib's
+    // route filter policy updated
+    if (ingressAffectedCount == 0 && egressAffectedCount == 0) {
+      XLOG(INFO, "Routing policy update: no adjRibs affected");
+      return;
+    }
+
+    XLOGF(
+        INFO,
+        "Routing policy update for : {} ingress, {} egress adjRibs",
+        ingressAffectedCount,
+        egressAffectedCount);
+
+    asyncScope_.add(co_withExecutor(
+        &evb_,
+        processIngressAndEgressRouteFilterUpdate(
+            ingressAffectedCount, egressAffectedCount, scope)));
+  });
+}
+
+std::tuple<bool, bool> PeerManager::updateIngressEgressPolicyNamesForAdjRib(
+    std::shared_ptr<AdjRib> adjRib,
+    const PeerToPolicyMap& peerToPolicyNames) noexcept {
+  const auto& peeringParams = adjRib->getPeeringParams();
+  const auto& peerAddrStr = peeringParams.peerAddr.str();
+
+  XLOGF(
+      DBG1,
+      "Processing policy update for peer {} (peerGroup: {})",
+      peerAddrStr,
+      peeringParams.peerGroupName.value_or("(none)"));
+
+  auto policyIt = peerToPolicyNames.find(peerAddrStr);
+  if (policyIt == peerToPolicyNames.end()) {
+    XLOGF(DBG3, "No policy update found for peer {}, skipping", peerAddrStr);
+    return {false, false};
+  }
+
+  return adjRib->updateIngressEgressPolicyNames(policyIt->second);
+}
+
+std::tuple<bool, bool> PeerManager::setRouteFilterStatement(
+    std::shared_ptr<AdjRib> adjRib) noexcept {
+  if (!adjRib) {
+    return std::make_tuple(false, false);
+  }
+  if (!routeFilterPolicy_) {
+    return adjRib->setRouteFilterStatement(nullptr);
+  }
+  for (const auto& [stmtName, stmt] : routeFilterPolicy_->getStatements()) {
+    bool isMatch = false;
+
+    // Check if key_type is PEER_GROUP_NAME, match against peer group name
+    if (routeFilterPolicy_->matchAgainstPeerGroupName()) {
+      const auto& peeringParams = adjRib->getPeeringParams();
+      if (peeringParams.peerGroupName.has_value() &&
+          stmtName == *peeringParams.peerGroupName) {
+        XLOGF(
+            DBG2,
+            "RouteFilterPolicy: Matched peer group {} for peer {}",
+            stmtName,
+            adjRib->getPeeringParams().peerAddr.str());
+        isMatch = true;
+      }
+    } else {
+      // If key_type is not present or is DEVICE_REGEX, use existing regex
+      // match
+      re2::RE2 peerRegex(stmtName);
+      if (re2::RE2::FullMatch(
+              adjRib->getPeeringParams().description, peerRegex)) {
+        XLOGF(
+            DBG2,
+            "RouteFilterPolicy: Matched peer regex {} for peer {}",
+            stmtName,
+            adjRib->getPeeringParams().description);
+        isMatch = true;
+      }
+    }
+
+    if (isMatch) {
+      auto globalConfig = configManager_->getConfig()->getBgpGlobalConfig();
+      if (globalConfig->deviceName) {
+        auto logger = std::make_unique<RouteFilterLogger>(
+            *(globalConfig->deviceName),
+            stmtName,
+            adjRib->getPeeringParams().description,
+            scubaLogger_);
+        return adjRib->setRouteFilterStatement(stmt, std::move(logger));
+      }
+      return adjRib->setRouteFilterStatement(stmt);
+    }
+  }
+  return adjRib->setRouteFilterStatement(nullptr);
+}
+
+bool PeerManager::setGoldenPrefixPolicy(
+    std::shared_ptr<AdjRib> adjRib,
+    bool initializeAdjRib) noexcept {
+  if (!adjRib) {
+    return false;
+  }
+  // Don't update golden prefix policy if safe mode is on, unless this is a
+  // newly initialized AdjRib that doesn't have a policy yet.
+  if (adjRib->isSafeModeOn() && !initializeAdjRib) {
+    return false;
+  }
+  if (routeFilterPolicy_) {
+    auto goldenPolicy = routeFilterPolicy_->getGoldenPrefixPolicy();
+    goldenPrefixesPolicyActive_ = goldenPolicy && switchLimitConfig_ &&
+        switchLimitConfig_->overload_protection_mode() ==
+            thrift::OverloadProtectionMode::APPLY_GOLDEN_PREFIX_POLICY;
+    return adjRib->setGoldenPrefixPolicy(std::move(goldenPolicy));
+  }
+  goldenPrefixesPolicyActive_ = false;
+  return adjRib->setGoldenPrefixPolicy(nullptr);
+}
+
+bool PeerManager::getIsInitialized() const {
+  return initialized_;
+}
+
+bool PeerManager::getIsSafeModeOn() const {
+  return *isSafeModeOn_;
+}
+
+bool PeerManager::getIsGoldenPrefixPolicyActive() const {
+  return goldenPrefixesPolicyActive_;
+}
+
+void PeerManager::removeSafeModeFile() {
+  try {
+    if (boost::filesystem::exists(FLAGS_safemode_file)) {
+      boost::filesystem::remove(FLAGS_safemode_file);
+      XLOGF(INFO, "Previous safe mode file {} removed", FLAGS_safemode_file);
+    }
+  } catch (const std::exception& ex) {
+    XLOGF(
+        ERR,
+        "Could not remove safe mode file {}. Exception: {}",
+        FLAGS_safemode_file,
+        folly::exceptionStr(ex));
+  }
+  return;
+}
+
+folly::coro::Task<void> PeerManager::startAdjRibReEvaluationRoutine(
+    RibPauseResumeCause cause) {
+  ScopedProfile profile("PeerManager::startAdjRibReEvaluationRoutine");
+  XLOGF(
+      INFO,
+      "Starting AdjRib Re-evaluation for {}",
+      magic_enum::enum_name(cause));
+
+  /**
+   * Instructs the RIB to pause best-path selection and FIB programming
+   * during route re-evaluation operations. This optimization prevents
+   * expensive repeated computations and reduces FIB churn.
+   */
+  co_await ribInQ_.push(PauseBestPathAndFibProgramming(cause));
+
+  bool policyUpdate =
+      (cause == RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE ||
+       cause == RibPauseResumeCause::ROUTING_POLICY_UPDATE);
+
+  for (const auto& [peerId, adjRib] : adjRibs_) {
+    if (!adjRib) {
+      continue;
+    }
+
+    // For policy updates, skip adjRibs without pending
+    // updates
+    if (policyUpdate && !adjRib->isPendingIngressPolicyUpdate()) {
+      continue;
+    }
+
+    const auto adjRibStart = std::chrono::steady_clock::now();
+    // Process each AdjRib re-evaluation with policy application
+    co_await processAdjRibReEvaluationTask(adjRib, cause, policyUpdate);
+
+    // Report per-peer-group processing time for CRF route filter updates
+    if (cause == RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE) {
+      const auto& peerGroupName = adjRib->getPeeringParams().peerGroupName;
+      BgpStats::addIngressRouteFilterPeerGroupProcessTimeMs(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - adjRibStart)
+              .count(),
+          peerGroupName.value_or(peerId.toOdsKey()));
+    }
+  }
+
+  XLOGF(
+      INFO,
+      "Completed AdjRib Re-evaluation for {}",
+      magic_enum::enum_name(cause));
+
+  // Send a message to RIB to resume best-path selection and FIB programming
+  co_await ribInQ_.push(ResumeBestPathAndFibProgramming(cause));
+}
+
+folly::coro::Task<void> PeerManager::processAdjRibReEvaluationTask(
+    std::shared_ptr<AdjRib> adjRib,
+    RibPauseResumeCause cause,
+    bool policyUpdate) {
+  XLOGF(
+      DBG2,
+      "Processing AdjRib re-evaluation task for peer {}",
+      adjRib->getPeeringParams().peerId);
+
+  // Process AdjRib re-evaluation with policy application
+  co_await adjRib->processAdjRibReEvaluation(cause);
+
+  // Clear flag after processing for policy updates
+  if (policyUpdate) {
+    adjRib->clearPendingIngressPolicyUpdate();
+  }
+
+  co_return;
+}
+
+folly::coro::Task<void> PeerManager::startPeriodicPolicyCacheEvictionRoutine() {
+  XLOG(INFO, "Starting Periodic Policy Cache Eviction");
+  while (true) {
+    // when cancelAndJoinAsync is called, loop will be broken to exit
+    co_await folly::coro::co_safe_point;
+
+    // sleep a constant time and yield to other coroutines
+    co_await folly::coro::sleepReturnEarlyOnCancel(
+        periodicPolicyCacheEvictionInterval_);
+
+    // evict stale entries of policy cache
+    auto policyCache = AdjRibPolicyCache::get();
+    if (policyCache) {
+      policyCache->evictFromPolicyCache();
+    }
+  }
+}
+
+folly::coro::Task<void> PeerManager::startPeriodicUpdatePeerCountersRoutine() {
+  XLOG(DBG1, "Start Counter Update Loop");
+  while (true) {
+    // when cancelAndJoinAsync is called, loop will be broken to exit
+    co_await folly::coro::co_safe_point;
+
+    // sleep a constant time and yield to other coroutines
+    co_await folly::coro::sleepReturnEarlyOnCancel(
+        seconds(FLAGS_counter_update_time_s));
+
+    co_await updatePeerCounters();
+  }
+}
+
+/**
+ * @brief: Publish the current size of each deduplicated attributes
+ * collection as ODS counters.
+ */
+void publishDeduplicatedAttributesSizes() {
+  bgp::BgpStats::setDeduplicatedAttributesTotal(
+      nettools::bgplib::DeDuplicatedBgpAttributesC::deduplicatorSize());
+  bgp::BgpStats::setDeduplicatedAttributesAsPath(
+      nettools::bgplib::DeDuplicatedAsPath::deduplicatorSize());
+  bgp::BgpStats::setDeduplicatedAttributesCommunities(
+      nettools::bgplib::DeDuplicatedCommunities::deduplicatorSize());
+  bgp::BgpStats::setDeduplicatedAttributesClusterList(
+      nettools::bgplib::DeDuplicatedClusterList::deduplicatorSize());
+  bgp::BgpStats::setDeduplicatedAttributesExtCommunities(
+      nettools::bgplib::DeDuplicatedExtCommunities::deduplicatorSize());
+  bgp::BgpStats::setDeduplicatedAttributesBgpPath(
+      nettools::bgplib::DeDuplicatedBgpPath::deduplicatorSize());
+}
+
+/**
+ * @brief: Schedule periodic evict from deduplicators coroutine on
+ * CancellableAsyncScope.
+ */
+folly::coro::Task<void>
+PeerManager::periodicEvictFromDeduplicatorLoop() noexcept {
+  void (*evictFunctions[])(void) = {
+      nettools::bgplib::DeDuplicatedBgpAttributesC::
+          evictDeletedEntriesFromDeduplicator,
+      nettools::bgplib::DeDuplicatedAsPath::evictDeletedEntriesFromDeduplicator,
+      nettools::bgplib::DeDuplicatedCommunities::
+          evictDeletedEntriesFromDeduplicator,
+      nettools::bgplib::DeDuplicatedClusterList::
+          evictDeletedEntriesFromDeduplicator,
+      nettools::bgplib::DeDuplicatedExtCommunities::
+          evictDeletedEntriesFromDeduplicator,
+      DeDuplicatedBgpPath::evictDeletedEntriesFromDeduplicator};
+  auto evictFunctionsLen = sizeof(evictFunctions) / sizeof(evictFunctions[0]);
+
+  while (true) {
+    for (int i = 0; i < evictFunctionsLen; ++i) {
+      // when cancelAndJoinAsync is called, loop will be broken to exit
+      co_await folly::coro::co_safe_point;
+
+      // Clean up deduplicators every 30 seconds
+      co_await folly::coro::sleepReturnEarlyOnCancel(30s);
+
+      evictFunctions[i]();
+      publishDeduplicatedAttributesSizes();
+    }
+  }
+}
+
+void PeerManager::sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope) {
+  XLOGF(
+      INFO, "sendRibDumpReqForEgressPolicyUpdate called with scope {}", scope);
+  // TODO(6.3): When enableUpdateGroup_, branch on scope:
+  //   PEER_GROUP → collect affected groups, schedule group re-evaluation
+  //   PEER → per-peer UpdateGroupKey rebuild + group migration
+  for (const auto& [peerId, adjRib] : adjRibs_) {
+    if (adjRib->isPendingEgressPolicyUpdate() &&
+        !adjRib->inInitialAnnouncement()) {
+      XLOGF(
+          INFO,
+          "Sending RibDumpReq for egress affected adjrib {}",
+          peerId.str());
+      asyncScope_.add(co_withExecutor(
+          &evb_, processRibDumpReqForEgressPolicyUpdate(peerId, adjRib)));
+    }
+  }
+}
+
+void PeerManager::distributeRibOutAnnouncementToAdjRibs(
+    const RibOutAnnouncement& announcement) {
+  auto ribMsg = std::make_shared<const RibOutMessage>(announcement);
+  for (const auto& [_, adjRib] : adjRibs_) {
+    if (!adjRib) {
+      /* adjrib is not ready. Skip sending. */
+      continue;
+    }
+    if (ribInitialAnnouncementDone_ || adjRib->inInitialAnnouncement()) {
+      /*
+       * Case 1: `ribInitialAnnouncementDone_ = true`
+       *
+       * This implies that BGP has been initialized, we need to send
+       * incremental updates to peers.
+       *
+       * Case 2: `ribInitialAnnouncementDone_ = false` and
+       *         `adjRib->inInitialAnnouncement() = true`.
+       *
+       * This implies BGP has NOT yet initialized. We send updates to
+       * all peers as the initial RibDumpReq.
+       */
+      if (!ribInitialAnnouncementDone_) {
+        /*
+         * This applies ONLY to BGP not yet initialized case.
+         *
+         * Not using intermediate queue to adjRibOut, instead
+         * calling adjRib's method of processing ribMsg directly.
+         */
+        adjRib->processRibMessage(announcement);
+      }
+
+      if (announcement.sendWithEoR && adjRib->inInitialAnnouncement()) {
+        adjRib->resetInInitialAnnouncement();
+        /*
+         * changeList consumers are to be registered to the tracker
+         * library only after initial dump with EoR flag is sent to
+         * adjRibOut.
+         *
+         * consumers must be registered right away as soon EoR flag
+         * is sent so as to not miss any further incremental changes
+         * to routes
+         */
+        adjRib->activateChangeListConsumer();
+      }
+    }
+  }
+}
+
+folly::coro::Task<void> PeerManager::processRibDumpReqForEgressPolicyUpdate(
+    const nettools::bgplib::BgpPeerId& peerId,
+    std::shared_ptr<AdjRib> adjRib) {
+  co_await processRibDumpReqCoro(RibDumpReq(peerId, adjRib->sendAddPath()));
+  adjRib->clearPendingEgressPolicyUpdate(); // Clear flag after completion
+}
+
+folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
+    size_t ingressAffectedCount,
+    size_t egressAffectedCount,
+    PolicyChangeScope scope) {
+  // Check if dynamic policy evaluation is enabled and there are adjRibs
+  // with ingress policy changes
+  if (enableDynamicPolicyEvaluation_ && ingressAffectedCount > 0) {
+    XLOGF(
+        INFO,
+        "Dynamic policy evaluation enabled - starting re-evaluation for {} ingress adjribs",
+        ingressAffectedCount);
+
+    const auto allPeersStart = std::chrono::steady_clock::now();
+    // Process ingress re-evaluation for affected adjRibs
+    co_await startAdjRibReEvaluationRoutine(
+        RibPauseResumeCause::ROUTE_FILTER_POLICY_UPDATE);
+
+    const auto allPeersReEvaluationTimeMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - allPeersStart)
+            .count();
+    BgpStats::setIngressPolicyAllPeersLastReEvaluationTimeMs(
+        allPeersReEvaluationTimeMs);
+
+    XLOGF(
+        INFO,
+        "Completed route filter policy re-evaluation for ingress adjribs in {} ms",
+        allPeersReEvaluationTimeMs);
+  }
+
+  // Process egress-affected adjRibs (always needed if
+  // egressAffectedCount > 0)
+  if (egressAffectedCount > 0) {
+    XLOGF(
+        INFO,
+        "Sending RibDumpReq for {} egress affected adjribs",
+        egressAffectedCount);
+
+    sendRibDumpReqForEgressPolicyUpdate(scope);
+  }
+
+  co_return;
+}
+
+std::vector<nettools::bgplib::BgpPeerId>
+PeerManager::triggerRouteRefreshRequestsForPeers(
+    std::vector<nettools::bgplib::BgpPeerId> peerIds) {
+  // Check if BGP is initialized
+  if (!initialized_) {
+    XLOG(ERR, "Refresh request can not be initiated. BGP is not initialized");
+    return peerIds;
+  }
+  // Trigger route refresh request for all the peers and keep track of the
+  // failed peerIds
+  std::vector<nettools::bgplib::BgpPeerId> failedPeerIds;
+  for (const auto& peerId : peerIds) {
+    if (!triggerRouteRefreshRequestForPeer(peerId)) {
+      failedPeerIds.emplace_back(peerId);
+    }
+  }
+  return failedPeerIds;
+}
+
+bool PeerManager::triggerRouteRefreshRequestForPeer(
+    const BgpPeerId& peerId) noexcept {
+  auto peerIdAdjRib = adjRibs_.find(peerId);
+  if (peerIdAdjRib == adjRibs_.cend()) {
+    XLOGF(
+        ERR,
+        "Error sending route refresh request to {}. AdjRib does not exist",
+        peerId.str());
+    return false;
+  }
+  auto adjRib = peerIdAdjRib->second;
+  if ((!adjRib) || (!adjRib->isStateEstablished()) ||
+      (!adjRib->isEnhancedRouteRefreshNegotiated() &&
+       !adjRib->isRouteRefreshNegotiated())) {
+    XLOGF(
+        ERR,
+        "Error sending route refresh request to {}. "
+        "Session is not established or neither Route Refresh nor "
+        "Enhanced Route Refresh is negotiated",
+        peerId.str());
+    return false;
+  }
+  // TODO: Handle GR case and check if ERR is not already in progress. If
+  // so, return false.
+  adjRib->buildAndSendRouteRefresh(
+      BgpRouteRefreshMessageSubtype::ROUTE_REFRESH_REQUEST);
+  return true;
+}
+
+} // namespace bgp
+} // namespace facebook

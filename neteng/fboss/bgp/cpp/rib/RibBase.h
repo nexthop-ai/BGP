@@ -1,0 +1,915 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <folly/IPAddress.h>
+#include <folly/IntrusiveList.h>
+#include <folly/coro/AsyncScope.h>
+#include <folly/coro/Task.h>
+#include <folly/io/async/AsyncTimeout.h>
+#include <folly/io/async/EventBase.h>
+
+#include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
+#include "neteng/fboss/bgp/cpp/common/BgpModuleBase.h"
+#include "neteng/fboss/bgp/cpp/common/BgpPath.h"
+#include "neteng/fboss/bgp/cpp/common/RibMessage.h"
+#include "neteng/fboss/bgp/cpp/common/RouteInfo.h"
+#include "neteng/fboss/bgp/cpp/common/Structs.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
+#include "neteng/fboss/bgp/cpp/lib/coro/BackPressuredQueue.h"
+#include "neteng/fboss/bgp/cpp/lib/coro/MPMCQueue.h"
+#include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopCache.h"
+#include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopInfo.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
+#include "neteng/fboss/bgp/cpp/rib/Fib.h"
+#include "neteng/fboss/bgp/cpp/rib/LocalRoute.h"
+#include "neteng/fboss/bgp/cpp/rib/RibEntry.h"
+#include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
+#include "neteng/fboss/bgp/cpp/watchdog/MonitoredModule.h"
+#include "neteng/fboss/bgp/cpp/watchdog/MonitoredQueue.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
+
+DECLARE_string(rp_state_file);
+DECLARE_string(rp_change_history_file);
+DECLARE_bool(enable_default_route_logging);
+
+namespace facebook::bgp {
+
+// Default path for the RIB policy change history file.
+// Used by bgpd (RibBase.cpp) to write change history, and by fboss2 CLI to read
+// it. patternlint-disable-next-line no-dev-shm-usage
+constexpr auto kRpChangeHistoryFilePath = "/dev/shm/rp_change_history.txt";
+/*
+ * This is the class defintion of RIB, aka, Routing Information Base.
+ *
+ * As the name suggests, it implements RIB functionality of the BGP RFC and
+ * maintain database of all routes received from all peers. It is with this
+ * module that we do best path selection and create FIB (Forwarding Information
+ * Base).
+ *
+ * NOTE: FIB essentially is the  Loc-RIB of the BGP RFC, except that it also
+ * has ECMP paths.
+ */
+class RibBase : public BgpModuleBase, public MonitoredModule {
+ public:
+  /*
+   * [Util Class for Iteration]
+   *
+   * Create an iterator by merging the local routes and fib-programmed
+   * prefixes.
+   *
+   * The return order of the iterator is:
+   *   1. (high-pri) any local route present in the pfxNhs;
+   *   2. all other non-local routes present in the pfxNhs;
+   */
+  class FibProgrammedPrefixIterator {
+   public:
+    FibProgrammedPrefixIterator(
+        const RibBase& rib,
+        const Fib::FibProgrammedPfxToNexthops& pfxNhs);
+    Fib::FibProgrammedPfxToNexthops::const_iterator cbegin();
+    Fib::FibProgrammedPfxToNexthops::const_iterator cend();
+    Fib::FibProgrammedPfxToNexthops::const_iterator next();
+
+   private:
+    // Whether iterator is currently handling summary routes or not.
+    bool summaryRoutesPass_{true};
+    bool inited_{false};
+    // Reference back to parent RIB.
+    const RibBase& rib_;
+    // Iterator to track next localRoutes to process.
+    folly::F14NodeMap<folly::CIDRNetwork, LocalRoute>::const_iterator
+        localRouteIter_;
+    // Iterator to track next nonLocalRoutes to process.
+    Fib::FibProgrammedPfxToNexthops::const_iterator nonLocalRouteIter_;
+    // prefix to nexthop map returned from FIB.
+    const Fib::FibProgrammedPfxToNexthops& pfxNhs_;
+  };
+
+  struct RibPolicyClearMsg {};
+
+  /**
+   * [Route Attribute Policy]
+   *
+   * Define message structure used for route attribute policy, which can
+   * override BGP route attributes before installing to FIB.
+   */
+  struct RouteAttributePolicySetMsg {
+    const rib_policy::TRouteAttributePolicy policy;
+
+    explicit RouteAttributePolicySetMsg(
+        rib_policy::TRouteAttributePolicy policy)
+        : policy(std::move(policy)) {}
+  };
+
+  struct RouteAttributePolicyClearMsg {};
+  struct RouteAttributePolicyTimerMsg {};
+
+  /**
+   * [Path Selection Policy]
+   *
+   * Define message structure used for path selection policy, which can
+   * override BGP path selection before installing to FIB.
+   */
+  struct PathSelectionPolicySetMsg {
+    const rib_policy::TPathSelectionPolicy policy;
+
+    explicit PathSelectionPolicySetMsg(rib_policy::TPathSelectionPolicy policy)
+        : policy(std::move(policy)) {}
+  };
+
+  struct PathSelectionPolicyClearMsg {};
+
+  /**
+   * [Route Filter Policy]
+   */
+  struct RouteFilterPolicySetMsg {
+    const rib_policy::TRouteFilterPolicy policy;
+
+    explicit RouteFilterPolicySetMsg(rib_policy::TRouteFilterPolicy policy)
+        : policy(std::move(policy)) {}
+  };
+
+  struct RouteFilterPolicyClearMsg {};
+
+  using RibPolicyMessage = std::variant<
+      RibPolicyClearMsg,
+      RouteAttributePolicySetMsg,
+      RouteAttributePolicyClearMsg,
+      RouteAttributePolicyTimerMsg,
+      PathSelectionPolicySetMsg,
+      PathSelectionPolicyClearMsg,
+      RouteFilterPolicySetMsg,
+      RouteFilterPolicyClearMsg>;
+
+  //
+  // Creates RibBase instance
+  //
+  RibBase(
+      const std::unordered_map<folly::CIDRNetwork, thrift::BgpNetwork>&
+          localRoutes,
+      const BgpGlobalConfig& globalConfig,
+      const std::optional<bgp_policy::BgpPolicies>& policyConfig,
+      nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ,
+      MonitoredMPMCQueue<RibOutMessage>& ribOutQ,
+      const std::string& platform,
+      std::shared_ptr<NexthopCache> nextHopCache = nullptr,
+      uint16_t fibAgentPort = kFbossAgentPort,
+      uint32_t fibAgentRecvTimeout = kFbossAgentRecvTimeout.count());
+
+  virtual ~RibBase();
+
+  void run() noexcept override;
+  void stop() noexcept override;
+
+  /**
+   * @brief Clean up the RIB module resources.
+   */
+  void stopRoutine() noexcept;
+
+  void setFibBatchTime(std::chrono::milliseconds d);
+  std::chrono::milliseconds getFibBatchTime() const {
+    return fibBatchTime_;
+  }
+
+  /**
+   * @brief Return the asyncScope of RIB
+   */
+  inline folly::coro::CancellableAsyncScope& getRibAsyncScope() {
+    return asyncScope_;
+  }
+
+  //
+  // Thrift service handlers
+  //
+
+  // Get the timestamp
+  inline int64_t getLastProgrammedRoutesTimeStamp() {
+    return lastProgrammedRoutesTimeStamp_;
+  }
+
+  /**
+   * Check if egress rib queue has crossed high water mark
+   * If so pause RIB best path computation. It will be
+   * resumed by peer mgr when the queue size hits lower
+   * watermark.
+   */
+  template <typename T>
+  void ribOutQPushAndMayPauseBestPathAndFibProgramming(T&& val) {
+    ribOutQ_.push(std::forward<T>(val));
+
+    if (ribOutQ_.size() > ribOutQHighWatermark_) {
+      XLOGF(INFO, "Pause RIB as ribOutQ size : {}", ribOutQ_.size());
+      processPauseBestPathAndFibProgramming(
+          PauseBestPathAndFibProgramming(RibPauseResumeCause::BACKPRESSURE));
+    }
+  }
+
+  // Get current ribEntries by address family
+  std::vector<neteng::fboss::bgp::thrift::TRibEntry> getRibEntries(
+      neteng::fboss::bgp_attr::TBgpAfi afi);
+
+  // Get ribEntries by prefixes:
+  // prefix: prefix to match from the ribEntries.
+  std::vector<neteng::fboss::bgp::thrift::TRibEntry> getRibEntryForPrefix(
+      std::unique_ptr<std::string> prefix);
+
+  // Get ribEntries by community
+  // afi: AFI to match or all AFIs
+  // comms: community list with match-any logic (in contrast of match-all)
+  // rib entry returned should match at least 1 community in comms.
+  // when comms is emtpy, no rib entry should be returned.
+  std::vector<neteng::fboss::bgp::thrift::TRibEntry>
+  getRibEntriesForCommunities(
+      neteng::fboss::bgp_attr::TBgpAfi afi,
+      const std::vector<nettools::bgplib::BgpAttrCommunityC>& comms);
+
+  // Get ribEntries whose prefix is within a given prefix:
+  // prefix: prefix to match from the ribEntries.
+  std::vector<neteng::fboss::bgp::thrift::TRibEntry>
+  getRibEntriesForSubprefixes(std::unique_ptr<std::string> prefix);
+
+  void injectLocalRoutes(
+      const std::map<
+          facebook::neteng::fboss::bgp_attr::TIpPrefix,
+          facebook::neteng::fboss::bgp::thrift::TBgpAttributes>& networks);
+  void removeLocalRoutes(
+      const std::set<facebook::neteng::fboss::bgp_attr::TIpPrefix>& prefixes);
+
+  folly::F14NodeMap<folly::CIDRNetwork, LocalRoute> getLocalRoutes() {
+    return localRoutes_;
+  }
+
+  /**
+   * @brief Retrieves NexthopInfo for a given nexthop IP address from the
+   * nexthopInfoMap_.
+   *
+   * @param nexthop The IP address of the nexthop to look up
+   * @return std::optional<TNexthopInfo> containing nexthop information if
+   *         found, std::nullopt if nexthop doesn't exist in the map
+   */
+  std::optional<neteng::fboss::bgp::thrift::TNexthopInfo>
+  getNexthopInfoForNexthop(const folly::IPAddress& nexthop);
+
+  static std::optional<size_t> getSwitchId(
+      const std::optional<std::string>& deviceName) {
+    if (!deviceName) {
+      return std::nullopt;
+    }
+    std::vector<std::string> segments;
+    folly::split('.', *deviceName, segments);
+    if (segments.size() < 2) {
+      // fa001-uu001.abc1 has 2 segments, this is the minimum case
+      return std::nullopt;
+    }
+    try {
+      auto switchId = stoul(segments[0].substr(segments[0].size() - 3));
+      return switchId;
+    } catch (const std::exception& ex) {
+      XLOGF(
+          ERR,
+          "unable to obtain switchId from deviceName: {}, reason: {}",
+          *deviceName,
+          ex.what());
+      return std::nullopt;
+    }
+  }
+
+  std::vector<neteng::fboss::bgp::thrift::TOriginatedRoute>
+  getOriginatedRoutes();
+
+  rib_policy::TRibPolicy getRibPolicy();
+
+  // update entry stats
+  void updateEntryStats(
+      neteng::fboss::bgp::thrift::TEntryStats& stats) noexcept;
+
+  /**
+   * Get the current RIB version. This is a monotonically increasing counter
+   * that increments whenever a material routing change occurs (best path
+   * or multipath changes).
+   */
+  uint64_t getRibVersion() const {
+    return ribVersion_;
+  }
+
+  /**
+   * Increment the RIB version counter. Called when a material routing change
+   * occurs (best path or multipath changes). Returns the new version value.
+   */
+  uint64_t incrementRibVersion() {
+    RibStats::incrementRibTableVersion();
+    return ++ribVersion_;
+  }
+
+  virtual void clearRibPolicy();
+
+  // Append a timestamped entry to the RIB policy change history file.
+  // Keeps at most the last 50 entries.
+  static void appendRibPolicyChangeHistory(
+      const std::string& policyType,
+      int64_t version) noexcept;
+
+  /**
+   * [Route Attribute Policy]
+   */
+  virtual neteng::fboss::bgp::thrift::TResult setRouteAttributePolicy(
+      std::unique_ptr<rib_policy::TRouteAttributePolicy> policy);
+
+  rib_policy::TRouteAttributePolicy getRouteAttributePolicy();
+
+  virtual void clearRouteAttributePolicy();
+
+  /**
+   * [Path Selection Policy]
+   */
+  virtual neteng::fboss::bgp::thrift::TResult setPathSelectionPolicy(
+      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy);
+
+  rib_policy::TPathSelectionPolicy getPathSelectionPolicy();
+  // get path selection policy version. Return -1 if policy is not set.
+  int64_t getPathSelectionPolicyVersion() const;
+
+  virtual void clearPathSelectionPolicy();
+
+  std::vector<rib_policy::TPathSelector> getActivePathSelectionCriteria(
+      std::unique_ptr<std::vector<std::string>> prefixes);
+
+  /**
+   * [Route Filter Policy]
+   */
+  virtual void setRouteFilterPolicy(
+      std::unique_ptr<rib_policy::TRouteFilterPolicy> policy);
+
+  rib_policy::TRouteFilterPolicy getRouteFilterPolicy();
+  // get route filter policy version. Return -1 if policy is not set.
+  int64_t getRouteFilterPolicyVersion() const;
+
+  virtual void clearRouteFilterPolicy();
+
+  void announceAndWithdrawAddPathsBasedOnDelta(
+      const RibEntry& entry,
+      RibOutAnnouncement& announcement,
+      bool sendWithEoR,
+      bool newlyInstalledInLocalRib,
+      RibOutWithdrawal& withdrawal);
+
+  void announceAddPath(
+      const RibEntry& entry,
+      RibOutAnnouncement& announcement,
+      bool sendWithEoR,
+      bool newlyInstalledInLocalRib,
+      const std::shared_ptr<RouteInfo>& addPath);
+
+  void withdrawAddPath(
+      RibOutWithdrawal& withdrawal,
+      const folly::CIDRNetwork& prefix,
+      uint32_t pathId,
+      uint64_t ribVersion);
+
+  virtual void enqueueRibUpdateToFsdb() {}
+  virtual void postRouteFilterPolicyReplaced() {}
+
+ protected:
+  virtual void createFib();
+  virtual void prepareFibProgramming(bool fullSync = false) noexcept;
+  void handleFullAddPathWithdrawal(
+      const RibEntry& ribEntry,
+      RibOutWithdrawal& withdrawalAddPath);
+
+  std::chrono::milliseconds ribPauseTime_{kRibPauseTimeout};
+
+  // Periodic interval in seconds to check for route churn
+  std::chrono::seconds routeChurnCheckInterval_{kRouteChurnCheckInterval};
+
+  // Higher watermark value for number of prefixes that are allowed within the
+  // interval
+  static inline uint64_t highWatermarkForRouteChurn_{
+      kHighWaterMarkForRouteChurn};
+
+  // Lower watermark value for number of prefixes to fall to after threshold
+  // exceeded
+  static inline uint64_t lowWatermarkForRouteChurn_{kLowWaterMarkForRouteChurn};
+
+  std::unique_ptr<Fib> fib_;
+
+  // Based on configuration, we use different multipath and bestpath selectors.
+  // These will be passed to rib entry during best path selection.
+  std::unique_ptr<RouteInfoSelector> multipathSelector_{nullptr};
+  std::unique_ptr<RouteInfoSelector> bestpathSelector_{nullptr};
+
+  // prefix -> RibEntry map
+  folly::F14NodeMap<folly::CIDRNetwork, RibEntry> ribEntries_;
+
+  /*
+   * [Fib -> Rib]
+   *
+   * Single-Producer-Single-Consumer(SPSC Queue) from Fib to Rib:
+   *  - FibProgrammedMessage: routes programmed in HW or Fib agent connection
+   *                          has been established;
+   *  - FibSyncReq: Fib has disconnected from agent. Force a full-sync;
+   */
+  bgp::coro::MPMCQueue<Fib::FibMessage> fromFibMessageQ_;
+
+  /*
+   * [Rib -> Fib]
+   *
+   * Single-Producer-Single-Consumer(SPSC Queue) from Rib to Fib.
+   *
+   * Trigger the Fib programming task under the following conditions:
+   *  - incremental route update: triggers on fibBatchTimer_'s expiration;
+   *  - full-sync route update:
+   *    1) initial FIB programming
+   *    2) request received from Fib upon bgp-agent connection failure
+   */
+  struct TriggerFibProgMessage {
+    const bool fullSync{false};
+    explicit TriggerFibProgMessage(bool fullSync) : fullSync(fullSync) {}
+  };
+  bgp::coro::MPMCQueue<TriggerFibProgMessage> toFibMessageQ_;
+
+  /*
+   * [RibPolicy]
+   *
+   * Multiple-Producer-Single-Consumer(MPSC Queue) between coro tasks.
+   */
+  bgp::coro::MPMCQueue<RibPolicyMessage> ribPolicyMsgQ_;
+
+  /* TODO: Move to RibDC once overwriteRouteAttributes,
+     createTRibEntry, and thrift getters no longer access it from RibBase */
+  std::unique_ptr<RouteAttributePolicy> routeAttributePolicy_{nullptr};
+  /* TODO: Move to RibDC once getPathSelectionPolicyForBestPath
+     and thrift getters no longer access it from RibBase */
+  std::unique_ptr<PathSelectionPolicy> pathSelectionPolicy_{nullptr};
+  std::unique_ptr<RouteFilterPolicy> routeFilterPolicy_{nullptr};
+
+  // The list to store all RibEntry that have been updated and needs to
+  // be programmed in Fib and/or send to peers.
+  //
+  // Using a non-intrusive list requires storing either a key or a shared
+  // pointer of the entry. It could contribute to some performance overload.
+  // Using folly::IntrusiveList could help in this case. Measurement shows
+  // IntrusiveList has about 4x performance gain on constructing the list
+  // and 7x gain on looping, comparing with std::forward_list.
+  folly::IntrusiveList<RibEntry, &RibEntry::fibBatchListHook_> fibBatchList_;
+
+ private:
+  //
+  // Member functions
+  //
+  // apply policy and get new attrs
+  // nullptr indicates the policy rejected the prefix
+  std::shared_ptr<BgpPath> getBgpPathFromPolicy(
+      const std::string& policyName,
+      const folly::CIDRNetwork& prefixes,
+      const std::shared_ptr<BgpPath>& preInAttrs);
+
+  // given config, create local route object
+  std::optional<facebook::bgp::LocalRoute> createLocalRoute(
+      const folly::CIDRNetwork& prefix,
+      const facebook::bgp::thrift::BgpNetwork& network);
+
+  // logging utils function
+  bool enableUnicastRouteLogging(const folly::CIDRNetwork& prefix);
+
+  /**
+   * Utility method to turn a RibEntry to tRibEntry
+   * entry: prefix and associated ribEntry
+   */
+  neteng::fboss::bgp::thrift::TRibEntry createTRibEntry(
+      const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>&
+          entry);
+
+  /**
+   * Utility method to turn a RibEntry to tRibEntry after applying pathFilter.
+   *
+   * entry: prefix and associated ribEntry
+   * pathFilter: unary predicate to check if a path should be in o/p list.
+   */
+  std::optional<neteng::fboss::bgp::thrift::TRibEntry>
+  createTRibEntryWithFilter(
+      const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>& entry,
+      const std::function<bool(const RouteInfo&)>& pathFilter);
+
+  // The coro task to asynchronously process local routes
+  folly::coro::Task<void> processLocalRoutesRoutine() noexcept;
+
+  /*
+   * [Rib <-> PeerManager]
+   *
+   * The loop to process incoming messages from PeerManager(AdjRib).
+   *
+   * This coro task deals with the following message types:
+   *  - RibInAnnoucement
+   *  - RibInWithdrawal
+   *  - RibInInitialPathComputation
+   *  - PauseBestPathAndFibProgramming
+   *  - ResumeBestPathAndFibProgramming
+   */
+  folly::coro::Task<void> processRibInMsgLoop() noexcept;
+
+  void processRibInAnnouncement(
+      const TinyPeerInfo& peer,
+      std::shared_ptr<const BgpPath> attr,
+      const PrefixPathIds& pfxPathIds) noexcept;
+  void checkWithdrawalBeforeRouteProgrammed(
+      folly::CIDRNetwork& prefix,
+      RibEntry& entry) noexcept;
+  void processRibInWithdrawal(
+      const TinyPeerInfo& peer,
+      const PrefixPathIds& pfxPathIds) noexcept;
+  void processRibInInitialPathComputation() noexcept;
+  void processPauseBestPathAndFibProgramming(
+      const PauseBestPathAndFibProgramming&
+          pauseBestPathAndFibProgramming) noexcept;
+  void processResumeBestPathAndFibProgramming(
+      const ResumeBestPathAndFibProgramming&
+          resumeBestPathAndFibProgramming) noexcept;
+  /**
+   * @brief Process nexthop updates from the nexthopHandler thread
+   * @details This method iterates over the nexthopIps and iterates over the
+   * associated RouteInfo entries to trigger best-path selection for the
+   * corresponding RibEntry.
+   * @param nexthopUpdate The nexthop update message containing the list of
+   * nexthop IPs
+   */
+  void processRibInNexthopUpdate(
+      const RibInNexthopUpdate& nexthopUpdate) noexcept;
+
+  /**
+   * @brief Process nexthop resolution updates from NeighborWatcher
+   * @details Virtual hook called from the RibInMessage dispatch loop when a
+   * NexthopResolutionUpdate arrives. Default is a no-op for subclasses (e.g.
+   * RibBB) that don't originate conditional routes. RibDC overrides to
+   * advertise/withdraw prefixes from conditionalLocalRoutes_ and emit the
+   * one-shot RibOutNexthopResolutionReceived signal to PeerManager.
+   * @param nexthopResolutionUpdate The update message containing both resolved
+   * and unresolved nexthop ips
+   */
+  virtual void processNexthopResolutionUpdate(
+      const NexthopResolutionUpdate& /* nexthopResolutionUpdate */) noexcept {}
+
+  // Util function to return aggregated route(locally originated) update to be
+  // processed if any
+  std::vector<std::pair<folly::CIDRNetwork, std::shared_ptr<const BgpPath>>>
+  processSingleRibInUpdate(
+      const TinyPeerInfo& peer,
+      std::shared_ptr<const BgpPath> attrs,
+      const PrefixPathId& pfxPid) noexcept;
+
+  /*
+   * @brief: helper function called in processSingleRibInUpdate
+   * @return:
+   *  1. local route announcement if >= minimum_supporting_routes number of
+   *     subnet are processed.
+   *  2. local routes withdrawal if < minimum_supporting_routes number of
+   *     subnet are processed.
+   */
+  std::vector<std::pair<folly::CIDRNetwork, std::shared_ptr<const BgpPath>>>
+  aggregateRoute(
+      const folly::CIDRNetwork& prefix,
+      bool supportingRouteAnnouncement) noexcept;
+
+  // Util function to resume bestpath/fib programming
+  void mayResumeBestPathAndFibProgramming(
+      std::optional<RibPauseResumeCause> cause = std::nullopt) noexcept;
+
+  /*
+   * [Rib <-> Watchdog]
+   *
+   * This section contains the methods of message handling from Watchdog.
+   */
+  folly::coro::Task<void> processWatchdogMsgLoop() noexcept;
+
+  /*
+   * [Rib <-> Fib]
+   *
+   * This section contains the methods to handle interaction between RIB and
+   * FibFboss/FibDev
+   */
+  folly::coro::Task<void> processFibProgrammingMsgLoop() noexcept;
+  folly::coro::Task<void> processFibMsgLoop() noexcept;
+
+  void handleFibProgrammedMessage(
+      const Fib::FibProgrammedMessage& msg) noexcept;
+  void handleFibSyncReq(const Fib::FibSyncReq& req) noexcept;
+
+ protected:
+  void schedulePrepareFibProgrammingTimer() noexcept;
+
+ private:
+  /**
+   * @brief Get the backoff timeout for Fib programming, during churn.
+   *
+   * @return std::chrono::seconds - backoff timeout in seconds.
+   */
+  virtual std::chrono::seconds getFibBackoffTimeout() const noexcept;
+
+ protected:
+  /**
+   * Process RibPolicy message loop. Pure virtual — each subclass provides
+   * its own dispatch covering the policy types it supports.
+   */
+  virtual folly::coro::Task<void> processRibPolicyMsgLoop() noexcept = 0;
+
+  /* Shared CRF handlers used by both RibDC and RibBB dispatch loops. */
+  void handleRibPolicyClearMsg() noexcept;
+  virtual void handlePathSelectionPolicySetMsg(
+      const PathSelectionPolicySetMsg& msg) noexcept;
+  virtual void handlePathSelectionPolicyClearMsg() noexcept;
+  void handleRouteFilterPolicySetMsg(
+      const RouteFilterPolicySetMsg& msg) noexcept;
+  void handleRouteFilterPolicyClearMsg() noexcept;
+
+  virtual void overwriteRouteAttributes(
+      const std::unordered_set<folly::CIDRNetwork>& /* prefixes */,
+      bool /* fullRibWalk */ = false) {}
+
+  /**
+   * Replace RibPolicy: save to disk, then trigger fib programming when there
+   * is delta and not in read-only mode.
+   *
+   * Pure virtual — each subclass (RibDC, RibBB) provides its own dispatch
+   * to the relevant replace*Policy methods for its platform.
+   *
+   * @param newRibPolicy the new RibPolicy to apply, or nullptr to clear.
+   * @param isBootstrap if true, skip appending to change history file
+   *        (used during constructor restore from disk).
+   */
+  virtual void replaceRibPolicy(
+      std::unique_ptr<RibPolicy> newRibPolicy,
+      bool isBootstrap = false) = 0;
+  // We only replace instead of updating route filter policy
+  // Each time the route filter policy is replaced, we also need to save route
+  // filter policy to disk. After that, when there is delta and not in read-only
+  // mode, trigger fib programming and force routes to be sent to AdjRibs
+  // @return: hasUpdate: whether the newPolicy contains update
+  virtual bool replaceRouteFilterPolicy(
+      std::unique_ptr<RouteFilterPolicy> newPolicy,
+      bool isBootstrap = false);
+
+ private:
+  // helper functions to read/write rp_state_file
+  // check if rp_state_file exists on disk
+  bool ribPolicyStoreExists() noexcept;
+  // return a pair of
+  //   readSuccess: if we could successfully read from the file
+  //   TRibPolicyStore: the TRibPolicyStore
+  std::pair<bool, neteng::fboss::bgp::thrift::TRibPolicyStore>
+  readTRibPolicyStore() noexcept;
+  // remove existing rp_state_file on disk
+  void removeExistingRibPolicyStore() noexcept;
+  // serialize and save tRibPolicyStore to rp_state_file
+  void saveTRibPolicyStore(
+      const neteng::fboss::bgp::thrift::TRibPolicyStore&
+          tRibPolicyStore) noexcept;
+
+  // Validate and return the saved rib policy state
+  std::unique_ptr<RibPolicy> readRibPolicyState() noexcept;
+
+  // persistence logic for rib policy during restart
+  // Save rib policy state upon receipt of any rib policy updates
+  void saveRibPolicyState() noexcept;
+
+  /**
+   * @brief Periodically monitor the number of prefixes learnt and detect if
+   * route churn has occurred.
+   *
+   * @details This function periodically checks for route churn and
+   * pauses/resumes best-path computation and Fib programming accordingly.
+   *
+   * @return None.
+   */
+  folly::coro::Task<void> monitorRouteChurn() noexcept;
+
+  /*
+   * Periodically export BgpProfiler stats to ODS counters.
+   * Only active when --bgp_coro_profiler_export_ods is set.
+   */
+  folly::coro::Task<void> co_exportProfilerStatsLoop() noexcept;
+
+  // Increment the number of prefixes learnt/withdrawn for route churn detection
+  void incrementPrefixCountForRouteChurn(uint64_t count) noexcept;
+
+  /**
+   * @brief Checks if the number of prefixes learnt has exceeded the allowed
+   * threshold.
+   *
+   * This function uses a high-watermark/low-watermark mechanism to track the
+   * number of prefixes learnt. If the number of prefixes learnt exceeds the
+   * maximum allowed (high watermark), it will remain in an exceeded state until
+   * the number of prefixes learnt falls below the minimum allowed (low
+   * watermark).
+   *
+   * @return True if the number of prefixes learnt exceeds the allowed
+   * threshold, false otherwise.
+   */
+  bool isRouteChurnDetected() noexcept;
+
+  /**
+   * Helper method to get a NexthopInfo for a given nexthop or find it
+   * based on route info.
+   *
+   * For announcements (attrs is not null):
+   * - If the nexthop is not in the nexthopInfoMap_, it will get the status from
+   *   nexthopCache_ and create a new NexthopInfo in the map.
+   *
+   * For withdrawals (attrs is null):
+   * - It will find the RouteInfo to get its nexthop, and then find the
+   * NexthopInfo for that nexthop.
+   *
+   * @param attrs The route attributes (null for withdrawals)
+   * @param peer The peer information
+   * @param entry The RibEntry
+   * @param receivedPathId The path ID
+   * @return A pointer to the NexthopInfo for the nexthop, or nullptr if not
+   * found
+   */
+  NexthopInfo* FOLLY_NULLABLE getNexthopInfo(
+      const std::shared_ptr<const BgpPath>& attrs,
+      const TinyPeerInfo& peer,
+      const RibEntry& entry,
+      const uint32_t receivedPathId);
+
+  /**
+   * @brief Helper method to check if a NexthopInfo should be deleted from
+  nexthopInfoMap_ and nexthopCache. This is executed
+   * only for withdrawals when enableNexthopTracking_ is true.
+   *
+   * @details NexthopInfo will be deleted from nexthopInfoMap_ if no routeInfo
+  objects are associated with it.
+   * NexthopInfo will be deleted from nexthopCache ONLY if the nexthop is
+   * unreachable.
+   *
+   * @param nexthop The nexthop IP address to check for deletion
+   * @return True if the NexthopInfo was deleted, false otherwise
+   */
+  bool checkAndDeleteNexthopInfo(const folly::IPAddress& nexthop);
+
+  //
+  // Member variables
+  //
+  const BgpGlobalConfig globalConfig_;
+
+ protected:
+  const std::string platform_;
+
+ private:
+  std::shared_ptr<facebook::bgp::PolicyManager> policyManager_{nullptr};
+
+  folly::F14NodeMap<folly::CIDRNetwork, LocalRoute> localRoutes_{};
+  // There could be more than one route pointing to the same nexthop ip,
+  // hence we store a map of nexthop ip to a list of routes.
+  // Routes in each list conditionally originate based on resolution of the
+  // nexthop ip
+  folly::F14NodeMap<
+      folly::IPAddress /* nexthop ip */,
+      std::vector<folly::CIDRNetwork> /* route */>
+      conditionalLocalRoutes_{};
+  std::chrono::steady_clock::time_point
+      pauseBestPathAndFibProgrammingStartTime_;
+
+  // Max-cap timer for pausing best-path computation and Fib programming in Rib.
+  // This is used to avoid deadlocks or extra long locking time for RIB/FIB
+  // programming. If the pause time exceeds the set limit, Rib will resume
+  // operations.
+  std::unique_ptr<folly::AsyncTimeout> ribPauseTimer_;
+
+  // Number of prefixes learnt since the last reset.
+  uint64_t prefixCountForRouteChurn_{0};
+
+  // Flag to indicate if route churn is detected.
+  std::atomic<bool> routeChurnDetected_{false};
+
+  // ---------------- PeerManager <-> Rib ----------------
+
+  // rib in and out message queue
+  nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage>& ribInQ_;
+  MonitoredMPMCQueue<RibOutMessage>& ribOutQ_;
+
+ protected:
+  // Flag used to pause Rib operations such as best-path computation and Fib
+  // programming while policy re-evaluation is in progress
+  // TODO: revisit this collection since it is changed by single thread.
+  std::atomic<bool> pauseBestPathAndFibProgramming_{false};
+
+ private:
+  // Set containing all the operations due to which best
+  // path computation and Fib programming are paused
+  folly::Synchronized<folly::F14NodeSet<RibPauseResumeCause>>
+      bestPathAndFibProgrammingPausedBy_{};
+
+  // ---------------- Rib <-> Fib ----------------
+
+  // fib update with batch processing
+  std::chrono::milliseconds fibBatchTime_{kFibBatchTimeDefault};
+  std::unique_ptr<folly::AsyncTimeout> fibBatchTimer_;
+
+  /* TODO: Move to RibDC once timer init moves to RibDC */
+  std::unique_ptr<folly::AsyncTimeout> routeAttributePolicyTimer_;
+
+  /*
+   * [Initialization]
+   *
+   * One time flags:
+   *  - initialEorSent_: the flag indicates Rib has successfully programed
+   *          initial FULL_SYNC to fib and EoR has been sent out from RIB;
+   *  - ribEoRReceived_: the flag indicates Rib has received the notification
+   *                    from PeerManager to unblock initial RIB computation;
+   */
+  bool initialEorSent_{false};
+  bool ribEoRReceived_{false};
+
+  /*
+   * Flag to track if a FIB sync request was received while best-path
+   * computation and FIB programming were paused. This ensures that when
+   * the pause is lifted, we trigger a full FIB sync (instead of incremental)
+   * to honor the FibAgent's reconnection request that occurred during the
+   * pause period. Without this flag, the fullSync request from FibAgent
+   * would be lost, leading to inconsistent FIB state.
+   */
+  std::atomic<bool> fibSyncReqPending_{false};
+
+  /*
+   * - Timestamp representing last fib update;
+   * - Initialized to -1 representing NO fib update yet(e.g. initialization);
+   */
+  int64_t lastProgrammedRoutesTimeStamp_{-1};
+
+ private:
+  friend class RibDC;
+  friend class RibBB;
+  friend class MockRib;
+  friend class RibBaseFixture;
+
+  // e.g., for rsw001.p002.f03.abc4, switchId is 1
+  // e.g., for fa001-uu002.abc3, switchId is 2
+  std::optional<size_t> switchId_{std::nullopt};
+
+  /**
+   * Nexthop tracking related variables
+   */
+  // Flag to track if nexthop tracking is enabled
+  const bool enableNexthopTracking_{false};
+
+ protected:
+  // Pointer to the NexthopCache for nexthop status tracking
+  std::shared_ptr<NexthopCache> nexthopCache_{nullptr};
+
+ private:
+  /**
+   * Map to store nexthop prefix to NexthopInfo accessed only by Rib thread.
+   * NexthopInfo makes a local copy of the nexthop status from nexthopCache_ and
+   * stores the list of BgpRouteInfo objects associated with the nexthop prefix.
+   *
+   * NexthopInfo carries information about:
+   *  1. nexthop reachability
+   *  2. IGP cost
+   *  3. List of all BgpRouteInfo objects associated with the nexthop prefix.
+   */
+  folly::F14NodeMap<folly::IPAddress, facebook::bgp::NexthopInfo>
+      nexthopInfoMap_;
+
+ protected:
+  // Fib Agent Related Information
+  uint16_t fibAgentPort_;
+  uint32_t fibAgentRecvTimeout_;
+
+ private:
+  // temporary flag for rolling out rib-allocated path ID
+  // TODO: deprecate/remove once rollout is stable
+  bool enableRibAllocatedPathId_{false};
+
+  uint32_t ribOutQHighWatermark_{kRibOutQueueSizePauseThreshold};
+
+  /*
+   * RIB version counter - monotonically increasing value that increments
+   * whenever a material change occurs (best path or multipath changes).
+   * Used for tracking how caught up each peer is with RIB state.
+   */
+  uint64_t ribVersion_{0};
+
+// per class placeholder for test code injection
+// only need to be setup once here
+#ifdef RibBase_TEST_FRIENDS
+  RibBase_TEST_FRIENDS
+#endif
+      friend class RibFixture;
+};
+
+} // namespace facebook::bgp

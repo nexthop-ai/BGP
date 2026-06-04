@@ -1,0 +1,1587 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "fboss/agent/AddressUtil.h"
+#include "neteng/fboss/bgp/cpp/BgpProfiler.h"
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRib.h"
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRibCommon.h"
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRibGroup.h"
+#include "neteng/fboss/bgp/cpp/adjrib/WellKnownCommunityFilter.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
+
+using namespace facebook::nettools::bgplib;
+
+DEFINE_bool(
+    enable_rib_path_data_exporting,
+    false,
+    "Enable RibPathData exporting to thrift stream subscriber (e.g. MpBgpMonitor)");
+
+namespace facebook::bgp {
+
+/*
+ * @brief  process shadow rib entries as they are consumed from
+ *         changeList. Every adjRib instance when it consumes
+ *         from changeList would go through this function.
+ *
+ * @param  srEntry - shadow Rib entry consumed from the changeList
+ *
+ * @return void
+ */
+void AdjRib::processShadowRibEntryChange(ShadowRibEntry& srEntry) noexcept {
+  /*
+   * The adjRib is activated to consume from changeListTracker immediately
+   * as RibDumpReq sends EoR. However, it is possible that
+   */
+  if (!egressEoRsSent_) {
+    XLOGF(
+        DBG1,
+        "Ignoring changeList announcement for {} before sending initial dump",
+        getPeerName());
+    return;
+  }
+
+  if (sendAddPath_) {
+    for (const auto& [_, multipath] : srEntry.multipaths) {
+      if (!multipath) {
+        continue;
+      }
+      if (isShadowRibRouteInUpdate(multipath->flags)) {
+        RibOutAnnouncementEntry entry(
+            srEntry.prefix,
+            multipath->pathIdToSend,
+            multipath->peer,
+            multipath->attrs,
+            srEntry.switchId,
+            srEntry.multiPathSize,
+            srEntry.aggregateReceivedUcmpWeight,
+            srEntry.aggregateLocalUcmpWeight,
+            srEntry.ribPolicyUcmpWeight);
+        entry.newlyInstalledInLocalRib = srEntry.newlyInstalledInLocalRib;
+        entry.installTimeStamp = srEntry.installTimeStamp;
+        entry.ribVersion = srEntry.ribVersion;
+        handleRibAnnouncedEntry(entry, false);
+      } else if (isShadowRibRouteInWithdraw(multipath->flags)) {
+        /*
+         * Withdrawal announcements from RIB don't have attrs, however
+         * when we are processing withdrawal here, it is a priori
+         * shadow RIB entry that was existing with attrs in place (the
+         * entry yet has not been reset for multipath) and hence it
+         * should have attrs available to get the nexthop value
+         *
+         * Thus, we would never expect nullptr to attrs here. The check
+         * here is simply a safety check
+         */
+        if (multipath->attrs) {
+          // TODO: we don't need a full RibOutWithdrawal entry here, do we?
+          RibOutWithdrawalEntry entry(
+              srEntry.prefix,
+              multipath->pathIdToSend,
+              multipath->attrs->getNexthop());
+          uint32_t pathId = enableRibAllocatedPathId_
+              ? multipath->pathIdToSend
+              : pathIdGenerator_->getPathId(
+                    entry.prefix, entry.nh.value_or(folly::IPAddress()));
+          processRibWithdraw(entry.prefix, pathId);
+        } else {
+          XLOGF(
+              ERR,
+              "Unexpected null attr for multipath when processing "
+              "withdrawal for shadowrib entry. prefix {}, peer {}",
+              folly::IPAddress::networkToString(srEntry.prefix),
+              getPeerName());
+        }
+      }
+    }
+  } else {
+    if (!srEntry.bestpath) {
+      return;
+    }
+    if (isShadowRibRouteInUpdate(srEntry.bestpath->flags)) {
+      RibOutAnnouncementEntry entry(
+          srEntry.prefix,
+          kDefaultPathID,
+          srEntry.bestpath->peer,
+          srEntry.bestpath->attrs,
+          srEntry.switchId,
+          srEntry.multiPathSize,
+          srEntry.aggregateReceivedUcmpWeight,
+          srEntry.aggregateLocalUcmpWeight,
+          srEntry.ribPolicyUcmpWeight);
+      entry.newlyInstalledInLocalRib = srEntry.newlyInstalledInLocalRib;
+      entry.installTimeStamp = srEntry.installTimeStamp;
+      entry.ribVersion = srEntry.ribVersion;
+      handleRibAnnouncedEntry(entry, false);
+    } else if (isShadowRibRouteInWithdraw(srEntry.bestpath->flags)) {
+      /*
+       * Withdrawal announcements from RIB don't have attrs, however
+       * when we are processing withdrawal here, it is a priori
+       * shadow RIB entry that was existing with attrs in place (the
+       * entry yet has not been reset for bestpath) and hence it
+       * should have attrs available to get the nexthop value
+       *
+       * Thus, we would never expect nullptr to attrs here. The check
+       * here is simply a safety check
+       */
+      if (srEntry.bestpath->attrs) {
+        // TODO: we don't need a full RibOutWithdrawal entry here, do we?
+        RibOutWithdrawalEntry entry(
+            srEntry.prefix,
+            kDefaultPathID,
+            srEntry.bestpath->attrs->getNexthop());
+        uint32_t pathId = enableRibAllocatedPathId_
+            ? kDefaultPathID
+            : pathIdGenerator_->getPathId(
+                  entry.prefix, entry.nh.value_or(folly::IPAddress()));
+        processRibWithdraw(entry.prefix, pathId);
+      } else {
+        XLOGF(
+            ERR,
+            "Unexpected null attr for bestpath when processing "
+            "withdrawal for shadowrib entry. prefix {}, peer {}",
+            folly::IPAddress::networkToString(srEntry.prefix),
+            getPeerName());
+      }
+    }
+  }
+
+  return;
+}
+
+void AdjRib::processRibMessage(const RibOutMessage& ribMsg) noexcept {
+  folly::variant_match(
+      ribMsg,
+      [this](const RibOutAnnouncement& announcement) {
+        processRibOutAnnouncement(announcement);
+      },
+      [this](const RibOutWithdrawal& withdrawal) {
+        processRibOutWithdrawal(withdrawal);
+      },
+      [](const ShadowRibOutAnnouncement&) {},
+      [](const ShadowRibOutWithdrawal&) {},
+      [](const RibInitialAnnouncementStart& /* unused*/) {},
+      [](const RibOutNexthopResolutionReceived& /* unused*/) {});
+
+  if (!enableEgressQueueBackpressure_) {
+    attrToPrefixMap_.clear();
+  }
+}
+
+void AdjRib::scheduleSendBgpUpdates(bool tryPullNewChangeItems) noexcept {
+  if (!sendCoroScheduled_ && asyncScope_ &&
+      !asyncScope_->isScopeCancellationRequested()) {
+    asyncScope_->add(
+        co_withExecutor(&evb_, sendBgpUpdates(tryPullNewChangeItems)));
+    sendCoroScheduled_ = true;
+  }
+}
+
+/**
+ * This method is cancellation-aware because of the underlying queue
+ * implementation using a folly::fibers::Semaphore with D21655946.
+ * When cancellation is requested on the asyncScope_, the co_wait from
+ * the semaphore in waitToPush will return with OperationCancelled,
+ * and cancellation will be propagated upwards from the semaphore to callers.
+ */
+folly::coro::Task<bool> AdjRib::waitForQueueSpace() noexcept {
+  /* Record if we experienced a write block when checking to wait. */
+  bool writeBlocked = boundedAdjRibOutQueue_->isBlocked();
+  if (writeBlocked) {
+    BgpStats::incrementEgressQueueBackpressuredEvents();
+    stats_.incrementEgressQueueBackpressuredEvents();
+
+    /*
+     * Cancel packing timers if queue is blocked as the peer has not
+     * handled the queued updates quickly enough. We cannot take more updates
+     * into the packing list when backpressured.
+     */
+    cancelPackingTimers();
+    auto stateBeforeBlock = peerState_;
+    if (enableUpdateGroup_ && isDetachedPeer()) {
+      XLOGF(
+          DBG3,
+          "Peer {}: State Transition: {} -> {}",
+          getPeerName(),
+          peerState_,
+          PeerUpdateState::DETACHED_BLOCKED);
+      setPeerState(PeerUpdateState::DETACHED_BLOCKED);
+    }
+    auto beforeWait = getCurrentTimeMs();
+    co_await boundedAdjRibOutQueue_->waitToPush();
+
+    stats_.setLastEgressQueueBlockTime(beforeWait);
+    stats_.addEgressQueueBlockDuration(getCurrentTimeMs() - beforeWait);
+    if (enableUpdateGroup_ && peerState_ == PeerUpdateState::DETACHED_BLOCKED) {
+      XLOGF(
+          DBG3,
+          "Peer {}: State Transition: {} -> {}",
+          getPeerName(),
+          peerState_,
+          stateBeforeBlock);
+      setPeerState(stateBeforeBlock);
+    }
+  }
+  /* Now we are unblocked; return whether or not we experienced blocking. */
+  co_return writeBlocked;
+}
+
+void AdjRib::cancelPackingTimers() noexcept {
+  if (changeListConsumeTimer_ && changeListConsumeTimer_->isScheduled()) {
+    XLOGF(
+        DBG2, "Canceled changeListConsumeTimer_ timeout for {}", getPeerName());
+
+    changeListConsumeTimer_->cancelTimeout();
+  }
+
+  if (outDelayTimer_ && outDelayTimer_->isScheduled()) {
+    XLOGF(DBG2, "Canceled outDelayTimer_ timeout for {}", getPeerName());
+
+    outDelayTimer_->cancelTimeout();
+  }
+}
+
+void AdjRib::reschedulePackingTimers() noexcept {
+  if (changeListConsumeTimer_ && !changeListConsumeTimer_->isScheduled()) {
+    XLOGF(
+        DBG2,
+        "Rescheduled changeListConsumeTimer_ of {} millisecs for {}.",
+        mraiInterval,
+        getPeerName());
+
+    changeListConsumeTimer_->scheduleTimeout(mraiInterval);
+  }
+
+  if (!outDelayPQ_.empty() && outDelayTimer_ &&
+      !outDelayTimer_->isScheduled()) {
+    XLOGF(
+        DBG2,
+        "Rescheduled outDelayTimer_ of {} millisecs for {}.",
+        kRescheduleOutDelayTimeoutMs,
+        getPeerName());
+
+    outDelayTimer_->scheduleTimeout(kRescheduleOutDelayTimeoutMs);
+  }
+}
+
+folly::coro::Task<void> AdjRib::sendBgpUpdates(
+    bool tryPullNewChangeItems) noexcept {
+  uint64_t bgpMessageCnt = 0;
+  uint64_t withdrawPrefixCnt = 0;
+  uint64_t announcePrefixCnt = 0;
+  uint16_t eorCnt = 0;
+  bool backpressured = false;
+
+  while (!attrToPrefixMap_.empty()) {
+    /* Check for asyncScope cancellation. */
+    co_await folly::coro::co_safe_point;
+
+    /* Wait for queue space before building an update to write to queue. */
+    backpressured |= co_await waitForQueueSpace();
+    if (backpressured && shouldExitEarlyOnBackPressure(tryPullNewChangeItems)) {
+      break;
+    }
+    /*
+     * If we were backpressured and resume here, it is currently possible for
+     * the map to be cleared if the peer session flaps. This check can be
+     * removed once we properly implement cancellation in sessionTerminated.
+     * Here we need to check one more time to make sure that the map is not
+     * empty before taking the begin iterator.
+     */
+    if (attrToPrefixMap_.empty()) {
+      break;
+    }
+    auto it = attrToPrefixMap_.begin();
+    auto& [attrWithAfi, pfxSet] = *it;
+    const auto& attr = attrWithAfi.attrs;
+    const auto afi = attrWithAfi.afi;
+    auto update = buildUpdateWithSizeEstimation(attrWithAfi, pfxSet);
+    if (update) {
+      /* Update counters and statistics. */
+      ++bgpMessageCnt;
+      if (attr) {
+        announcePrefixCnt += update->mpAnnounced()->prefixes()->size();
+      } else {
+        if (afi == BgpUpdateAfi::AFI_IPv4) {
+          withdrawPrefixCnt += update->v4Withdrawn2()->size();
+        } else if (afi == BgpUpdateAfi::AFI_IPv6) {
+          withdrawPrefixCnt += update->mpWithdrawn()->prefixes()->size();
+        }
+      }
+      /*
+       * We waited for the queue to be unblocked before building the message;
+       * guaranteed to succeed writing.
+       */
+      boundedAdjRibOutQueue_->push(std::move(update));
+    }
+    /*
+     * Move onto next attr if we sent all of the prefixes for current attr.
+     * This is guaranteed to happen because attrToPrefixMap cannot be
+     * updated between the start and end of sendBgpUpdates, as we cancel
+     * all packing timers. Otherwise we would be in an infinite loop.
+     */
+    if (pfxSet.empty()) {
+      attrToPrefixMap_.erase(it);
+    }
+  }
+
+  /* Queue EoRs if we just finished sending RIB initial announcement. */
+  if (egressEoRsPending_) {
+    auto [writeBlocked, numEoRs] = co_await sendPendingEoRs();
+    backpressured |= writeBlocked;
+    eorCnt = numEoRs;
+    bgpMessageCnt += eorCnt;
+  }
+  stats_.incrementSentUpdateMsgs(bgpMessageCnt);
+  XLOGF_IF(
+      INFO,
+      bgpMessageCnt > 0,
+      "Sending accumulated changes to {}."
+      "({} withdraws, {} announcements, EoR {}) - {} BGP message(s). "
+      "Backpressured = {}",
+      getPeerName(),
+      withdrawPrefixCnt,
+      announcePrefixCnt,
+      eorCnt,
+      bgpMessageCnt,
+      backpressured);
+  sendCoroScheduled_ = false;
+
+  if (enableUpdateGroup_) {
+    maybeTransitionDetachedReadyToJoin();
+  } else {
+    reschedulePackingTimers();
+  }
+  co_return;
+}
+
+folly::coro::Task<std::pair<bool, uint16_t>>
+AdjRib::sendPendingEoRs() noexcept {
+  XLOGF(INFO, "Sending EoR to peer {}", getPeerName());
+  /* Check for asyncScope cancellation. */
+  co_await folly::coro::co_safe_point;
+
+  uint16_t bgpMessageCnt{0};
+  bool backpressured = false;
+  /* Send out to FiberBgpPeerManager to send via socket */
+  if (isAfiIpv4Negotiated_) {
+    backpressured |= co_await waitForQueueSpace();
+    bgpMessageCnt++;
+    boundedAdjRibOutQueue_->push(buildEndOfRib(BgpUpdateAfi::AFI_IPv4));
+  }
+  if (isAfiIpv6Negotiated_) {
+    backpressured |= co_await waitForQueueSpace();
+    bgpMessageCnt++;
+    boundedAdjRibOutQueue_->push(buildEndOfRib(BgpUpdateAfi::AFI_IPv6));
+  }
+  /* Send out egressEoR notification to peer manager for initialization. */
+  fromAdjRibQ_.push({*remotePeerId_, EgressEoR{}});
+
+  /* Mark egressEoR being sent as a one-time flag for initialization */
+  egressEoRsSent_ = true;
+  /* We finished sending EoR; set it as no longer pending. */
+  egressEoRsPending_ = false;
+  eorSentTime_ = getCurrentTimeMs();
+  logPeerEvent("SESSION_EOR_SENT", BGP_LOG_SRC());
+
+  co_return std::make_pair(backpressured, bgpMessageCnt);
+}
+
+/**
+ * This can be used to pack all prefixes into the provided RiggedIPPrefix
+ * container up to an estimated limit, such that the final BgpUpdate2
+ * can be roughly serialized to 1 PDU. Used when backpressure is enabled.
+ *
+ * Highlighting two scenarios:
+ *   1. The approximate serialized attr length is smaller than the actual
+ *      length, and we overpacked prefixes.
+ *
+ *   2. The approximate serialized attr length is larger than the actual
+ *      length, and we underpacked prefixes.
+ *
+ * In both cases, the BgpUpdate2 that carries the @bgpUpdatePrefixes container
+ * is passed all the way to the FiberSocket. Serialization only happens
+ * after dequeueing from the last egress queue between AdjRibOut and
+ * socket. We aim to be within 1-2 messages after serialization; and socket
+ * currently writes EVERYTHING it serialized before dequeueing another
+ * BgpUpdate2.
+ */
+uint32_t AdjRib::packPrefixesWithLimit(
+    const uint32_t approximateSerializedAttrLen,
+    PrefixSet& prefixPathIds,
+    std::vector<RiggedIPPrefix>& bgpUpdatePrefixes) {
+  return packPrefixesWithLimitCommon(
+      approximateSerializedAttrLen,
+      prefixPathIds,
+      bgpUpdatePrefixes,
+      sendAddPath_,
+      getPeerName());
+}
+
+/**
+ * Used in sendBgpUpdates coro to build a BgpUpdate2 that can be serialized
+ * to roughly 1 PDU.
+ */
+std::shared_ptr<BgpUpdate2> AdjRib::buildUpdateWithSizeEstimation(
+    const BgpPathWithAfi& attrsWithAfi,
+    PrefixSet& prefixPathIds) noexcept {
+  if (prefixPathIds.empty()) {
+    return nullptr;
+  }
+  auto& postOutAttrs = attrsWithAfi.attrs;
+  auto afi = attrsWithAfi.afi;
+  std::shared_ptr<BgpUpdate2> update;
+  if (postOutAttrs) {
+    /* Case 1: Announcement. */
+    /* Set the new nexthop on the BgpUpdate2 message. */
+    auto newNexthop = getNewNexthopFromAttributesOut(
+        afi == BgpUpdateAfi::AFI_IPv4 /* isV4 */,
+        postOutAttrs,
+        attrsWithAfi.isNexthopSetByPolicy);
+
+    update = postOutAttrs->getBgpUpdate2();
+    update->mpAnnounced()->afi() = afi;
+    update->mpAnnounced()->safi() = BgpUpdateSafi::SAFI_UNICAST;
+    update->mpAnnounced()->nexthop() = network::toBinaryAddress(newNexthop);
+    update->attrs()->nexthop() = newNexthop.str();
+
+    packPrefixesWithLimit(
+        kApproxSerializedAttrLen,
+        prefixPathIds,
+        *update->mpAnnounced()->prefixes());
+
+    if (afi == BgpUpdateAfi::AFI_IPv4) {
+      stats_.incrementSentAnnouncementsIpv4();
+    } else if (afi == BgpUpdateAfi::AFI_IPv6) {
+      stats_.incrementSentAnnouncementsIpv6();
+    }
+
+  } else {
+    /* Case 2: Withdrawal. */
+    update = std::make_shared<BgpUpdate2>();
+    if (afi == BgpUpdateAfi::AFI_IPv4) {
+      packPrefixesWithLimit(
+          0 /* approxAttrLen */, prefixPathIds, *update->v4Withdrawn2());
+    } else if (afi == BgpUpdateAfi::AFI_IPv6) {
+      packPrefixesWithLimit(
+          0 /* approxAttrLen */,
+          prefixPathIds,
+          *update->mpWithdrawn()->prefixes());
+      update->mpWithdrawn()->afi() = BgpUpdateAfi::AFI_IPv6;
+      update->mpWithdrawn()->safi() = BgpUpdateSafi::SAFI_UNICAST;
+    }
+    stats_.incrementSentWithdrawals();
+  }
+  return update;
+}
+
+void AdjRib::buildAndSendBgpMessages(bool sendWithEoR) noexcept {
+  ScopedProfile profile("AdjRib::buildAndSendBgpMessages");
+  // Return early if nothing to announce/withdraw.
+  if (attrToPrefixMap_.empty() && !sendWithEoR) {
+    return;
+  }
+
+  uint64_t bgpMessageCnt{0};
+  // TODO: Merge withdraw and updates into same message. We need delay timer
+  //       to merge as they come in separate messages.
+  auto withdrawPrefixCnt = buildAndQueueWithdrawals(bgpMessageCnt);
+  auto announcePrefixCnt = buildAndQueueAnnouncements(bgpMessageCnt);
+  if (sendWithEoR) {
+    buildAndQueueEoRs(bgpMessageCnt);
+  }
+
+  stats_.incrementSentUpdateMsgs(bgpMessageCnt);
+  XLOGF(
+      INFO,
+      "Sending accumulated changes to {}."
+      "({} withdraws, {} announcements, EoR {}) - {} BGP message(s).",
+      getPeerName(),
+      withdrawPrefixCnt,
+      announcePrefixCnt,
+      sendWithEoR,
+      bgpMessageCnt);
+
+  // temp collection cleanup
+  attrToPrefixMap_.clear();
+}
+
+/**
+ * This can be used to pack all prefixes into the provided RiggedIPPrefix
+ * container with no limit. Used when backpressure is not enabled.
+ * This method will be removed when backpressure is enabled by default
+ * and the feature flag is removed.
+ */
+uint32_t AdjRib::packPrefixes(
+    PrefixSet& prefixPathIds,
+    std::vector<RiggedIPPrefix>& bgpUpdatePrefixes) {
+  return packPrefixesCommon(
+      prefixPathIds, bgpUpdatePrefixes, sendAddPath_, getPeerName());
+}
+
+uint32_t AdjRib::buildAndQueueAnnouncements(uint64_t& bgpMessageCnt) noexcept {
+  uint32_t prefixesAnnounced = 0;
+  // Start packing updates from attrToPrefixMap_
+  for (auto& [attrsWithAfi, prefixPathIds] : attrToPrefixMap_) {
+    auto& postOutAttrs = attrsWithAfi.attrs;
+    auto afi = attrsWithAfi.afi;
+    if (!postOutAttrs) {
+      // Ignore withdrawals.
+      continue;
+    }
+    if (prefixPathIds.empty()) {
+      continue;
+    }
+
+    /* Set the new nexthop on the BgpUpdate2 message. */
+    auto newNexthop = getNewNexthopFromAttributesOut(
+        afi == BgpUpdateAfi::AFI_IPv4 /* isV4 */,
+        postOutAttrs,
+        attrsWithAfi.isNexthopSetByPolicy);
+
+    auto update = postOutAttrs->getBgpUpdate2();
+    update->mpAnnounced()->afi() = afi;
+    update->mpAnnounced()->safi() = BgpUpdateSafi::SAFI_UNICAST;
+    update->mpAnnounced()->nexthop() = network::toBinaryAddress(newNexthop);
+    update->attrs()->nexthop() = newNexthop.str();
+
+    prefixesAnnounced +=
+        packPrefixes(prefixPathIds, *update->mpAnnounced()->prefixes());
+
+    // Enqueue update
+    bgpMessageCnt++;
+    adjRibOutQueue_->push(std::move(update));
+
+    if (afi == BgpUpdateAfi::AFI_IPv4) {
+      stats_.incrementSentAnnouncementsIpv4();
+    } else if (afi == BgpUpdateAfi::AFI_IPv6) {
+      stats_.incrementSentAnnouncementsIpv6();
+    } else {
+      XLOGF(WARN, "Unexpected BgpUpdateAfi: {}", static_cast<int>(afi));
+    }
+  }
+  return prefixesAnnounced;
+}
+
+void AdjRib::buildAndSendRouteRefresh(
+    const nettools::bgplib::BgpRouteRefreshMessageSubtype& subtype) noexcept {
+  // Get the negotiated AFI and SAFI
+  if (isAfiIpv4Negotiated_) {
+    adjRibOutQueue_->push(buildRouteRefresh(
+        BgpUpdateAfi::AFI_IPv4, subtype, BgpUpdateSafi::SAFI_UNICAST));
+  }
+  if (isAfiIpv6Negotiated_) {
+    adjRibOutQueue_->push(buildRouteRefresh(
+        BgpUpdateAfi::AFI_IPv6, subtype, BgpUpdateSafi::SAFI_UNICAST));
+  }
+}
+
+uint32_t AdjRib::buildAndQueueWithdrawals(uint64_t& bgpMessageCnt) noexcept {
+  auto v4Itr = attrToPrefixMap_.find(
+      BgpPathWithAfi{nullptr /* withdrawal */, BgpUpdateAfi::AFI_IPv4});
+  auto v6Itr = attrToPrefixMap_.find(
+      BgpPathWithAfi{nullptr /* withdrawal */, BgpUpdateAfi::AFI_IPv6});
+  bool hasV4 = v4Itr != attrToPrefixMap_.end();
+  bool hasV6 = v6Itr != attrToPrefixMap_.end();
+
+  if (!hasV4 && !hasV6) {
+    return 0;
+  }
+
+  uint32_t prefixesWithdrawn = 0;
+  auto update = std::make_shared<BgpUpdate2>();
+  // Pack v4 withdrawals.
+  if (hasV4) {
+    prefixesWithdrawn += packPrefixes(v4Itr->second, *update->v4Withdrawn2());
+  }
+
+  // Pack v6 withdrawals.
+  if (hasV6) {
+    prefixesWithdrawn +=
+        packPrefixes(v6Itr->second, *update->mpWithdrawn()->prefixes());
+    update->mpWithdrawn()->afi() = BgpUpdateAfi::AFI_IPv6;
+    update->mpWithdrawn()->safi() = BgpUpdateSafi::SAFI_UNICAST;
+  }
+
+  if (prefixesWithdrawn > 0) {
+    stats_.incrementSentWithdrawals();
+    bgpMessageCnt++;
+    adjRibOutQueue_->push(std::move(update));
+  }
+  return prefixesWithdrawn;
+}
+
+void AdjRib::buildAndQueueEoRs(uint64_t& bgpMessageCnt) noexcept {
+  XLOGF(INFO, "Sending EoR to peer {}", getPeerName());
+
+  // mark egressEoR being sent as a one-time flag for initialization
+  egressEoRsSent_ = true;
+  egressEoRsPending_ = false;
+  eorSentTime_ = getCurrentTimeMs();
+  logPeerEvent("SESSION_EOR_SENT", BGP_LOG_SRC());
+
+  // send out egressEoR notification to peer manager for initialization
+  fromAdjRibQ_.push({*remotePeerId_, EgressEoR{}});
+
+  // send out to FiberBgpPeerManager to send via socket
+  if (isAfiIpv4Negotiated_) {
+    bgpMessageCnt++;
+    adjRibOutQueue_->push(buildEndOfRib(BgpUpdateAfi::AFI_IPv4));
+  }
+  if (isAfiIpv6Negotiated_) {
+    bgpMessageCnt++;
+    adjRibOutQueue_->push(buildEndOfRib(BgpUpdateAfi::AFI_IPv6));
+  }
+}
+
+void AdjRib::processRibOutAnnouncement(
+    const RibOutAnnouncement& announcement) noexcept {
+  if (!egressEoRsSent_ && !announcement.initialDump) {
+    XLOGF(
+        DBG1,
+        "Ignoring Rib announcement for {} before sending initial dump",
+        getPeerName());
+    return;
+  }
+
+  const auto& entries =
+      sendAddPath_ ? announcement.addPathEntries : announcement.entries;
+
+  for (const auto& entry : entries) {
+    handleRibAnnouncedEntry(entry, announcement.initialDump);
+  }
+  scheduleOutDelayTimer();
+  if (announcement.sendWithEoR) {
+    egressEoRsPending_ = true;
+  }
+  if (!enableEgressQueueBackpressure_) {
+    buildAndSendBgpMessages(announcement.sendWithEoR);
+  }
+}
+
+void AdjRib::handleRibAnnouncedEntry(
+    const RibOutAnnouncementEntry& entry,
+    bool initialDump) noexcept {
+  XLOGF(
+      DBG5,
+      "Processing Rib announcement of {} for peer {}",
+      folly::IPAddress::networkToString(entry.prefix),
+      getPeerName());
+  // ignore unsupported afi
+  if (!AdjRibCommonUtils::isAfiNegotiated(
+          entry.prefix, isAfiIpv4Negotiated_, isAfiIpv6Negotiated_)) {
+    XLOGF(
+        DBG4,
+        "Ignore RibAnnouncement of prefix {}: AFI is not supported for {}.",
+        folly::IPAddress::networkToString(entry.prefix),
+        getPeerName());
+    return;
+  }
+  // sanity check
+  if (!canAnnounceEntry(entry)) {
+    handleImplicitWithdrawal(
+        entry.prefix, entry.attrs->getNexthop(), entry.pathIdToSend);
+    return;
+  }
+
+  // if processOutDelay returns false we are not deferring the prefix
+  // update due to out-delay. if the prefix is not already deferred
+  // then newEntryDeferred will be set.
+  bool outDelay{false}, newEntryDeferred{false};
+  if (!initialDump) {
+    std::tie(outDelay, newEntryDeferred) = processOutDelay(entry);
+  }
+  if (!outDelay) {
+    processRibAnnouncedEntry(entry);
+  } else if (newEntryDeferred) {
+    newDeferredPrefixes_.emplace_back(entry.prefix);
+  }
+
+  // Update cached RIB version to track how caught up this peer is
+  setLastSeenRibVersion(entry.ribVersion);
+}
+
+void AdjRib::scheduleOutDelayTimer(void) noexcept {
+  if (newDeferredPrefixes_.empty()) {
+    return;
+  }
+
+  // Enqueue the new out-delay timer if newEntryDeferred is set from
+  // above.
+  auto delayTimeStamp = std::chrono::system_clock::now() + outDelay_;
+  outDelayPQ_.emplace(delayTimeStamp, std::move(newDeferredPrefixes_));
+  // if timer is running we don't need to do anything.
+  // else fire a new out-delay timer.
+  if (!outDelayTimer_ || !outDelayTimer_->isScheduled()) {
+    XLOGF(
+        DBG4,
+        "Starting outDelay timer_ of {} secs for {}.",
+        outDelay_.count(),
+        getPeerName());
+
+    outDelayTimer_ = folly::AsyncTimeout::schedule(
+        std::chrono::duration_cast<std::chrono::milliseconds>(outDelay_),
+        evb_,
+        [this]() noexcept { this->programOutDelayTimer(); });
+  }
+  newDeferredPrefixes_.clear();
+}
+
+bool AdjRib::canAnnounce(const RibOutAnnouncementEntry& update) noexcept {
+  // Do not send out to the peer from which we learnt this route
+  // NOTE Here we only use peer Addr, maybe also need to check the bgpId?
+  if ((update.peer.addr == peeringParams_.peerAddr) &&
+      ((!peeringParams_.peerAddr.isLoopback()) ||
+       (!peeringParams_.allowLoopbackReflection))) {
+    XLOGF(
+        DBG4,
+        "Not advertising prefix {} to {}. Reason: Learnt from the same peer",
+        folly::IPAddress::networkToString(update.prefix),
+        getPeerName());
+    return false;
+  }
+
+  if (isIBgpPeer()) {
+    if (peeringParams_.isRrClient) {
+      XLOGF(
+          DBG4,
+          "Permit prefix announcement {} to IBGP peer {}. "
+          "Reason: Peer is RR client",
+          folly::IPAddress::networkToString(update.prefix),
+          getPeerName());
+      return true;
+    }
+
+    // Announce eBGP learnt routes, local routes and RR client routes to
+    // non RR peer
+    // Local routes will have addr.isZero()
+    if (update.peer.sessionType != BgpSessionType::IBGP ||
+        update.peer.addr.isZero() || update.peer.isRrClient) {
+      XLOGF(
+          DBG4,
+          "Permit prefix announcement {} to IBGP peer {}. "
+          "Reason: EBGP learnt route | Local Route | RRC Learnt Route",
+          folly::IPAddress::networkToString(update.prefix),
+          getPeerName());
+      return true;
+    }
+
+    XLOGF(
+        DBG4,
+        "Not advertising prefix {} to {}. Reason: Learnt from same AS",
+        folly::IPAddress::networkToString(update.prefix),
+        getPeerName());
+    return false;
+  }
+  return true;
+}
+
+/*
+ * When update-group is enabled, use the group-level check to stay
+ * consistent with the group processing path, which skips the per-peer
+ * same-peer filter (split-horizon is deferred to per-peer distribution).
+ */
+bool AdjRib::canAnnounceEntry(const RibOutAnnouncementEntry& update) noexcept {
+  if (enableUpdateGroup_ && adjRibOutGroup_) {
+    return adjRibOutGroup_->canAnnounceForGroup(update);
+  }
+  if (!canAnnounce(update)) {
+    return false;
+  }
+  if (sender_suppress_as_loop_ && suppressLoopedAdvertisements(update.attrs)) {
+    return false;
+  }
+  /*
+   * RFC 1997 well-known community egress filter. Gated by gflag so the
+   * rollout is bisectable and rollback is instant. When the flag is off
+   * the behavior is unchanged (routes carrying well-known communities
+   * continue to be advertised, preserving the historical behavior).
+   *
+   * The filter wrapper is shared with the group-level path
+   * (AdjRibOutGroup::canAnnounceForGroup) so the decision + logging +
+   * counter side-effects stay in lock-step regardless of update-grouping.
+   */
+  if (FLAGS_enable_well_known_community_filter &&
+      applyWellKnownCommunityFilter(
+          update.attrs, getBgpSessionType(), getPeerName(), update.prefix)) {
+    return false;
+  }
+  return true;
+}
+
+bool AdjRib::suppressLoopedAdvertisements(
+    const std::shared_ptr<const facebook::bgp::BgpPath>& attrs) noexcept {
+  auto remoteAs = facebook::bgp::AsNum(peeringParams_.remoteAs);
+  // Determine if remote AS exists in the as path (so that remote would reject
+  // it)
+  // Note: its check is less than hasAsPathLoop it will check confed_as or
+  // global_as depending whether it is confed peer, as it has only one remote_as
+  // Motivation: https://fburl.com/gdoc/4cm17y05
+  if (isIBgpPeer()) {
+    return false;
+  }
+
+  if (peeringParams_.isConfedPeer) {
+    for (const auto& seg : attrs->getAsPath().get()) {
+      if (std::find(
+              seg.asConfedSequence.cbegin(),
+              seg.asConfedSequence.cend(),
+              remoteAs) != seg.asConfedSequence.cend()) {
+        return true;
+      }
+      if (seg.asConfedSet.contains(remoteAs)) {
+        return true;
+      }
+    }
+  } else {
+    for (const auto& seg : attrs->getAsPath().get()) {
+      if (seg.asSet.contains(remoteAs)) {
+        return true;
+      }
+      if (std::find(seg.asSequence.cbegin(), seg.asSequence.cend(), remoteAs) !=
+          seg.asSequence.cend()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// TODO (D6882628): We are applying policy per Rib announcement entry. We can
+// see if we can optimize by trying to group prefixes based on attributes from
+// RIB message and applyPolicy. (If policy applying cost is more than grouping
+// cost) For incremental announcements as rib aggregates messages from multiple
+// peers and accumulates with delay, it may not be worth it. Even for initial
+// dump of route table as we advertise only couple of routes from each RSW,
+// number of routes sharing preOutAttrs with same values is very small,
+// annecdotally < 4. As we create separate shared_ptr for preInAttrs from
+// multiple peers unless we do deep compare/deep hashing we cannot determine
+// which prefixes to group. Overall I feel with current design and deployments
+// it's not worth it.
+void AdjRib::processRibAnnouncedEntry(
+    const RibOutAnnouncementEntry& update) noexcept {
+  const std::string updatePeerIdStr =
+      BgpPeerId(update.peer.addr, update.peer.routerId).str();
+
+  auto adjRibEntry = tryInsertRibOutEntry(
+      update.prefix, update.attrs->getNexthop(), update.pathIdToSend);
+  CHECK(adjRibEntry);
+  stats_.updateAttributeSizes(update.attrs);
+  adjRibEntry->setPreOut(update.attrs);
+  adjRibEntry->setRibVersion(update.ribVersion);
+
+  // apply per-peer-lbw-config for AdvertiseLBW
+  // lbw-policy is applied afterwards, which takes precedence over
+  // per-peer-config
+  auto prePolicyAttrs = update.attrs->clone();
+  updateAdvertiseLbwExtCommunity(update, prePolicyAttrs);
+
+  // Get post policy attributes
+  // Look up in the cache - if found just clone the result
+  // Else run thru policy and store result in cache, clone the cached copy
+  const auto& [policyCachedAttrs, postPolicyInfo] =
+      getPostOutPolicyAttributesAndInfo(
+          update, adjRibEntry, prePolicyAttrs, updatePeerIdStr);
+
+  /* Store flag on AdjRibEntry for CLI display (AdjRibShow). */
+  adjRibEntry->setNexthopSetByPolicy(postPolicyInfo.isNexthopSetByPolicy);
+
+  if (!policyCachedAttrs) {
+    PeerStats::incrRejectedOutboundRoutes();
+    // Policy blocked this prefix
+    tryInsertWithdrawal(
+        update.prefix,
+        adjRibEntry,
+        fmt::format(
+            "Withdrawing {} from [{}]. "
+            "Reason: Blocked prefix by policy. (Previously announced to peer)",
+            folly::IPAddress::networkToString(update.prefix),
+            updatePeerIdStr),
+        fmt::format(
+            "Ignoring Rib announcement {} from [{}]. "
+            "Reason: Blocked prefix by policy. (Not previously announced to peer)",
+            folly::IPAddress::networkToString(update.prefix),
+            updatePeerIdStr));
+    return;
+  }
+
+  auto newNexthop = getNewNexthopFromAttributesOut(
+      update.prefix.first.isV4(), policyCachedAttrs);
+
+  // ignore announcement with unsupported nexthop encoding
+  if (!newNexthop.empty() && !isNexthopSupported(update.prefix, newNexthop)) {
+    XLOGF(
+        DBG4,
+        "Ignore RibAnnouncement of prefix {} with nexthop {}: Nexthop encoding "
+        "is not supported for {}.",
+        folly::IPAddress::networkToString(update.prefix),
+        newNexthop.str(),
+        getPeerName());
+    return;
+  }
+
+  /*
+   * Prefix is permitted from egress policy.
+   * Attributes needs to be updated before sending to packing list.
+   *
+   * NOTE: directly modifying prePolicyAttrs will make cache miss since it is
+   * used as the policy cache key. Clone it for modification.
+   */
+  auto postOutAttrsNew = prePolicyAttrs->clone();
+  updateAttributesOutWithoutNexthopCommon(
+      PeerConfig{peeringParams_, egressPolicyName_, policyManager_.get()},
+      update,
+      policyCachedAttrs,
+      postOutAttrsNew,
+      postPolicyInfo);
+
+  /* Attributes will not change any more. Publish. */
+  postOutAttrsNew->publish();
+
+  // Check if we announced the prefix before
+  // post out is set if the prefix was previously announced
+  if (adjRibEntry->getPostAttr()) {
+    // Announce the prefix to peer again only if postOut has changed
+    // We are doing deep compare to avoid notifying peer in cases where
+    // due to policy changes of attributes, we end up with same contents
+    // but different BgpPath shared_ptr
+    if (*adjRibEntry->getPostAttr() == *postOutAttrsNew) {
+      XLOGF(
+          DBG3,
+          "Skip announcing {} from [{}] to {}. "
+          "Reason: Previously announced to peer",
+          folly::IPAddress::networkToString(update.prefix),
+          updatePeerIdStr,
+          getPeerName());
+      return;
+    }
+  } else {
+    // If we haven't announced the prefix before, increment sentPrefixCount
+    // as we are announcing the prefix this time
+    stats_.incrementPostOutPrefixCount(update.prefix.first.isV4());
+  }
+
+  XLOGF(
+      DBG3,
+      "Announcing {} from [{}] to {}.",
+      folly::IPAddress::networkToString(update.prefix),
+      updatePeerIdStr,
+      getPeerName());
+
+  auto prefixPathId = std::make_pair(update.prefix, adjRibEntry->getPathId());
+
+  auto oldPostAttr = adjRibEntry->getPostAttr();
+
+  // Set the post out
+  // Majority of the cases we update attributes with nexthop/AS-Path changes
+  // or policy changes, but in few cases where there is no change between
+  // preOut and postOut, this deep compare will save memory.
+  if (*postOutAttrsNew == *adjRibEntry->getPreOut()) {
+    auto preOutPostAttr = adjRibEntry->getPreOut();
+    stats_.updateAttributeSizes(preOutPostAttr);
+    adjRibEntry->setPostAttr(preOutPostAttr);
+  } else {
+    stats_.updateAttributeSizes(postOutAttrsNew);
+    adjRibEntry->setPostAttr(postOutAttrsNew);
+  }
+  tryUpdateAttrToPrefixMap(
+      prefixPathId,
+      oldPostAttr,
+      adjRibEntry->getPostAttr(),
+      postPolicyInfo.isNexthopSetByPolicy);
+}
+
+// Try inserting a ribOutEntry based on the prefix and next hop.
+// Return the existing one if the entry already exists; Otherwise,
+// create a new one and return it.
+AdjRibEntry* FOLLY_NULLABLE AdjRib::tryInsertRibOutEntry(
+    const folly::CIDRNetwork& prefix,
+    const folly::IPAddress& nexthop,
+    const uint32_t pathIdToSend) noexcept {
+  auto pathId = enableRibAllocatedPathId_
+      ? pathIdToSend
+      : pathIdGenerator_->getPathId(prefix, nexthop);
+
+  auto [adjRibEntry, _] =
+      getRibOutEntry(prefix, pathId, true /* copyOnWriteIfShared */);
+  if (!adjRibEntry) {
+    // Learning new route
+    XLOGF(
+        DBG4,
+        "Learning new prefix from Rib for {}: {}",
+        getPeerName(),
+        folly::IPAddress::networkToString(prefix));
+    stats_.incrementPreOutPrefixCount(prefix.first.isV4());
+    return addRibEntry(/*ingress=*/false, prefix, pathId);
+  }
+
+  XLOGF(
+      DBG4,
+      "Updating preOut attributes of prefix {} for {}",
+      folly::IPAddress::networkToString(prefix),
+      getPeerName());
+
+  return adjRibEntry;
+}
+
+std::pair<const std::shared_ptr<const BgpPath>, const PostPolicyInfo>
+AdjRib::getPostOutPolicyAttributesAndInfo(
+    const RibOutAnnouncementEntry& update,
+    AdjRibEntry* adjRibEntry,
+    const std::shared_ptr<const BgpPath>& prePolicyAttrs,
+    const std::string& updatePeerIdStr) {
+  std::shared_ptr<const BgpPath> policyResultAttrs{nullptr};
+  PostPolicyInfo postPolicyResultInfo;
+
+  // adjRibEntry must not be nullptr
+  // This check allows UT to surface assumption violation early
+  CHECK(adjRibEntry != nullptr);
+
+  // TODO: if policy has no prefix terms we can store a separate cache of
+  //       egress-policy and attrs which can then be applied across all prefixes
+  //       thus saving cache space.
+
+  // Even in presence of local-as policy cache lookup is fine.
+  // Because as-path-update is done on post-policy attrs.
+  if (egressPolicyConfigured()) {
+    // snapshot policyActionData
+    // This captures the original data, before update.attrs is
+    // updated to prePolicyAttrs
+    auto policyActionData = createPolicyActionData(
+        update.attrs,
+        update.switchId,
+        update.multiPathSize,
+        update.aggregateReceivedUcmpWeight,
+        update.aggregateLocalUcmpWeight,
+        update.ribPolicyUcmpWeight);
+
+    const auto& [attrs, postTermName, postPolicyInfo] =
+        getPostPolicyAttributesPolicyTermAndInfo(
+            *egressPolicyName_,
+            update.prefix,
+            prePolicyAttrs,
+            policyActionData);
+
+    policyResultAttrs = attrs;
+    postPolicyResultInfo = postPolicyInfo;
+    adjRibEntry->setPostOutPolicy(postTermName);
+  } else {
+    policyResultAttrs = prePolicyAttrs;
+  }
+
+  // see if egress route filter hard blocks this prefix
+  if (policyResultAttrs != nullptr &&
+      blockedByEgressRouteFilter(update, updatePeerIdStr)) {
+    policyResultAttrs = nullptr;
+    // this prefix was allowed by policy but blocked by crf, we update
+    // PostOutPolicy accordingly
+    adjRibEntry->setPostOutPolicy("Denied by CRF");
+  }
+  return {policyResultAttrs, postPolicyResultInfo};
+}
+
+const std::shared_ptr<const BgpPath> AdjRib::getPostOutPolicyAttributes(
+    const RibOutAnnouncementEntry& update,
+    AdjRibEntry* adjRibEntry,
+    const std::shared_ptr<const BgpPath>& prePolicyAttrs,
+    const std::string& updatePeerIdStr) {
+  return getPostOutPolicyAttributesAndInfo(
+             update, adjRibEntry, prePolicyAttrs, updatePeerIdStr)
+      .first;
+}
+
+bool AdjRib::shouldApplyNexthopSelf(
+    const std::shared_ptr<const BgpPath>& postOutAttrs,
+    bool isNexthopSetByPolicy) noexcept {
+  /**
+   * Zero nexthop (0.0.0.0 / ::) is always invalid in a BGP UPDATE.
+   * Always apply nexthop-self regardless of policy intent.
+   */
+  if (postOutAttrs->getNexthop().isZero()) {
+    return true;
+  }
+
+  /**
+   * If the egress policy explicitly set the nexthop via SetNexthop
+   * action, honor the policy's intent and skip nexthop-self.
+   */
+  if (isNexthopSetByPolicy) {
+    return false;
+  }
+
+  return isEBgpPeer() || peeringParams_.nextHopSelf;
+}
+
+folly::IPAddress AdjRib::getNewNexthopFromAttributesOut(
+    const bool isV4Prefix,
+    const std::shared_ptr<const BgpPath>& postOutAttrs,
+    bool isNexthopSetByPolicy) noexcept {
+  CHECK(postOutAttrs != nullptr);
+  /**
+   * Set nexthop as the configured nexthop when shouldApplyNexthopSelf()
+   * returns true. Policy-set nexthop takes precedence over nexthop-self
+   * (except for zero nexthop which is always invalid).
+   */
+  folly::IPAddress newNexthop = postOutAttrs->getNexthop();
+  if (shouldApplyNexthopSelf(postOutAttrs, isNexthopSetByPolicy)) {
+    if (!isV4OverV6NexthopNegotiated_ && isV4Prefix) {
+      newNexthop = peeringParams_.nexthopV4.isZero()
+          ? folly::IPAddress(peeringParams_.localBgpId)
+          : peeringParams_.nexthopV4;
+    } else {
+      newNexthop = peeringParams_.nexthopV6.isZero()
+          ? folly::IPAddress::createIPv6(peeringParams_.localBgpId)
+          : peeringParams_.nexthopV6;
+    }
+  }
+
+  return newNexthop;
+}
+
+bool AdjRib::blockedByEgressRouteFilter(
+    const RibOutAnnouncementEntry& update,
+    const std::string& peerId) const {
+  // apply egress route filtering if set
+  if (routeFilterStmt_) {
+    std::vector<std::string> communityStrs;
+    for (const auto& community : update.attrs->getCommunities().get()) {
+      communityStrs.emplace_back(community.to_string());
+    }
+
+    auto routeFilterOut = routeFilterStmt_->applyEgressFilter({update.prefix});
+    const auto& remainingPrefixes = std::get<0>(routeFilterOut);
+    const auto& filteredPrefixes = std::get<1>(routeFilterOut);
+    if (remainingPrefixes.empty()) {
+      if (routeFilterLogger_) {
+        routeFilterLogger_->log(
+            true /* egress */,
+            update.prefix,
+            false /* blocked */,
+            false /* non-permissive */,
+            communityStrs);
+      }
+      XLOGF(
+          WARNING,
+          "Egress Route Filter Policy blocked prefix {} from [{}]. ",
+          folly::IPAddress::networkToString(update.prefix),
+          peerId);
+      // blocked
+      return true;
+    } else if (!filteredPrefixes.empty()) {
+      if (routeFilterLogger_) {
+        routeFilterLogger_->log(
+            true /* egress */,
+            update.prefix,
+            true /* allowed */,
+            true /* permissive */,
+            communityStrs);
+      }
+      XLOGF(
+          WARNING,
+          "Egress Route Filter Policy permissive-allowed prefix {} from [{}]. ",
+          folly::IPAddress::networkToString(update.prefix),
+          peerId);
+    }
+  }
+  return false;
+}
+
+// Check if the update is to be deferred due to out-delay or not.
+// Whenever a new AdjRibEntry is created for the first time we will apply
+// out-delay. Any subsequent update won't trigger out-delay.
+// Returns true if update is deferred or dropped.
+// Else, return false which invokes processRibAnnouncedEntry on the update
+// to send the update out without any delay.
+std::pair<bool, bool> AdjRib::processOutDelay(
+    const RibOutAnnouncementEntry& update) {
+  if (outDelay_ == 0s) {
+    return std::make_pair<bool, bool>(false, false);
+  }
+
+  // if prefix is currently in deferredUpdates_ list just modify it.
+  // Note such a prefix might not have newlyInstalledInLocalRib marked.
+  if (deferredUpdates_.erase(update.prefix) > 0) {
+    XLOGF(
+        DBG3,
+        "Modifying already deferred prefix received from Rib for {}: {}",
+        getPeerName(),
+        folly::IPAddress::networkToString(update.prefix));
+    // Replace the existing update entry and return true to indicate deferred
+    // processing will be in effect. No counter change: erase+emplace is a
+    // replace, net size stays the same.
+    deferredUpdates_.emplace(update.prefix, update);
+    return std::make_pair<bool, bool>(true, false);
+  }
+  // if prefix is seen firstime with newlyInstalledInLocalRib marked then add to
+  // deferred list. Also if the entry's RIB install time stamp is within the
+  // outdelay window (i.e. install time is < (currentTime - outdelay)) apply
+  // outdelay.
+  // TODO: The current logic defers the entry for outdelay seconds not the
+  // delta. Technically sepaking delta is the right deferral period but that
+  // compicates the overall timer mgmt logic too much in terms of (potentially)
+  // tracking a timer per entry and later creating multiple timers per batch.
+  // For now I have taken the simpler approach.
+  auto curTimeStamp = std::chrono::system_clock::now();
+  std::chrono::duration<double> timeDiff =
+      curTimeStamp - update.installTimeStamp - outDelay_;
+  if ((timeDiff.count() <= 0) || (update.newlyInstalledInLocalRib)) {
+    XLOGF(
+        DBG3,
+        "Adding new deferred prefix {} new {} time-diff {}sec "
+        "received from Rib for {}",
+        folly::IPAddress::networkToString(update.prefix),
+        update.newlyInstalledInLocalRib,
+        timeDiff.count(),
+        getPeerName());
+    if (deferredUpdates_.emplace(update.prefix, update).second) {
+      deferredUpdatesSize_++;
+      RibStats::incrDeferredUpdatesCount();
+    }
+    return std::make_pair<bool, bool>(true, true);
+  }
+  XLOGF(
+      DBG4,
+      "Not deferring the prefix for [{}] for peer {}",
+      folly::IPAddress::networkToString(update.prefix),
+      getPeerName());
+  return std::make_pair<bool, bool>(false, false);
+}
+
+void AdjRib::programOutDelayTimer() noexcept {
+  XLOGF(DBG2, "Out-Delay timer expired for {}.", getPeerName());
+
+  /*
+   * Pop the min-heap for all out-delay which are in the past. For each enqueued
+   * out-delay entry, process the prefixes ONLY present in the deferredUpdates_
+   * map. If not, just ignore since the "deferredUpdates_" serves the state
+   * compression purpose with prefix withdrawals.
+   */
+  uint64_t processedCnt{0};
+  auto now = std::chrono::system_clock::now();
+
+  /* Iterate through the priority_queue until the top expires in the future */
+  while (!outDelayPQ_.empty()) {
+    const auto& topEntry = outDelayPQ_.top();
+    if (topEntry.expiryTimeStamp > now) {
+      /* Not yet, not yet */
+      break;
+    }
+    for (const auto& pfx : topEntry.deferredPrefixes) {
+      const auto& match = deferredUpdates_.find(pfx);
+      if (match != deferredUpdates_.cend()) {
+        processRibAnnouncedEntry(match->second);
+        /* deferred update is processed. Purge it. */
+        if (deferredUpdates_.erase(pfx) > 0) {
+          deferredUpdatesSize_--;
+          RibStats::decrDeferredUpdatesCount(1);
+        }
+      }
+    }
+    if (enableEgressQueueBackpressure_) {
+      scheduleSendBgpUpdates(true /* tryPullNewChangeItems */);
+    } else {
+      buildAndSendBgpMessages();
+    }
+    outDelayPQ_.pop();
+
+    // TODO: the cnt does not reflect the real number of prefixes processed as
+    // one entry may contain high number of prefixes. Refactor this.
+    if (!outDelayPQ_.empty() &&
+        ++processedCnt >= nettools::bgplib::kMsgBatchSizeToYield) {
+      outDelayTimer_->scheduleTimeout(kRescheduleOutDelayTimeoutMs);
+      return;
+    }
+  }
+
+  if (!outDelayPQ_.empty()) {
+    /*
+     * For the next timer to be scheduled, we want to be a bit loose about the
+     * next timeout and fire with timeout after at least 250ms so as to club
+     * multiple outdelay updates in one batch. This will be helpful during
+     * intitial update after reboot as we will be getting a lot of rib-update
+     * batches and those will come within O(50msec) of each other.
+     */
+    std::chrono::duration<double> delta =
+        outDelayPQ_.top().expiryTimeStamp - std::chrono::system_clock::now();
+    double timeout =
+        std::max(ceil(delta.count()), kMinimumOutDelayTimeout) * 1000;
+    outDelayTimer_->scheduleTimeout(timeout); /* unit in milliseconds */
+
+    XLOGF(
+        DBG4,
+        "Schedule outDelay timer of {} millisecs for {}.",
+        timeout,
+        getPeerName());
+  }
+}
+
+void AdjRib::processRibOutWithdrawal(
+    const RibOutWithdrawal& withdrawal) noexcept {
+  if (!egressEoRsSent_) {
+    XLOGF(
+        DBG1,
+        "Ignoring Rib withdrawal for {} before sending initial dump",
+        getPeerName());
+    return;
+  }
+  const auto& entries =
+      sendAddPath_ ? withdrawal.addPathEntries : withdrawal.entries;
+  for (const auto& entry : entries) {
+    XLOGF(
+        DBG5,
+        "Processing Rib withdrawal of {} for peer {}",
+        folly::IPAddress::networkToString(entry.prefix),
+        getPeerName());
+
+    if (enableRibAllocatedPathId_) {
+      processRibWithdraw(entry.prefix, entry.pathIdToSend);
+    } else {
+      auto nh = entry.nh.has_value() ? entry.nh.value() : folly::IPAddress();
+      processRibWithdraw(
+          entry.prefix, pathIdGenerator_->getPathId(entry.prefix, nh));
+    }
+
+    // Update cached RIB version to track how caught up this peer is
+    setLastSeenRibVersion(entry.ribVersion);
+  }
+  if (!enableEgressQueueBackpressure_) {
+    // Send out all the accumulated changes
+    buildAndSendBgpMessages();
+  }
+}
+
+// Check if we need to withdraw previously announced prefix due to
+// bestpath change and latest prefix/path no longer qualifies for announcing
+void AdjRib::handleImplicitWithdrawal(
+    const folly::CIDRNetwork& prefix,
+    const folly::IPAddress& nextHop,
+    const uint32_t pathIdToSend) noexcept {
+  auto pathId = enableRibAllocatedPathId_
+      ? pathIdToSend
+      : pathIdGenerator_->getPathId(prefix, nextHop);
+
+  XLOGF(
+      DBG3,
+      "Implicit withdrawing prefix {} from {}.",
+      folly::IPAddress::networkToString(prefix),
+      getPeerName());
+
+  processRibWithdraw(prefix, pathId);
+}
+
+void AdjRib::processRibWithdraw(
+    const folly::CIDRNetwork& prefix,
+    uint32_t pathId) noexcept {
+  if (!AdjRibCommonUtils::isAfiNegotiated(
+          prefix, isAfiIpv4Negotiated_, isAfiIpv6Negotiated_)) {
+    XLOGF(
+        DBG4,
+        "Ignore RibWithdrawal of prefix {}: AFI is not supported for {}.",
+        folly::IPAddress::networkToString(prefix),
+        getPeerName());
+    return;
+  }
+
+  // Note we remove the prefix from the deferredUpdates_ but don't cancel the
+  // deferred timer. we let the timer run out and ignore any entry that is
+  // not present in the deferredUpdates_ list.
+  if (deferredUpdates_.erase(prefix)) {
+    deferredUpdatesSize_--;
+    RibStats::decrDeferredUpdatesCount(1);
+    XLOGF(
+        DBG3,
+        "Removed deferred entry of prefix {} for {} as we "
+        "received withdrawal before out-delay expiry",
+        folly::IPAddress::networkToString(prefix),
+        getPeerName());
+  }
+
+  auto [adjRibEntry, _] =
+      getRibOutEntry(prefix, pathId, true /* copyOnWriteIfShared */);
+  if (!adjRibEntry || !adjRibEntry->getPreOut()) {
+    XLOGF(
+        DBG3,
+        "Received withdraw of prefix {} without announcement for {}",
+        folly::IPAddress::networkToString(prefix),
+        getPeerName());
+    return;
+  }
+
+  adjRibEntry->setPreOut(nullptr);
+  adjRibEntry->setPostOutPolicy({});
+  stats_.decrementPreOutPrefixCount(prefix.first.isV4());
+  if (adjRibEntry) {
+    tryInsertWithdrawal(
+        prefix,
+        adjRibEntry,
+        fmt::format(
+            "Withdrawing prefix {} from {}",
+            folly::IPAddress::networkToString(prefix),
+            getPeerName()),
+        fmt::format(
+            "Ignoring Rib withdraw of prefix {} for unannounced route for {}",
+            folly::IPAddress::networkToString(prefix),
+            getPeerName()));
+  }
+
+  tryDeleteRibOutEntry(prefix, adjRibEntry, pathId);
+}
+
+void AdjRib::tryInsertWithdrawal(
+    const folly::CIDRNetwork& prefix,
+    AdjRibEntry* adjRibEntry,
+    const std::string& insertedMsg,
+    const std::string& notInsertedMsg) {
+  auto oldPostAttr = adjRibEntry->getPostAttr();
+  if (oldPostAttr) {
+    // Withdraw the prefix only if we previously announced it to this peer
+    // This can happen if attributes change for a prefix and policy based on
+    // new attributes blocks the prefix. Withdraw it from peer.
+    XLOGF_IF(
+        DBG1,
+        stats_.getPostOutPrefixCount() == 0,
+        "Invalid sent prefix count of {} for {}",
+        folly::IPAddress::networkToString(prefix),
+        getPeerName());
+    stats_.decrementPostOutPrefixCount(prefix.first.isV4());
+
+    adjRibEntry->setPostAttr(nullptr);
+
+    auto prefixPathId = std::make_pair(prefix, adjRibEntry->getPathId());
+
+    // Update attrToPrefixMap to move prefixPathId from the previous postAttrs
+    // to the new postAttr (nullptr).
+    tryUpdateAttrToPrefixMap(
+        prefixPathId, oldPostAttr, adjRibEntry->getPostAttr());
+
+    XLOG(DBG3, insertedMsg);
+  } else {
+    // we din't inform peer before, so no need of informing to peer now.
+    XLOG(DBG3, notInsertedMsg);
+  }
+}
+
+// Try to delete AdjRibEntry if there is no longer any interest for this prefix
+// i.e. we have withdrawn it and no one is advertising this prefix
+void AdjRib::tryDeleteRibOutEntry(
+    const folly::CIDRNetwork& prefix,
+    const AdjRibEntry* adjRibEntry,
+    uint32_t pathId) noexcept {
+  if (adjRibEntry->getPreOut() || adjRibEntry->getPostAttr()) {
+    return;
+  }
+  deleteRibEntry(/*ingress=*/false, prefix, pathId);
+}
+
+/*
+ * DFP (Detached Fast Peer) check.
+ * Returns true if peer finished draining PL before the group moved on CL.
+ * DFP skips CL consumption and transitions directly to
+ * DETACHED_READY_TO_JOIN with IS_DETACHED_FAST_PEER flag (no collapse needed).
+ */
+bool AdjRib::isDFP() const {
+  return attrToPrefixMap_.empty() && adjRibOutGroup_ &&
+      adjRibOutGroup_->getLastSeenRibVersion() == lastSeenRibVersion_ &&
+      !adjRibOutGroup_->getAttrToPrefixMap().empty();
+}
+
+/*
+ * DSP (Detached Slow Peer) readiness check.
+ * Returns true if peer has READY marker on the changelist and all pending
+ * packing list items have been drained.
+ */
+bool AdjRib::isReadyToRejoinGroup() const {
+  return attrToPrefixMap_.empty() && changeListConsumer_ &&
+      changeListConsumer_->isReady();
+}
+
+bool AdjRib::isDetachedPeer() const {
+  return peerState_ == PeerUpdateState::DETACHED_INIT_DUMP ||
+      peerState_ == PeerUpdateState::DETACHED_READY_TO_JOIN ||
+      peerState_ == PeerUpdateState::DETACHED_BLOCKED ||
+      peerState_ == PeerUpdateState::DETACHED_RUNNING;
+}
+
+/*
+ * Check if a DETACHED_RUNNING peer should transition to
+ * DETACHED_READY_TO_JOIN. Called at the end of sendBgpUpdates() after PL
+ * drain when update groups are enabled and peer is in DETACHED_RUNNING state.
+ *
+ * DFP: group hasn't moved since detach -> sets IS_DETACHED_FAST_PEER flag,
+ *      no collapse needed on rejoin.
+ * DSP: peer caught up independently -> collapse verification needed on rejoin.
+ *      DSP can initiate rejoin if the group is ready/IDLE.
+ * Neither: reschedule packing timers to continue processing.
+ */
+void AdjRib::maybeTransitionDetachedReadyToJoin() noexcept {
+  // DETACHED_INIT_DUMP peers were never in sync with the group, so they
+  // can never be DFP — they must always go through the DSP rejoin path
+  // with collapse verification.
+  if (peerState_ != PeerUpdateState::DETACHED_INIT_DUMP && isDFP()) {
+    setAdjRibFlag(IS_DETACHED_FAST_PEER);
+    XLOGF(
+        DBG1,
+        "Peer {}: State Transition: {} (DFP) -> {}",
+        getPeerName(),
+        peerState_,
+        PeerUpdateState::DETACHED_READY_TO_JOIN);
+
+    setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    cancelPackingTimers();
+  } else if (isReadyToRejoinGroup()) {
+    XLOGF(
+        DBG1,
+        "Peer {}: State Transition: {} (DSP) -> {}",
+        getPeerName(),
+        peerState_,
+        PeerUpdateState::DETACHED_READY_TO_JOIN);
+
+    setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    cancelPackingTimers();
+    // DSP can initiate rejoin if the group is ready/IDLE
+    if (adjRibOutGroup_->isGroupConsumerReady()) {
+      adjRibOutGroup_->checkAndAcceptDSPPeer(shared_from_this());
+    }
+  } else {
+    reschedulePackingTimers();
+  }
+}
+
+/*
+ * Start the detached peer's independent processing loop.
+ * Called when a DETACHED_BLOCKED peer unblocks.
+ *
+ * Schedules sendBgpUpdates to drain PL. sendBgpUpdates handles DFP/DSP
+ * transitions and timer scheduling at the end of the drain.
+ */
+void AdjRib::activateDetachedModeProcessing() {
+  XLOGF(INFO, "Peer {}: Activating detached mode processing", getPeerName());
+
+  // Schedule PL drain. DFP/DSP checks happen at end of sendBgpUpdates.
+  // CL consumption will also be pumped through scheduleSendBgpUpdates entry
+  // point by scheduling the packing timers (changeListConsumeTimer_).
+  scheduleSendBgpUpdates(false /* tryPullNewChangeItems */);
+}
+
+/*
+ * Clean up detached mode processing state on rejoin or peer down.
+ */
+void AdjRib::deactivateDetachedModeProcessing() {
+  XLOGF(DBG1, "Peer {}: Deactivating detached mode processing", getPeerName());
+  resetChangeListConsumer();
+  cancelPackingTimers();
+  setDetachedRibVersion(0);
+}
+
+} // namespace facebook::bgp

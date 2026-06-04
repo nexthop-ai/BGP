@@ -1,0 +1,90 @@
+# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Reference: https://www.arista.com/en/support/toi/eos-4-25-2f/14712-cli-extensions-for-customers
+vendor:
+  name: Meta Platforms, Inc.
+  email: oncall+network_backbone@xmail.facebook.com
+namespace: meta.bgpcli
+commands:
+  showBgpCpp:
+    syntax: |
+      show bgpcpp
+      ( changelist
+      | (config [raw])
+      | summary
+      | (summary egress)
+      | (neighbors [<ipAddr> [[session-id] <sessionID>]])
+      | (neighbors <ipAddr> (advertised | received) (pre-policy | post-policy | rejected | dryrun-post-policy) [{<ipPrefix>}])
+      | originated-routes
+      | initialization-events
+      | (policy <policyName>)
+      | shadowrib
+      | (stream summary)
+      | (stream subscriber <peerID> [(pre-policy | post-policy) [{<ipPrefix>}]])
+      | (stats (attrs | entries | policy))
+      | (table [detail | (prefix {<ipPrefix>}) | (more-specifics {<ipPrefix>}) | (community {<community>})])
+      | techsupport
+      | (update-group [{<groupId>}])
+      | (rib-policy [criteria {<ipPrefix>}])
+      | health
+      | (holdtimers [{<ipAddr>}])
+      | (nexthopinfo <ipAddr>)
+      )
+    mode: Unprivileged
+    outputSchema:
+      "$schema": "http://json-schema.org/draft-07/schema"
+      type: object
+    data:
+      <community>: { regex: { regex: .+, help: BGP Community } }
+      <ipAddr>: { ipAddress: { help: IP Address } }
+      <ipPrefix>: { regex: { regex: .+, help: IP Prefix } }
+      <peerID>: { integer: { help: Peer ID } }
+      <policyName>: { regex: { regex: .+, help: Policy name } }
+      <sessionID>: { ipAddress: { help: Session ID } }
+      advertised: { keyword: { help: Routes advertised to a peer } }
+      attrs: { keyword: { help: Show attribute statistics } }
+      changelist: { keyword: { help: Show BGP changelist information } }
+      config: { keyword: { help: Show BGP configuration } }
+      community: { keyword: { help: Show BGP routes with paths matching community value or name } }
+      criteria: { keyword: { help: Show BGP RibPolicy active path selection criteria for prefixes } }
+      detail: { keyword: { help: Show BGP RIB route details } }
+      dryrun-post-policy: { keyword: { help: Routes after dry run on new policy configuration at /var/tmp/bgpcpp.conf } }
+      entries: { keyword: { help: Show entry statistics } }
+      health: { keyword: { help: Show BGP health report } }
+      holdtimers: { keyword: { help: Show BGP peer hold timer information } }
+      initialization-events: { keyword: { help: Show BGP initialization events } }
+      shadowrib: { keyword: { help: Show BGP shadow RIB information } }
+      more-specifics: { keyword: { help: Show BGP route details within passed-in subnet} }
+      neighbors: { keyword: { help: Show BGP neighbor information } }
+      nexthopinfo: { keyword: { help: Show nexthop information for a specific nexthop } }
+      originated-routes: { keyword: { help: Show statically configured routes } }
+      policy: { keyword: { help: Show BGP policy information } }
+      post-policy: { keyword: { help: After policy } }
+      pre-policy: { keyword: { help: Before policy } }
+      prefix: { keyword: { help: Show BGP route details of exact prefix } }
+      raw: { keyword: { help: Show BGP configuration in raw config-file format } }
+      received: { keyword: { help: Routes received from a peer } }
+      rejected: { keyword: { help: Rejected routes } }
+      rib-policy: { keyword: { help: Show installed BGP RibPolicy } }
+      session-id: { keyword: { help: Show BGP neighbor information for specific session-id } }
+      stats: { keyword: { help: Show various statistics } }
+      stream: { keyword: { help: Show BGP stream session information } }
+      subscriber: { keyword: { help: Show information sent to BGP thrift stream subscriber } }
+      summary: { keyword: { help: Show BGP session information } }
+      table: { keyword: { help: Show BGP RIB } }
+      techsupport: { keyword: { help: Show BGP techsupport } }
+      update-group: { keyword: { help: Show update-group details } }
+      <groupId>: { integer: { min: 0, max: 65535, help: Update group ID } }
+      egress: { keyword: { help: Show BGP egress statistics } }
+
+  showBgpVersion:
+    syntax: show bgpcpp version
+    mode: Unprivileged
+    outputSchema:
+      "$schema": "http://json-schema.org/draft-07/schema"
+      type: object
+
+  showBgpcppDrainState:
+    syntax: show bgpcpp drain-state
+    mode: Unprivileged
+    data:
+      drain-state: { keyword: { help: Show current drain state of all peer groups } }

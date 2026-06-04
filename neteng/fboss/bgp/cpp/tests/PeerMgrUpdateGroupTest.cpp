@@ -1,0 +1,126 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#define PeerManager_TEST_FRIENDS \
+  FRIEND_TEST(PeerManagerUpdateGroupTestFixture, UpdateGroupConstructionTest);
+
+#include <folly/coro/BlockingWait.h>
+#include <folly/fibers/FiberManagerMap.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/Utils.h"
+
+using ::testing::_;
+using namespace facebook::nettools::bgplib;
+
+namespace facebook::bgp {
+
+class PeerManagerUpdateGroupTestFixture : public PeerManagerTestFixture {
+ public:
+  void SetUp() override {
+    PeerManagerTestFixture::SetUp();
+    auto config = getConfig(
+        true, /* includeStaticPeer */
+        false, /* includeDynamicShivPeer */
+        false, /* includeDynamicMonitorPeer */
+        false, /* includeDynamicVipInjectorPeer */
+        false, /* enableStatefulHa */
+        false, /* enableVipServer */
+        kDefaultEorTimeS, /* eorTimeS */
+        false, /* enableSubscriberLimit */
+        false, /* enableSwitchLimit */
+        false, /* applyGoldenPrefixPolicy */
+        {}, /* bgpFeatures */
+        false, /* enableDynamicPolicyEvaluation */
+        true /* enableUpdateGroup */);
+
+    auto configManager = std::make_shared<ConfigManager>(config);
+    peerMgr_ = std::make_shared<PeerManager>(
+        configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
+
+    auto versionNumber = std::make_shared<VersionNumber>(version_);
+    auto mockInfo = mockInfo1_;
+    // Set AFI to v4 so that AdjRibOut doesn't skip building announcements.
+    mockInfo.negotiatedCapabilities.mpExtV4Unicast() = true;
+
+    sessionInfo_ = FiberBgpPeer::getObservableSessionInfo(
+        mockInfo, adjRibOutQ_, boundedAdjRibOutQ_, adjRibInQ_, versionNumber);
+  }
+
+  void cleanUp() {
+    adjRibInQ_->fiberPush(
+        FiberBgpPeer::BgpSessionStop{GracefulRestartFlag{false}});
+    folly::coro::blockingWait(asyncScope_.cancelAndJoinAsync());
+    peerMgr_->stop();
+  }
+
+  std::shared_ptr<PeerManager> peerMgr_;
+  folly::coro::CancellableAsyncScope asyncScope_;
+
+  uint64_t version_ = 0x100;
+  std::shared_ptr<FiberBgpPeer::ObservableSessionInfo> sessionInfo_;
+
+  std::shared_ptr<AdjRib::AdjRibInQueueT> adjRibInQ_ =
+      std::make_shared<AdjRib::AdjRibInQueueT>();
+  std::shared_ptr<AdjRib::AdjRibOutQueueT> adjRibOutQ_ =
+      std::make_shared<AdjRib::AdjRibOutQueueT>();
+  std::shared_ptr<AdjRib::BoundedAdjRibOutQueueT> boundedAdjRibOutQ_ =
+      std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
+          kMaxEgressQueueSize,
+          kEgressQueueHighWatermark,
+          kEgressQueueLowWatermark);
+};
+
+/*
+ * This test verifies the updateGroup creation when directly invoking
+ * sessionEstablished() call from PeerManager.
+ */
+TEST_F(PeerManagerUpdateGroupTestFixture, UpdateGroupConstructionTest) {
+  auto& evb = peerMgr_->getEventBase();
+  auto& fm = folly::fibers::getFiberManager(peerMgr_->getEventBase(), options_);
+
+  FiberBgpPeer::ObservableStateT stateEvent{
+      .peerId = kPeerId3,
+      .versionNumber = version_,
+      .sessionInfo = sessionInfo_};
+
+  peerMgr_->ribInitialAnnouncementStarted_ = true;
+  peerMgr_->ribInitialAnnouncementDone_ = true;
+
+  fm.addTask([&] {
+    EXPECT_EQ(0, peerMgr_->pendingRibDumpReqs_.size());
+    folly::coro::blockingWait(peerMgr_->sessionEstablished(stateEvent));
+
+    // Validation of update-group creation
+    auto adjRib = peerMgr_->adjRibs_.at(kPeerId3);
+    auto updateGroupKey = adjRib->getUpdateGroupKey();
+    EXPECT_EQ(1, peerMgr_->updateGroupManager_->getGroupCount());
+    EXPECT_TRUE(peerMgr_->updateGroupManager_->hasGroup(updateGroupKey));
+    auto adjRibOutGroup = peerMgr_->adjRibOutGroups_.begin()->second;
+    auto updateGroup =
+        peerMgr_->updateGroupManager_->findOrCreateGroup(updateGroupKey);
+    EXPECT_NE(adjRibOutGroup, updateGroup);
+
+    // trigger stop of task
+    cleanUp();
+  });
+  evb.loop();
+  SUCCEED();
+}
+
+} // namespace facebook::bgp

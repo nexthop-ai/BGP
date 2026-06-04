@@ -1,0 +1,29 @@
+{
+  "router_id": "10.191.0.26",
+  "local_as": 65401,
+  "peers": [
+    {
+      "remote_as": 65000,
+      "local_addr": "127.0.0.1",
+      "peer_addr": "127.0.0.1",
+      "next_hop4": "0.0.0.0",
+      "next_hop6": "::",
+      "is_passive": true,
+      "type": "SHIV_FABRIC",
+      "peer_id": "127.0.0.1",
+      "ingress_policy_name": "RSW-SLB-IN",
+      "egress_policy_name": "PROPAGATE_NOTHING",
+      "pre_filter": {
+        "max_routes": 1024,
+        "warning_only": false,
+        "warning_limit": 0
+      }
+    }
+  ],
+  "hold_time": 30,
+  "listen_port": 0,
+  "local_confed_as": 2027,
+  "listen_addr": "127.0.0.1",
+  "graceful_restart_convergence_seconds": 120,
+  "eor_time_s": 10
+}

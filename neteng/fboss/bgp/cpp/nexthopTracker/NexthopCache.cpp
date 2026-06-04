@@ -1,0 +1,235 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopCache.h"
+
+#include <vector>
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
+
+namespace facebook::bgp {
+
+std::vector<NexthopStatus> NexthopCache::addOrUpdateNextHopStatus(
+    const std::vector<NexthopStatus>& nexthopStatusList) {
+  XLOGF(
+      DBG2,
+      "Adding or updating {} nexthop statuses from list",
+      nexthopStatusList.size());
+
+  // Vector to store nexthop statuses that need to be pushed to RibInQ_
+  std::vector<NexthopStatus> statusesToPush;
+  statusesToPush.reserve(nexthopStatusList.size());
+
+  // Update the nexthopStatusMap_ with the provided list of NexthopStatus
+  // objects and track which entries were changed or newly added
+  nexthopStatusMap_.withWLock([&](folly::F14NodeMap<
+                                  folly::IPAddress,
+                                  NexthopStatusWithRegistration>& statusMap) {
+    // Iterate through the provided list and update or add entries
+    for (const auto& nexthopStatus : nexthopStatusList) {
+      const auto& nexthopIp = nexthopStatus.getNexthop();
+      auto it = statusMap.find(nexthopIp);
+
+      if (it != statusMap.end()) {
+        // Get the current status and registration flag
+        auto& [currentStatus, isRegisteredFromRib] = it->second;
+
+        /**
+         * On FBOSS, directly connected nexthops are learned via both
+         * FsdbNeighborWatcher and FsdbFibWatcher
+         *
+         * For directly connected nexthops (learned via
+         * FsdbNeighborWatcher with isConnected=true), NeighborWatcher is
+         * the sole authority for both reachability and igpCost. Ignore
+         * updates from non-connected sources (FsdbFibWatcher sends
+         * isConnected=nullopt) to prevent stale FIB data from overriding
+         * authoritative ARP/NDP-based connectivity.
+         *
+         * TODO: In future, FsdbNeighborWatcher when removed, only
+         * FsdbFibWatcher can sole be notifier. In that case, following block
+         * won't be required anymore, and thus can go away
+         **/
+        if (currentStatus.isConnected() == true &&
+            nexthopStatus.isConnected() != true) {
+          XLOGF(
+              DBG2,
+              "Skipping update for {} from non-connected source"
+              " — nexthop is directly connected",
+              nexthopIp.str());
+          continue;
+        }
+
+        // Check if there's a change in the update
+        bool isReachabilityChanged =
+            currentStatus.isReachable() != nexthopStatus.isReachable();
+        bool isIgpCostChanged =
+            currentStatus.getIgpCost() != nexthopStatus.getIgpCost();
+
+        if (!isReachabilityChanged && !isIgpCostChanged) {
+          XLOGF(
+              DBG2,
+              "No change in nexthop status for {}, reachable: {}, igpCost: {}, registeredFromRib: {}",
+              nexthopIp.str(),
+              currentStatus.isReachable(),
+              currentStatus.getIgpCost().has_value()
+                  ? std::to_string(currentStatus.getIgpCost().value())
+                  : "unset",
+              isRegisteredFromRib);
+          continue;
+        }
+
+        // Log the change in status
+        XLOGF(
+            DBG2,
+            "Updating nexthop status for {} from reachable: {}, igpCost: {} to reachable: {}, igpCost: {}, registeredFromRib: {}",
+            nexthopIp.str(),
+            currentStatus.isReachable(),
+            currentStatus.getIgpCost().has_value()
+                ? std::to_string(currentStatus.getIgpCost().value())
+                : "unset",
+            nexthopStatus.isReachable(),
+            nexthopStatus.getIgpCost().has_value()
+                ? std::to_string(nexthopStatus.getIgpCost().value())
+                : "unset",
+            isRegisteredFromRib);
+
+        // Update the status while preserving the registration flag
+        currentStatus = nexthopStatus;
+
+        if (isReachabilityChanged) {
+          if (nexthopStatus.isReachable()) {
+            RibStats::incrNhtCacheNexthopReachable();
+          } else {
+            RibStats::incrNhtCacheNexthopUnreachable();
+          }
+        }
+
+        // If it's registered from RIB, add to push list
+        if (isRegisteredFromRib) {
+          statusesToPush.emplace_back(currentStatus);
+        }
+      } else {
+        // Add new entry with registration flag set to false
+        XLOGF(
+            DBG2,
+            "Adding new nexthop status for {}, reachable: {}, igpCost: {}, isConnected: {} registeredFromRib: false",
+            nexthopIp.str(),
+            nexthopStatus.isReachable(),
+            nexthopStatus.getIgpCost().has_value()
+                ? std::to_string(nexthopStatus.getIgpCost().value())
+                : "unset",
+            nexthopStatus.isConnected().has_value()
+                ? std::to_string(nexthopStatus.isConnected().value())
+                : "unset");
+
+        // Insert the new entry with registration flag set to false
+        statusMap.emplace(nexthopIp, std::make_tuple(nexthopStatus, false));
+        RibStats::incrNexthopStatusMapCount();
+
+        // New entries are not registered from RIB yet, so no need to add to
+        // push list
+      }
+    }
+  });
+
+  return statusesToPush;
+}
+
+NexthopStatus NexthopCache::registerAndGetNexthopStatus(
+    const folly::IPAddress& nexthopIp) {
+  XLOGF(
+      DBG2,
+      "Getting nexthop status for {} and registering from RIB",
+      nexthopIp.str());
+
+  return nexthopStatusMap_.withWLock(
+      [&](folly::F14NodeMap<folly::IPAddress, NexthopStatusWithRegistration>&
+              statusMap) -> NexthopStatus {
+        auto it = statusMap.find(nexthopIp);
+        // Return the entry if it exists
+        if (it != statusMap.end()) {
+          // Mark this nexthop as registered from RIB
+          auto& [status, isRegisteredFromRib] = it->second;
+          isRegisteredFromRib = true;
+
+          XLOGF(
+              DBG2,
+              "Found nexthop status for {}, reachable: {}, igpCost: {}, registeredFromRib: true",
+              nexthopIp.str(),
+              status.isReachable(),
+              status.getIgpCost().has_value()
+                  ? std::to_string(status.getIgpCost().value())
+                  : "unset");
+          return status;
+        }
+
+        // Create a new entry with default values (unreachable, no IGP cost)
+        // and set the registration flag to true
+        XLOGF(
+            DBG2,
+            "Nexthop status not found for {}, creating new entry with default values and registeredFromRib: true",
+            nexthopIp.str());
+
+        // Create a default NexthopStatus (unreachable, no IGP cost)
+        NexthopStatus defaultStatus(nexthopIp, false);
+
+        // Insert the new entry with registration flag set to true
+        statusMap.emplace(nexthopIp, std::make_tuple(defaultStatus, true));
+        RibStats::incrNexthopStatusMapCount();
+
+        return defaultStatus;
+      });
+}
+
+bool NexthopCache::unregisterAndRemoveNexthopStatus(
+    const folly::IPAddress& nexthopIp) {
+  XLOGF(
+      DBG1,
+      "Attempting to unregister/remove nexthop status for {}",
+      nexthopIp.str());
+
+  return nexthopStatusMap_.withWLock(
+      [&](folly::F14NodeMap<folly::IPAddress, NexthopStatusWithRegistration>&
+              statusMap) -> bool {
+        auto it = statusMap.find(nexthopIp);
+        // Process the entry if it exists
+        if (it != statusMap.end()) {
+          auto& [status, isRegisteredFromRib] = it->second;
+
+          if (!status.isReachable()) {
+            // If nexthop is unreachable, remove it completely
+            XLOGF(
+                DBG2,
+                "Unregistering and removing unreachable nexthop status for {}",
+                nexthopIp.str());
+            statusMap.erase(it);
+            RibStats::decrNexthopStatusMapCount();
+            return true;
+          } else {
+            // If nexthop is reachable, just unregister it from RIB
+            XLOGF(
+                DBG2,
+                "Unregistering but NOT removing reachable nexthop status for {}",
+                nexthopIp.str());
+            isRegisteredFromRib = false;
+          }
+        } else {
+          XLOGF(DBG2, "Nexthop status not found for {}", nexthopIp.str());
+        }
+        return false;
+      });
+}
+
+} // namespace facebook::bgp

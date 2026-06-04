@@ -1,0 +1,620 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#define AdjRib_TEST_FRIENDS                                                  \
+  friend class AdjRibOutboundFixtureV4V6Nexthop;                             \
+  FRIEND_TEST(AdjRibOutboundFixtureV4V6Nexthop, VerifyV4V6PrefixesNexthops); \
+  FRIEND_TEST(                                                               \
+      AdjRibOutboundFixtureV4V6Nexthop,                                      \
+      VerifyNormalizedNexthop_BuildAndQueueAnnouncements);                   \
+  FRIEND_TEST(                                                               \
+      AdjRibOutboundFixtureV4V6Nexthop,                                      \
+      VerifyNormalizedNexthop_BuildUpdateWithSizeEstimation);
+
+#include <folly/coro/BlockingWait.h>
+#include <folly/logging/xlog.h>
+
+#include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
+
+namespace facebook::bgp {
+using namespace facebook::nettools::bgplib;
+
+using facebook::network::toIPPrefix;
+using folly::IPAddress;
+
+// Test parameters for different nexthop scenarios
+struct V4V6NexthopTestParam {
+  std::string testName;
+  bool isEBgpPeer;
+  bool isRrClient;
+  bool nextHopSelf;
+  bool isV4OverV6Negotiated;
+  folly::IPAddress configuredV4Nexthop;
+  folly::IPAddress configuredV6Nexthop;
+  folly::IPAddress originalV4Nexthop;
+  folly::IPAddress originalV6Nexthop;
+  folly::IPAddress expectedV4Nexthop;
+  folly::IPAddress expectedV6Nexthop;
+};
+
+class AdjRibOutboundFixtureV4V6Nexthop
+    : public AdjRibOutboundFixture,
+      public ::testing::WithParamInterface<V4V6NexthopTestParam> {
+ public:
+  std::shared_ptr<AdjRib> setupEbgpAdjRib(
+      const folly::IPAddress& v4Nexthop,
+      const folly::IPAddress& v6Nexthop) {
+    setupAdjRib(
+        kLocalAs1,
+        kLocalAs1,
+        kRemoteAs2, /* different AS for eBGP */
+        false, /* isRrClient */
+        false, /* isConfedPeer */
+        NextHopSelfConfigured(true),
+        v4Nexthop, /* configured v4 local */
+        v6Nexthop, /* configured v6 local */
+        false, // sessionEstablish
+        AfiIpv4Negotiated(true));
+    auto adjRib = adjRib_;
+    fm_->addTask([&, adjRib, adjRibInQ = adjRibInQ_, adjRibOutQ = adjRibOutQ_] {
+      adjRib->sessionEstablished(
+          std::nullopt, /* remoteGrRestartTime */
+          adjRibInQ,
+          adjRibOutQ,
+          boundedAdjRibOutQ_,
+          true /* isAfiIpv4Negotiated */,
+          true /* isAfiIpv6Negotiated */,
+          false /* isV4OverV6Nexthop */,
+          false /* isEnhancedRouteRefreshNegotiated */,
+          false /* isRouteRefreshNegotiated */,
+          std::nullopt /* addPathCapa */);
+      adjRib->startMessageProcessingLoop();
+    });
+    /* Restock the member queues on the test fixture for the next caller. */
+    adjRibInQ_ = std::make_shared<AdjRib::AdjRibInQueueT>();
+    adjRibOutQ_ = std::make_shared<AdjRib::AdjRibOutQueueT>();
+    return adjRib;
+  }
+
+  void announceTo(
+      AdjRib* adjRib,
+      const folly::F14NodeMap<
+          std::shared_ptr<BgpPath>,
+          std::vector<folly::CIDRNetwork>>& entries,
+      bool ebgpPeer = true) {
+    auto ribOutMsg = buildAnnouncementFromMap(entries, ebgpPeer);
+    adjRib->processRibMessage(ribOutMsg);
+    if (adjRib->isEnableEgressQueueBackpressure()) {
+      adjRib->scheduleSendBgpUpdates(true /* tryPullNewChangeItems */);
+    }
+  }
+
+  void verifyPrefixesAndNexthopInUpdate(
+      const std::optional<FiberBgpPeer::InputMessageT>& updateMsg,
+      const folly::F14NodeSet<folly::CIDRNetwork>& expected,
+      const folly::IPAddress& nh) {
+    auto update = std::get<std::shared_ptr<const BgpUpdate2>>(*updateMsg);
+    EXPECT_EQ(expected.size(), update->mpAnnounced()->prefixes()->size());
+
+    folly::F14NodeSet<folly::CIDRNetwork> observed;
+    for (auto& pfx : *update->mpAnnounced()->prefixes()) {
+      observed.insert(network::toCIDRNetwork(*pfx.prefix()));
+    }
+    EXPECT_EQ(expected, observed);
+
+    /* Verify nexthops match expected values. */
+    EXPECT_EQ(nh.str(), *update->attrs()->nexthop());
+
+    /* Verify nexthops inside of mpAnnounced also match expected values. */
+    EXPECT_EQ(network::toBinaryAddress(nh), *update->mpAnnounced()->nexthop());
+  }
+
+  void terminateSharedAdjRib(std::shared_ptr<AdjRib>& adjRib) {
+    adjRib->adjRibInQueue_->fiberPush(
+        nettools::bgplib::FiberBgpPeer::BgpSessionStop{false});
+  }
+};
+
+TEST_F(
+    AdjRibOutboundFixtureV4V6Nexthop,
+    VerifyNormalizedNexthop_BuildAndQueueAnnouncements) {
+  gflags::FlagSaver flags;
+  FLAGS_enable_egress_backpressure_in_adjribout_tests = false;
+  /*
+   * Make two AdjRibs with different configured nexthops.
+   * They will set the nexthop on egress attributes to self.
+   */
+  auto adjRib1 = setupEbgpAdjRib(kV4Nexthop1, kV6Nexthop1);
+  auto adjRib2 = setupEbgpAdjRib(kV4Nexthop2, kV6Nexthop2);
+
+  /*
+   * Create one shared attr from RIB and announce kV4Prefix1 to adjRib1
+   * and kV4Prefix2 to adjRib2. To verify the total deduplication at the
+   * end of the test, clone the attr for each AdjRib so their memory
+   * is even different.
+   */
+  BgpUpdate2 update = buildBgpUpdateAttributes(kV4Nexthop3);
+  auto attrs1 = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+  auto attrs2 = attrs1->clone();
+  EXPECT_NE(attrs1, attrs2);
+
+  fm_->addTask([&] {
+    announceTo(adjRib1.get(), {{attrs1, {kV4Prefix1}}});
+    announceTo(adjRib2.get(), {{attrs2, {kV4Prefix2}}});
+  });
+  fm_->addTask([&] {
+    /* Each peer receives one update. */
+    auto msg1 = folly::coro::blockingWait(adjRib1->adjRibOutQueue_->pop());
+    auto msg2 = folly::coro::blockingWait(adjRib2->adjRibOutQueue_->pop());
+
+    verifyPrefixesAndNexthopInUpdate(msg1, {kV4Prefix1}, kV4Nexthop1);
+    verifyPrefixesAndNexthopInUpdate(msg2, {kV4Prefix2}, kV4Nexthop2);
+
+    /*
+     * Verify each AdjRib's entry has the normalized nexthop.
+     * Note that, in this scenario, this assumes that the policy
+     * does not modify the nexthop; so the normalized nexthop
+     * is the nexthop that was announced from RIB, which was
+     * kV4Nexthop3.
+     */
+    auto entry1 = adjRib1->getRibEntry(/*ingress=*/false, kV4Prefix1);
+    auto entry2 = adjRib2->getRibEntry(/*ingress=*/false, kV4Prefix2);
+
+    /* Let's verify that the post attrs are the same shared_ptr. */
+    EXPECT_EQ(entry1->getPostAttr(), entry2->getPostAttr());
+    EXPECT_EQ(kV4Nexthop3, entry1->getPostAttr()->getNexthop());
+
+    /* Verify no more messages in each queue */
+    EXPECT_EQ(0, adjRib1->adjRibOutQueue_->size());
+    EXPECT_EQ(0, adjRib2->adjRibOutQueue_->size());
+
+    terminateSharedAdjRib(adjRib1);
+    terminateSharedAdjRib(adjRib2);
+  });
+
+  evb_.loop();
+}
+
+TEST_F(
+    AdjRibOutboundFixtureV4V6Nexthop,
+    VerifyNormalizedNexthop_BuildUpdateWithSizeEstimation) {
+  /*
+   * Make two AdjRibs with different configured nexthops.
+   * They will set the nexthop on egress attributes to self.
+   */
+  auto adjRib1 = setupEbgpAdjRib(kV4Nexthop1, kV6Nexthop1);
+  auto adjRib2 = setupEbgpAdjRib(kV4Nexthop2, kV6Nexthop2);
+
+  /*
+   * Create one shared attr from RIB and announce kV4Prefix1 to adjRib1
+   * and kV4Prefix2 to adjRib2. To verify the total deduplication at the
+   * end of the test, clone the attr for each AdjRib so their memory
+   * is even different.
+   */
+  BgpUpdate2 update = buildBgpUpdateAttributes(kV4Nexthop3);
+  auto attrs1 = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+  auto attrs2 = attrs1->clone();
+  EXPECT_NE(attrs1, attrs2);
+
+  auto ribMsg1 = buildAnnouncementFromMap({{attrs1, {kV4Prefix1}}});
+  auto ribMsg2 = buildAnnouncementFromMap({{attrs2, {kV4Prefix2}}});
+
+  fm_->addTask([&] {
+    adjRib1->handleRibAnnouncedEntry(
+        std::get<RibOutAnnouncement>(ribMsg1).entries[0],
+        true /* initialDump*/);
+    adjRib2->handleRibAnnouncedEntry(
+        std::get<RibOutAnnouncement>(ribMsg2).entries[0],
+        true /* initialDump*/);
+
+    EXPECT_EQ(1, adjRib1->attrToPrefixMap_.size());
+    EXPECT_EQ(1, adjRib2->attrToPrefixMap_.size());
+
+    auto update1 = adjRib1->buildUpdateWithSizeEstimation(
+        adjRib1->attrToPrefixMap_.begin()->first,
+        adjRib1->attrToPrefixMap_.begin()->second);
+    auto update2 = adjRib2->buildUpdateWithSizeEstimation(
+        adjRib2->attrToPrefixMap_.begin()->first,
+        adjRib2->attrToPrefixMap_.begin()->second);
+
+    verifyPrefixesAndNexthopInUpdate(
+        FiberBgpPeer::InputMessageT(update1), {kV4Prefix1}, kV4Nexthop1);
+    verifyPrefixesAndNexthopInUpdate(
+        FiberBgpPeer::InputMessageT(update2), {kV4Prefix2}, kV4Nexthop2);
+
+    /*
+     * Verify each AdjRib's entry has the normalized nexthop.
+     * Note that, in this scenario, this assumes that the policy
+     * does not modify the nexthop; so the normalized nexthop
+     * is the nexthop that was announced from RIB, which was
+     * kV4Nexthop3.
+     */
+    auto entry1 = adjRib1->getRibEntry(/*ingress=*/false, kV4Prefix1);
+    auto entry2 = adjRib2->getRibEntry(/*ingress=*/false, kV4Prefix2);
+
+    /* Let's verify that the post attrs are the same shared_ptr. */
+    EXPECT_EQ(entry1->getPostAttr(), entry2->getPostAttr());
+    EXPECT_EQ(kV4Nexthop3, entry1->getPostAttr()->getNexthop());
+  });
+  fm_->addTask([&] {
+    terminateSharedAdjRib(adjRib1);
+    terminateSharedAdjRib(adjRib2);
+  });
+
+  evb_.loop();
+}
+
+/*
+ * Test verifying BgpUpdate2 nexthops for v4 and v6 prefixes are set
+ * correctly when they share the same initial BgpPath.
+ */
+TEST_P(AdjRibOutboundFixtureV4V6Nexthop, VerifyV4V6PrefixesNexthopsSet) {
+  const auto& param = GetParam();
+
+  // Setup AdjRib with the test parameters
+  setupAdjRib(
+      kLocalAs1,
+      kLocalAs1,
+      param.isEBgpPeer ? kRemoteAs2 : kLocalAs1, // different AS for eBGP
+      param.isRrClient, // isRrClient
+      false, // isConfedPeer
+      NextHopSelfConfigured(param.nextHopSelf),
+      param.configuredV4Nexthop,
+      param.configuredV6Nexthop,
+      true, // sessionEstablish
+      AfiIpv4Negotiated(true),
+      AfiIpv6Negotiated(true),
+      V4OverV6Nexthop(param.isV4OverV6Negotiated),
+      EnhancedRouteRefreshNegotiated(false),
+      RouteRefreshNegotiated(false));
+
+  // Create BgpPaths that are the same except for nexthop.
+  BgpUpdate2 updateV4 = buildBgpUpdateAttributes(param.originalV4Nexthop);
+  BgpUpdate2 updateV6 = buildBgpUpdateAttributes(param.originalV6Nexthop);
+  auto attrsV4 = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(updateV4)));
+  auto attrsV6 = std::make_shared<facebook::bgp::BgpPath>(
+      BgpPathFields(*BgpUpdate2toBgpPathC(updateV6)));
+
+  fm_->addTask([&] {
+    announceTo(
+        adjRib_.get(),
+        {{attrsV4, {kV4Prefix1}}, {attrsV6, {kV6Prefix1}}},
+        param.isEBgpPeer);
+  });
+
+  fm_->addTask([&] {
+    /* Let sendBgpUpdates coro run if scheduled. */
+    fiberSleepFor(10ms);
+
+    // We should receive exactly 2 BGP updates (one for v4, one for v6)
+    std::vector<std::shared_ptr<const BgpUpdate2>> updates;
+
+    // Collect both updates
+    for (int i = 0; i < 2; i++) {
+      auto msg = folly::coro::blockingWait(popFromEgressQueue());
+      ASSERT_TRUE(
+          std::holds_alternative<std::shared_ptr<const BgpUpdate2>>(*msg));
+      auto bgpUpdate = std::get<std::shared_ptr<const BgpUpdate2>>(*msg);
+      updates.push_back(bgpUpdate);
+    }
+
+    // Sort updates by AFI to ensure consistent ordering
+    std::sort(updates.begin(), updates.end(), [](const auto& a, const auto& b) {
+      return a->mpAnnounced()->afi() < b->mpAnnounced()->afi();
+    });
+
+    // First update should be v4, second should be v6
+    auto v4Update = updates[0];
+    auto v6Update = updates[1];
+
+    // Verify AFI/SAFI
+    EXPECT_EQ(BgpUpdateAfi::AFI_IPv4, v4Update->mpAnnounced()->afi());
+    EXPECT_EQ(BgpUpdateAfi::AFI_IPv6, v6Update->mpAnnounced()->afi());
+    EXPECT_EQ(BgpUpdateSafi::SAFI_UNICAST, v4Update->mpAnnounced()->safi());
+    EXPECT_EQ(BgpUpdateSafi::SAFI_UNICAST, v6Update->mpAnnounced()->safi());
+
+    // Verify prefixes
+    ASSERT_EQ(1, v4Update->mpAnnounced()->prefixes()->size());
+    ASSERT_EQ(1, v6Update->mpAnnounced()->prefixes()->size());
+    EXPECT_EQ(
+        toIPPrefix(kV4Prefix1),
+        *v4Update->mpAnnounced()->prefixes()[0].prefix());
+    EXPECT_EQ(
+        toIPPrefix(kV6Prefix1),
+        *v6Update->mpAnnounced()->prefixes()[0].prefix());
+
+    // Verify nexthops match expected values
+    EXPECT_EQ(param.expectedV4Nexthop.str(), *v4Update->attrs()->nexthop());
+    EXPECT_EQ(param.expectedV6Nexthop.str(), *v6Update->attrs()->nexthop());
+
+    // Verify nexthops inside of mpAnnounced also match expected values.
+    EXPECT_EQ(
+        network::toBinaryAddress(param.expectedV4Nexthop),
+        *v4Update->mpAnnounced()->nexthop());
+    EXPECT_EQ(
+        network::toBinaryAddress(param.expectedV6Nexthop),
+        *v6Update->mpAnnounced()->nexthop());
+
+    /*
+     * Verify the adjRibEntry has the normalized nexthop.
+     * Note that, in this scenario, this assumes that the policy
+     * does not modify the nexthop; so the normalized nexthop
+     * is the nexthop that was announced from RIB.
+     */
+    auto entryV4 = adjRib_->getRibEntry(/*ingress=*/false, kV4Prefix1);
+    auto entryV6 = adjRib_->getRibEntry(/*ingress=*/false, kV6Prefix1);
+    EXPECT_EQ(param.originalV4Nexthop, entryV4->getPostAttr()->getNexthop());
+    EXPECT_EQ(param.originalV6Nexthop, entryV6->getPostAttr()->getNexthop());
+
+    // Verify no more messages in queue
+    EXPECT_EQ(0, adjRibOutQ_->size());
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+/**
+ * Test parameters covering different v4 and v6 nexthop assignment
+ * via getNewNexthopFromAttributesOut given the following scenarios
+ *
+ *   1. peer is configured as EBGP or IBGP
+ *   2. peer is configured as RR client or not RR client
+ *   3. peer allows v4OverV6 or does not allow v4OverV6
+ *   4. Nexthop of postAttrs after policy evaluation is zero
+ */
+INSTANTIATE_TEST_SUITE_P(
+    GetNewNexthopFromAttributesOutTest,
+    AdjRibOutboundFixtureV4V6Nexthop,
+    ::testing::Values(
+        V4V6NexthopTestParam{
+            .testName = "eBgpPeer_NexthopSelf",
+            .isEBgpPeer = true,
+            .isRrClient = false,
+            .nextHopSelf = true,
+            .isV4OverV6Negotiated = false,
+            .configuredV4Nexthop = kV4Nexthop1,
+            .configuredV6Nexthop = kV6Nexthop1,
+            .originalV4Nexthop = kV4Nexthop2,
+            .originalV6Nexthop = kV6Nexthop2,
+            .expectedV4Nexthop = kV4Nexthop1,
+            .expectedV6Nexthop = kV6Nexthop1},
+        V4V6NexthopTestParam{
+            .testName = "eBgpPeer_V4OverV6Enabled",
+            .isEBgpPeer = true,
+            .isRrClient = false,
+            .nextHopSelf = true,
+            .isV4OverV6Negotiated = true,
+            .configuredV4Nexthop = kV4Nexthop1,
+            .configuredV6Nexthop = kV6Nexthop1,
+            .originalV4Nexthop = kV4Nexthop2,
+            .originalV6Nexthop = kV6Nexthop2,
+            .expectedV4Nexthop =
+                kV6Nexthop1, // V4 uses V6 nexthop when V4OverV6
+            .expectedV6Nexthop = kV6Nexthop1},
+        V4V6NexthopTestParam{
+            .testName = "iBgpPeer_RrClient_NexthopSelf",
+            .isEBgpPeer = false,
+            .isRrClient = true,
+            .nextHopSelf = true,
+            .isV4OverV6Negotiated = false,
+            .configuredV4Nexthop = kV4Nexthop1,
+            .configuredV6Nexthop = kV6Nexthop1,
+            .originalV4Nexthop = kV4Nexthop2,
+            .originalV6Nexthop = kV6Nexthop2,
+            .expectedV4Nexthop = kV4Nexthop1,
+            .expectedV6Nexthop = kV6Nexthop1},
+        V4V6NexthopTestParam{
+            .testName = "iBgpPeer_RrClient_NexthopSelfFalse",
+            .isEBgpPeer = false,
+            .isRrClient = true,
+            .nextHopSelf = false,
+            .isV4OverV6Negotiated = false,
+            .configuredV4Nexthop = kV4Nexthop1,
+            .configuredV6Nexthop = kV6Nexthop1,
+            .originalV4Nexthop = kV4Nexthop2,
+            .originalV6Nexthop = kV6Nexthop2,
+            .expectedV4Nexthop = kV4Nexthop2,
+            .expectedV6Nexthop = kV6Nexthop2},
+        V4V6NexthopTestParam{
+            .testName = "eBgpPeer_V4V6NexthopZero",
+            .isEBgpPeer = true,
+            .isRrClient = false,
+            .nextHopSelf = false,
+            .isV4OverV6Negotiated = false,
+            .configuredV4Nexthop = kV4Nexthop1,
+            .configuredV6Nexthop = kV6Nexthop1,
+            .originalV4Nexthop = folly::IPAddress("0.0.0.0"),
+            .originalV6Nexthop = folly::IPAddress("::"),
+            .expectedV4Nexthop = kV4Nexthop1, // Should trigger configured V4
+            .expectedV6Nexthop = kV6Nexthop1 // Should trigger configured V6
+        },
+        V4V6NexthopTestParam{
+            .testName = "eBgpPeer_V4LocalRouteOnly_NexthopUseV4BgpId",
+            .isEBgpPeer = true,
+            .isRrClient = false,
+            .nextHopSelf = false,
+            .isV4OverV6Negotiated = false,
+            .configuredV4Nexthop = folly::IPAddress("0.0.0.0"),
+            .configuredV6Nexthop = kV6Nexthop1,
+            .originalV4Nexthop = kV4Nexthop2,
+            .originalV6Nexthop = kV6Nexthop2,
+            .expectedV4Nexthop = kLocalAddr1.asV4(), // localBgpId
+            .expectedV6Nexthop = kV6Nexthop1},
+        V4V6NexthopTestParam{
+            .testName = "eBgpPeer_V6LocalRouteOnly_NexthopUseV6BgpId",
+            .isEBgpPeer = true,
+            .isRrClient = false,
+            .nextHopSelf = false,
+            .isV4OverV6Negotiated = false,
+            .configuredV4Nexthop = kV4Nexthop1,
+            .configuredV6Nexthop = folly::IPAddress("::"),
+            .originalV4Nexthop = kV4Nexthop2,
+            .originalV6Nexthop = kV6Nexthop2,
+            .expectedV4Nexthop = kV4Nexthop1,
+            .expectedV6Nexthop =
+                folly::IPAddress::createIPv6(kLocalAddr1.asV4()) // localBgpId
+        }),
+    [](const ::testing::TestParamInfo<V4V6NexthopTestParam>& info) {
+      return info.param.testName;
+    });
+
+/**
+ * Tests for shouldApplyNexthopSelf() / getNewNexthopFromAttributesOut()
+ * with the isNexthopSetByPolicy parameter.
+ */
+class NexthopSetByPolicyTest : public AdjRibOutboundFixture {};
+
+TEST_F(NexthopSetByPolicyTest, eBgpPeer_PolicySetNexthop_SkipsNexthopSelf) {
+  setupAdjRib(
+      kLocalAs1,
+      kLocalAs1,
+      kRemoteAs2, /* eBGP */
+      false, /* isRrClient */
+      false, /* isConfedPeer */
+      NextHopSelfConfigured(true),
+      kV4Nexthop1, /* configured v4 local */
+      kV6Nexthop1 /* configured v6 local */);
+
+  fm_->addTask([&] {
+    BgpUpdate2 update = buildBgpUpdateAttributes(kV4Nexthop2);
+    auto attrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+
+    /* Without isNexthopSetByPolicy: eBGP applies nexthop-self */
+    EXPECT_EQ(
+        kV4Nexthop1,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, false /* isNexthopSetByPolicy */));
+
+    /* With isNexthopSetByPolicy: policy nexthop is preserved */
+    EXPECT_EQ(
+        kV4Nexthop2,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, true /* isNexthopSetByPolicy */));
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+TEST_F(NexthopSetByPolicyTest, iBgpPeer_NexthopSelf_PolicySetNexthop) {
+  setupAdjRib(
+      kLocalAs1,
+      kLocalAs1,
+      kLocalAs1, /* iBGP (same AS) */
+      false, /* isRrClient */
+      false, /* isConfedPeer */
+      NextHopSelfConfigured(true),
+      kV4Nexthop1, /* configured v4 local */
+      kV6Nexthop1 /* configured v6 local */);
+
+  fm_->addTask([&] {
+    BgpUpdate2 update = buildBgpUpdateAttributes(kV4Nexthop2);
+    auto attrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+
+    /* Without flag: nextHopSelf applies */
+    EXPECT_EQ(
+        kV4Nexthop1,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, false /* isNexthopSetByPolicy */));
+
+    /* With flag: policy nexthop preserved */
+    EXPECT_EQ(
+        kV4Nexthop2,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, true /* isNexthopSetByPolicy */));
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+TEST_F(
+    NexthopSetByPolicyTest,
+    ZeroNexthop_AlwaysOverridden_EvenWithPolicyFlag) {
+  setupAdjRib(
+      kLocalAs1,
+      kLocalAs1,
+      kRemoteAs2, /* eBGP */
+      false, /* isRrClient */
+      false, /* isConfedPeer */
+      NextHopSelfConfigured(true),
+      kV4Nexthop1, /* configured v4 local */
+      kV6Nexthop1 /* configured v6 local */);
+
+  fm_->addTask([&] {
+    BgpUpdate2 update = buildBgpUpdateAttributes(folly::IPAddress("0.0.0.0"));
+    auto attrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+
+    /* Zero nexthop is always invalid — nexthop-self overrides even with flag */
+    EXPECT_EQ(
+        kV4Nexthop1,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, true /* isNexthopSetByPolicy */));
+
+    /* Same result without flag */
+    EXPECT_EQ(
+        kV4Nexthop1,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, false /* isNexthopSetByPolicy */));
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+TEST_F(NexthopSetByPolicyTest, iBgpPeer_NoNexthopSelf_NoFlag_KeepsOriginal) {
+  setupAdjRib(
+      kLocalAs1,
+      kLocalAs1,
+      kLocalAs1, /* iBGP */
+      false, /* isRrClient */
+      false, /* isConfedPeer */
+      NextHopSelfConfigured(false),
+      kV4Nexthop1,
+      kV6Nexthop1);
+
+  fm_->addTask([&] {
+    BgpUpdate2 update = buildBgpUpdateAttributes(kV4Nexthop2);
+    auto attrs = std::make_shared<facebook::bgp::BgpPath>(
+        BgpPathFields(*BgpUpdate2toBgpPathC(update)));
+
+    /* iBGP without nextHopSelf: original nexthop preserved regardless */
+    EXPECT_EQ(
+        kV4Nexthop2,
+        adjRib_->getNewNexthopFromAttributesOut(
+            true /* isV4 */, attrs, false /* isNexthopSetByPolicy */));
+
+    terminateAdjRib();
+  });
+
+  evb_.loop();
+}
+
+} // namespace facebook::bgp
