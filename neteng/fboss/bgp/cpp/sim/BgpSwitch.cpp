@@ -17,6 +17,7 @@
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 

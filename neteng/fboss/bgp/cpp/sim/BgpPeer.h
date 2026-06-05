@@ -20,9 +20,12 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <folly/IPAddress.h>
+#include <folly/container/F14Map.h>
+#include <folly/hash/Hash.h>
 
 namespace facebook::bgp {
 
@@ -63,7 +66,17 @@ enum class PeerType : uint8_t {
 struct ReceivedRoute {
   folly::CIDRNetwork cidr;
   std::string fromSwitch;
-  std::shared_ptr<BgpPath> path;
+  std::shared_ptr<const BgpPath> path;
+};
+
+/*
+ * Hash for the prefix dedup key. A typed folly::CIDRNetwork key avoids the
+ * collision risk of concatenating into a delimited string.
+ */
+struct ReceivedRouteKeyHash {
+  size_t operator()(const folly::CIDRNetwork& key) const {
+    return folly::hash::hash_combine(key.first, key.second);
+  }
 };
 
 /*
@@ -95,8 +108,22 @@ class BgpPeer {
     return remoteSwitch_;
   }
 
+  /*
+   * Insert a received route, replacing any existing entry for the same prefix
+   * so re-advertisements update in place instead of accumulating stale
+   * duplicates (keeps receivedRoutes_ bounded). The Adj-RIB-In is per-session,
+   * so keying by prefix alone mirrors production (peer identity lives on the
+   * session, not in the route key). An index keyed by prefix makes this O(1)
+   * per insert rather than scanning receivedRoutes_.
+   */
   void addReceivedRoute(ReceivedRoute route) {
-    receivedRoutes_.push_back(std::move(route));
+    const auto [it, inserted] =
+        receivedRouteIndex_.emplace(route.cidr, receivedRoutes_.size());
+    if (inserted) {
+      receivedRoutes_.push_back(std::move(route));
+    } else {
+      receivedRoutes_[it->second] = std::move(route);
+    }
   }
 
   const std::vector<ReceivedRoute>& receivedRoutes() const {
@@ -236,6 +263,10 @@ class BgpPeer {
 
   // Routes received from the remote switch, post ingress policy
   std::vector<ReceivedRoute> receivedRoutes_;
+  // Index into receivedRoutes_ keyed by prefix (per-peer, mirrors production
+  // Adj-RIB-In) for O(1) dedup.
+  folly::F14FastMap<folly::CIDRNetwork, size_t, ReceivedRouteKeyHash>
+      receivedRouteIndex_;
 };
 
 } // namespace facebook::bgp

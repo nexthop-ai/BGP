@@ -22,6 +22,9 @@
 #include <string>
 #include <vector>
 
+#include <folly/CppAttributes.h>
+#include <folly/IPAddress.h>
+
 #include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpPeer.h"
 #include "neteng/fboss/bgp/cpp/sim/RoutingTable.h"
@@ -37,6 +40,15 @@ class PolicyManager;
  * production headers.
  */
 constexpr uint32_t kLocalRouteWeight = 1 << 15;
+
+/*
+ * One route advertised over a peering session: a prefix and its (post-egress)
+ * path. Used as the inter-switch message in propagate/receive.
+ */
+struct RouteUpdate {
+  folly::CIDRNetwork prefix;
+  std::shared_ptr<const BgpPath> path;
+};
 
 /*
  * A single simulated BGP switch (router).
@@ -121,6 +133,24 @@ class BgpSwitch {
    */
   void originateRoutes();
 
+  /*
+   * Advertise this switch's best paths to every linked peer. For each peer the
+   * peer's egress policy is applied; accepted routes are delivered directly to
+   * the remote switch's receiveRoutes() (in-process, no TCP).
+   */
+  void propagateRoutes();
+
+  /*
+   * Receive routes advertised by a remote switch over the session described by
+   * fromPeer (the sender's peer, identifying the link). Applies this switch's
+   * ingress policy, drops AS-path loops, records the routes on the local
+   * receiving peer and inserts them into the RIB.
+   */
+  void receiveRoutes(
+      const BgpPeer& fromPeer,
+      const std::string& fromSwitchName,
+      const std::vector<RouteUpdate>& routes);
+
  private:
   /*
    * Build peers_ from the config, resolving each peer's peer_group_name to the
@@ -137,6 +167,22 @@ class BgpSwitch {
 
   // Originate a single configured network into the local RIB.
   void originateNetwork(const thrift::BgpNetwork& network);
+
+  // Candidate prefixes this switch could advertise (originated + received).
+  std::vector<folly::CIDRNetwork> advertisablePrefixes() const;
+
+  // The local peer facing neighbor `neighborAddr`, or nullptr if none.
+  BgpPeer* FOLLY_NULLABLE findPeerToward(const folly::IPAddress& neighborAddr);
+
+  /*
+   * Run a named ingress/egress/origination policy on a path. Returns the
+   * (possibly transformed) path, or nullptr if the policy rejected the prefix.
+   * Throws if the policy is not configured.
+   */
+  std::shared_ptr<const BgpPath> applyRoutePolicy(
+      const std::string& policyName,
+      const folly::CIDRNetwork& prefix,
+      const std::shared_ptr<const BgpPath>& path);
 
   std::string name_;
   uint64_t routerId_{0};
