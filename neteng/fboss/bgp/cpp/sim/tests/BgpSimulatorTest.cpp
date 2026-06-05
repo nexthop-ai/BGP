@@ -24,11 +24,19 @@
 
 #include <algorithm>
 #include <memory>
+#include <vector>
+
+#include <folly/IPAddress.h>
 
 #include <folly/logging/LoggerDB.h>
 #include <folly/logging/test/TestLogHandler.h>
 
 #include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
+#include "configerator/structs/neteng/fboss/bgp/if/gen-cpp2/bgp_attr_types.h"
+#include "neteng/fboss/bgp/cpp/common/BgpPath.h"
+#include "neteng/fboss/bgp/cpp/config/Config.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigUtils.h"
+#include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSimulator.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
@@ -55,6 +63,39 @@ thrift::BgpPeer makePeer(
   peer.next_hop6() = "::1";
   peer.remote_as_4_byte() = 65000;
   return peer;
+}
+
+thrift::BgpNetwork makeNetwork(const std::string& prefix) {
+  thrift::BgpNetwork net;
+  net.prefix() = prefix;
+  return net;
+}
+
+// Borrow the sample config's policies (includes PROPAGATE_NOTHING).
+auto loadSamplePolicies() {
+  const auto path = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/tests/sample_configs/stand_alone_conf.json");
+  Config config(
+      path, /*peerSubnetLbwMap=*/std::nullopt, /*populateConfigDb=*/false);
+  return *config.getConfig().policies();
+}
+
+// Build a published BgpPath whose AS-path is the given AS sequence.
+std::shared_ptr<const BgpPath> makePathWithAsPath(
+    const std::vector<uint32_t>& asns) {
+  neteng::fboss::bgp_attr::TAsPathSeg seg;
+  seg.seg_type() = neteng::fboss::bgp_attr::TAsPathSegType::AS_SEQUENCE;
+  seg.asns_4_byte() = std::vector<int64_t>(asns.begin(), asns.end());
+  nettools::bgplib::BgpPathC pathC;
+  pathC.nexthop = folly::IPAddress("10.0.0.1");
+  nettools::bgplib::BgpAttributesC attrs;
+  attrs.origin = nettools::bgplib::BgpAttrOrigin::BGP_ORIGIN_IGP;
+  attrs.localPref = 100;
+  attrs.asPath = createBgpAttrAsPathDedup({seg});
+  pathC.attrs = std::move(attrs);
+  auto path = std::make_shared<BgpPath>(static_cast<BgpPathFields>(pathC));
+  path->publish();
+  return path;
 }
 
 } // namespace

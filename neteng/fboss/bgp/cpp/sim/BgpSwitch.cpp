@@ -289,22 +289,16 @@ void BgpSwitch::originateNetwork(const thrift::BgpNetwork& network) {
   }
 
   std::string policyName;
+  std::shared_ptr<const BgpPath> originatedPath = std::move(path);
   if (network.policy_name().has_value() && !network.policy_name()->empty()) {
     policyName = *network.policy_name();
-    if (!policyManager_ || !policyManager_->isPolicyPresent(policyName)) {
-      throw std::runtime_error(
-          fmt::format(
-              "BgpSwitch {}: network {} references origination policy '{}' but "
-              "the policy is not configured",
-              name_,
-              *network.prefix(),
-              policyName));
-    }
-    auto policyOut = policyManager_->applyPolicy(
-        policyName, PolicyInMessage({prefix}, path));
-    const auto it = policyOut.result.find(prefix);
-    /* Rejected prefixes are either absent or present with null attrs. */
-    if (it == policyOut.result.end() || !it->second->attrs) {
+    /*
+     * Reuse the shared policy-application helper (also used by ingress/egress)
+     * so the policy-lookup / applyPolicy / null-attrs-reject flow lives in one
+     * place. applyRoutePolicy throws if the policy is not configured.
+     */
+    originatedPath = applyRoutePolicy(policyName, prefix, originatedPath);
+    if (!originatedPath) {
       XLOGF(
           DBG2,
           "BgpSwitch {}: origination policy {} rejected prefix {}",
@@ -313,11 +307,69 @@ void BgpSwitch::originateNetwork(const thrift::BgpNetwork& network) {
           *network.prefix());
       return;
     }
-    path = it->second->attrs;
   }
 
-  path->publish();
-  routingTable_.addOriginatedRoute(prefix, path, policyName);
+  std::const_pointer_cast<BgpPath>(originatedPath)->publish();
+  routingTable_.addOriginatedRoute(prefix, originatedPath, policyName);
+}
+
+std::vector<folly::CIDRNetwork> BgpSwitch::advertisablePrefixes() const {
+  folly::F14FastSet<folly::CIDRNetwork> seen;
+  std::vector<folly::CIDRNetwork> prefixes;
+  const auto add = [&](const folly::CIDRNetwork& prefix) {
+    if (seen.insert(prefix).second) {
+      prefixes.push_back(prefix);
+    }
+  };
+  for (const auto& net : networks4_) {
+    add(folly::IPAddress::createNetwork(*net.prefix()));
+  }
+  for (const auto& net : networks6_) {
+    add(folly::IPAddress::createNetwork(*net.prefix()));
+  }
+  for (const auto& peer : peers_) {
+    for (const auto& received : peer.receivedRoutes()) {
+      add(received.cidr);
+    }
+  }
+  return prefixes;
+}
+
+BgpPeer* FOLLY_NULLABLE
+BgpSwitch::findPeerToward(const folly::IPAddress& neighborAddr) {
+  for (auto& peer : peers_) {
+    if (peer.peerIp() == neighborAddr) {
+      return &peer;
+    }
+  }
+  return nullptr;
+}
+
+std::shared_ptr<const BgpPath> BgpSwitch::applyRoutePolicy(
+    const std::string& policyName,
+    const folly::CIDRNetwork& prefix,
+    const std::shared_ptr<const BgpPath>& path) {
+  if (!policyManager_ || !policyManager_->isPolicyPresent(policyName)) {
+    throw std::runtime_error(
+        fmt::format(
+            "BgpSwitch {}: policy '{}' for prefix {} is not configured",
+            name_,
+            policyName,
+            folly::IPAddress::networkToString(prefix)));
+  }
+  /*
+   * Published paths are immutable; applyPolicy clones on modification, so it
+   * never mutates the input. The const_cast only satisfies the API's
+   * shared_ptr<BgpPath> parameter.
+   */
+  auto inAttrs = std::const_pointer_cast<BgpPath>(path);
+  auto policyOut = policyManager_->applyPolicy(
+      policyName, PolicyInMessage({prefix}, inAttrs));
+  const auto it = policyOut.result.find(prefix);
+  if (it == policyOut.result.end() || !it->second->attrs) {
+    return nullptr;
+  }
+  return it->second->attrs;
 }
 
 } // namespace facebook::bgp
