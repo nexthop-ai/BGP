@@ -31,6 +31,14 @@ namespace facebook::bgp {
 class PolicyManager;
 
 /*
+ * Weight applied to locally originated routes so they win path selection over
+ * learned routes when weight comparison is enabled. Mirrors the value used by
+ * production RibBase::createLocalRoute(); kept sim-local to avoid touching
+ * production headers.
+ */
+constexpr uint32_t kLocalRouteWeight = 1 << 15;
+
+/*
  * A single simulated BGP switch (router).
  *
  * Owns the per-switch view derived from one BgpConfig: the global identity
@@ -103,6 +111,16 @@ class BgpSwitch {
     return policyManager_.get();
   }
 
+  /*
+   * Originate the switch's configured networks into the local RIB. Each network
+   * becomes a locally originated BgpPath (default IGP origin, default
+   * local-pref, local-route weight), optionally transformed/rejected by its
+   * origination policy, and inserted so it participates in best-path selection.
+   *
+   * Idempotent: repeated calls after the first are no-ops.
+   */
+  void originateRoutes();
+
  private:
   /*
    * Build peers_ from the config, resolving each peer's peer_group_name to the
@@ -117,6 +135,9 @@ class BgpSwitch {
    */
   void initPolicyManager(const thrift::BgpConfig& config);
 
+  // Originate a single configured network into the local RIB.
+  void originateNetwork(const thrift::BgpNetwork& network);
+
   std::string name_;
   uint64_t routerId_{0};
   uint32_t localAsn_{0};
@@ -129,6 +150,9 @@ class BgpSwitch {
   RoutingTable routingTable_;
   std::vector<BgpPeer> peers_;
   std::unique_ptr<PolicyManager> policyManager_;
+
+  // Guards originateRoutes() so routes are originated at most once.
+  bool routesOriginated_{false};
 };
 
 } // namespace facebook::bgp

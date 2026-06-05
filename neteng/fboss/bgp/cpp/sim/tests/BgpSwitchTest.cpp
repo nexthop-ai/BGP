@@ -26,6 +26,7 @@
 #include <folly/IPAddress.h>
 
 #include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/Config.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
@@ -50,6 +51,18 @@ thrift::BgpConfig makeBaseConfig() {
   config.router_id() = "10.0.0.1";
   config.local_as_4_byte() = 65000;
   return config;
+}
+
+// A network to originate, optionally guarded by an origination policy.
+thrift::BgpNetwork makeNetwork(
+    const std::string& prefix,
+    const std::optional<std::string>& policyName = std::nullopt) {
+  thrift::BgpNetwork net;
+  net.prefix() = prefix;
+  if (policyName.has_value()) {
+    net.policy_name() = *policyName;
+  }
+  return net;
 }
 
 } // namespace
@@ -156,7 +169,125 @@ TEST_F(BgpSwitchTest, MissingLocalAsnThrows) {
   thrift::BgpConfig config;
   config.router_id() = "10.0.0.1";
 
-  EXPECT_THROW(BgpSwitch("rsw005", config), std::runtime_error);
+  EXPECT_THROW(BgpSwitch("rsw004", config), std::runtime_error);
+}
+
+/*
+ * Originated networks (no policy) become local routes with production default
+ * attributes: IGP origin, default local-pref, and the local-route weight.
+ */
+TEST_F(BgpSwitchTest, OriginateRoutesDefaultAttributes) {
+  thrift::BgpConfig config = makeBaseConfig();
+  config.networks4() = {makeNetwork("10.50.0.0/24")};
+  config.networks6() = {makeNetwork("2401:db00::/32")};
+
+  BgpSwitch sw("rsw005", config);
+  sw.originateRoutes();
+
+  EXPECT_EQ(2u, sw.routingTable().originatedSize());
+
+  const auto v4Prefix = folly::IPAddress::createNetwork("10.50.0.0/24");
+  const auto* entry = sw.routingTable().getEntry(v4Prefix);
+  ASSERT_NE(nullptr, entry);
+  const auto& paths = entry->getAllPaths();
+  const auto it = paths.find(std::string(RoutingTable::kLocalPeerAddr));
+  ASSERT_NE(it, paths.end());
+  const SimRouteInfo& route = *it->second;
+
+  EXPECT_EQ(kDefaultLocalPref, route.getBgpLocalPreference());
+  EXPECT_EQ(kLocalRouteWeight, route.getBgpWeightValue());
+  EXPECT_EQ(
+      static_cast<int64_t>(nettools::bgplib::BgpAttrOrigin::BGP_ORIGIN_IGP),
+      route.getBgpOriginCode());
+
+  // The IPv6 network is originated too.
+  EXPECT_NE(
+      nullptr,
+      sw.routingTable().getEntry(
+          folly::IPAddress::createNetwork("2401:db00::/32")));
+}
+
+/*
+ * A network whose origination policy rejects it is dropped, while a sibling
+ * network with no policy is still originated.
+ */
+TEST_F(BgpSwitchTest, OriginationPolicyRejectsRoute) {
+  const auto configPath = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/tests/sample_configs/stand_alone_conf.json");
+  Config parsed(
+      configPath,
+      /*peerSubnetLbwMap=*/std::nullopt,
+      /*populateConfigDb=*/false);
+
+  thrift::BgpConfig config = parsed.getConfig();
+  // PROPAGATE_NOTHING is the config's "block all" policy.
+  config.networks4() = {
+      makeNetwork("10.60.0.0/24"),
+      makeNetwork("10.61.0.0/24", "PROPAGATE_NOTHING")};
+
+  BgpSwitch sw("rsw006", config);
+  sw.originateRoutes();
+
+  EXPECT_EQ(1u, sw.routingTable().originatedSize());
+  EXPECT_NE(
+      nullptr,
+      sw.routingTable().getEntry(
+          folly::IPAddress::createNetwork("10.60.0.0/24")));
+  EXPECT_EQ(
+      nullptr,
+      sw.routingTable().getEntry(
+          folly::IPAddress::createNetwork("10.61.0.0/24")));
+}
+
+/*
+ * originateRoutes() is idempotent: calling it more than once does not
+ * re-originate or duplicate routes.
+ */
+TEST_F(BgpSwitchTest, OriginateRoutesIsIdempotent) {
+  thrift::BgpConfig config = makeBaseConfig();
+  config.networks4() = {makeNetwork("10.50.0.0/24")};
+
+  BgpSwitch sw("rsw005", config);
+  sw.originateRoutes();
+  sw.originateRoutes();
+
+  EXPECT_EQ(1u, sw.routingTable().originatedSize());
+}
+
+/*
+ * A network whose origin value is outside the valid BgpAttrOrigin range is
+ * rejected (mirrors RibBase::createLocalRoute validation) and not originated.
+ */
+TEST_F(BgpSwitchTest, InvalidOriginRejected) {
+  thrift::BgpConfig config = makeBaseConfig();
+  thrift::BgpNetwork net = makeNetwork("10.70.0.0/24");
+  // 99 is well outside the valid BgpAttrOrigin range (IGP/EGP/INCOMPLETE).
+  net.origin() = 99;
+  config.networks4() = {net};
+
+  BgpSwitch sw("rsw007", config);
+  sw.originateRoutes();
+
+  EXPECT_EQ(0u, sw.routingTable().originatedSize());
+  EXPECT_EQ(
+      nullptr,
+      sw.routingTable().getEntry(
+          folly::IPAddress::createNetwork("10.70.0.0/24")));
+}
+
+/*
+ * A network that references an origination policy which is not configured is a
+ * config error: originateNetwork() throws. Here no policies are configured at
+ * all (policyManager() is null), so the named policy cannot be present.
+ */
+TEST_F(BgpSwitchTest, OriginationPolicyNotConfiguredThrows) {
+  thrift::BgpConfig config = makeBaseConfig();
+  config.networks4() = {makeNetwork("10.80.0.0/24", "missing_policy")};
+
+  BgpSwitch sw("rsw008", config);
+  ASSERT_EQ(nullptr, sw.policyManager());
+
+  EXPECT_THROW(sw.originateRoutes(), std::runtime_error);
 }
 
 } // namespace facebook::bgp

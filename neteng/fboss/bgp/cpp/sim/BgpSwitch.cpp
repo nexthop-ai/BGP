@@ -23,9 +23,15 @@
 #include <fmt/format.h>
 #include <folly/IPAddress.h>
 #include <folly/container/F14Map.h>
+#include <folly/logging/xlog.h>
 
+#include "neteng/fboss/bgp/cpp/common/BgpPath.h"
+#include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigUtils.h"
+#include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
+#include "neteng/fboss/bgp/cpp/policy/PolicyStructs.h"
 
 namespace facebook::bgp {
 
@@ -101,6 +107,67 @@ RoutingTableConfig makeRoutingTableConfig(
   rtConfig.countConfedsInAsPathLen =
       config.count_confeds_in_as_path_len().value_or(false);
   return rtConfig;
+}
+
+/*
+ * Build the BgpPath for a locally originated network, mirroring
+ * RibBase::createLocalRoute(): default nexthop, IGP origin, default local-pref,
+ * optional communities/as-path, and the local-route weight applied up front so
+ * an origination policy can observe and override it. Returns nullptr (and logs)
+ * when the configured origin is outside the valid BgpAttrOrigin range, matching
+ * the production validation. The returned path is unpublished.
+ */
+std::shared_ptr<BgpPath> buildOriginatedPath(
+    const folly::CIDRNetwork& prefix,
+    const thrift::BgpNetwork& network) {
+  nettools::bgplib::BgpPathC pathC;
+  if (prefix.first.isV4()) {
+    pathC.nexthop = network.nexthop().has_value()
+        ? folly::IPAddress(*network.nexthop())
+        : kLocalRouteV4Nexthop;
+  } else {
+    pathC.nexthop = network.nexthop().has_value()
+        ? folly::IPAddress(*network.nexthop())
+        : kLocalRouteV6Nexthop;
+  }
+
+  nettools::bgplib::BgpAttributesC attrs;
+  if (network.origin().has_value()) {
+    const auto origin = *network.origin();
+    if (origin < static_cast<int>(apache::thrift::TEnumTraits<
+                                  nettools::bgplib::BgpAttrOrigin>::min()) ||
+        origin > static_cast<int>(apache::thrift::TEnumTraits<
+                                  nettools::bgplib::BgpAttrOrigin>::max())) {
+      XLOGF(
+          ERR,
+          "Invalid origin value {} for originated network {}",
+          origin,
+          *network.prefix());
+      return nullptr;
+    }
+    attrs.origin = static_cast<nettools::bgplib::BgpAttrOrigin>(origin);
+  } else {
+    attrs.origin = nettools::bgplib::BgpAttrOrigin::BGP_ORIGIN_IGP;
+  }
+  attrs.localPref = network.local_pref().has_value()
+      ? static_cast<uint32_t>(*network.local_pref())
+      : kDefaultLocalPref;
+  if (network.communities().has_value()) {
+    attrs.communities = createBgpAttrCommunitiesC(*network.communities());
+  }
+  if (network.as_path().has_value()) {
+    attrs.asPath = createBgpAttrAsPathDedup(*network.as_path());
+  }
+  pathC.attrs = std::move(attrs);
+
+  auto path = std::make_shared<BgpPath>(static_cast<BgpPathFields>(pathC));
+  /*
+   * Set the local-route weight before policy application so an origination
+   * policy can observe and override it (matches RibBase::createLocalRoute,
+   * where the weight is set on attrs before getBgpPathFromPolicy()).
+   */
+  path->setWeight(kLocalRouteWeight);
+  return path;
 }
 
 } // namespace
@@ -190,6 +257,66 @@ void BgpSwitch::initPolicyManager(const thrift::BgpConfig& config) {
       localConfedAsn_);
   policyManager_ =
       std::make_unique<PolicyManager>(*config.policies(), &globalConfig);
+}
+
+void BgpSwitch::originateRoutes() {
+  if (routesOriginated_) {
+    return;
+  }
+  for (const auto& network : networks4_) {
+    originateNetwork(network);
+  }
+  for (const auto& network : networks6_) {
+    originateNetwork(network);
+  }
+  /*
+   * Mark as originated only after a full successful pass. originateNetwork()
+   * throws if a network references an unconfigured policy; leaving the guard
+   * unset on a thrown config error keeps origination all-or-nothing rather
+   * than marking the switch done after a partial pass (addOriginatedRoute is
+   * idempotent per-prefix).
+   */
+  routesOriginated_ = true;
+}
+
+void BgpSwitch::originateNetwork(const thrift::BgpNetwork& network) {
+  const auto prefix = folly::IPAddress::createNetwork(*network.prefix());
+  auto path = buildOriginatedPath(prefix, network);
+  if (!path) {
+    /* Invalid origin value; buildOriginatedPath already logged the error. */
+    return;
+  }
+
+  std::string policyName;
+  if (network.policy_name().has_value() && !network.policy_name()->empty()) {
+    policyName = *network.policy_name();
+    if (!policyManager_ || !policyManager_->isPolicyPresent(policyName)) {
+      throw std::runtime_error(
+          fmt::format(
+              "BgpSwitch {}: network {} references origination policy '{}' but "
+              "the policy is not configured",
+              name_,
+              *network.prefix(),
+              policyName));
+    }
+    auto policyOut = policyManager_->applyPolicy(
+        policyName, PolicyInMessage({prefix}, path));
+    const auto it = policyOut.result.find(prefix);
+    /* Rejected prefixes are either absent or present with null attrs. */
+    if (it == policyOut.result.end() || !it->second->attrs) {
+      XLOGF(
+          DBG2,
+          "BgpSwitch {}: origination policy {} rejected prefix {}",
+          name_,
+          policyName,
+          *network.prefix());
+      return;
+    }
+    path = it->second->attrs;
+  }
+
+  path->publish();
+  routingTable_.addOriginatedRoute(prefix, path, policyName);
 }
 
 } // namespace facebook::bgp
