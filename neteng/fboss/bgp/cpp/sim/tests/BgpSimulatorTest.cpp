@@ -472,4 +472,122 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param.name;
     });
 
+/*
+ * AFI filtering in propagateRoutes drops routes of an address family that the
+ * receiving peer has disabled. Parameterized over which AFI is disabled so the
+ * v4-disabled and v6-disabled cases share one body.
+ */
+struct AfiFilterCase {
+  bool disableIpv4;
+  bool disableIpv6;
+  bool expectV4Received;
+  bool expectV6Received;
+};
+
+class BgpSimulatorAfiFilterTest
+    : public ::testing::TestWithParam<AfiFilterCase> {};
+
+TEST_P(BgpSimulatorAfiFilterTest, FiltersDisabledAfi) {
+  const AfiFilterCase& tc = GetParam();
+
+  thrift::BgpConfig cfgA = makeConfig("10.0.0.1", 65000);
+  thrift::BgpPeer peerA = makePeer("10.0.0.2", "10.0.0.1");
+  peerA.disable_ipv4_afi() = tc.disableIpv4;
+  peerA.disable_ipv6_afi() = tc.disableIpv6;
+  cfgA.peers() = {peerA};
+  cfgA.networks4() = {makeNetwork("10.50.0.0/24")};
+  cfgA.networks6() = {makeNetwork("2001:db8::/32")};
+
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65000);
+  cfgB.peers() = {makePeer("10.0.0.1", "10.0.0.2")};
+
+  BgpSimulator sim;
+  sim.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+  sim.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+  sim.resolvePeerLinks();
+
+  const size_t iterations = sim.run(/*maxIterations=*/50);
+  EXPECT_LT(iterations, 50u);
+
+  const BgpSwitch& b = *sim.switches()[1];
+  const auto v4prefix = folly::IPAddress::createNetwork("10.50.0.0/24");
+  const auto v6prefix = folly::IPAddress::createNetwork("2001:db8::/32");
+
+  EXPECT_EQ(
+      tc.expectV4Received, b.routingTable().getEntry(v4prefix) != nullptr);
+  EXPECT_EQ(
+      tc.expectV6Received, b.routingTable().getEntry(v6prefix) != nullptr);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BgpSimulator,
+    BgpSimulatorAfiFilterTest,
+    ::testing::Values(
+        AfiFilterCase{/*disableIpv4=*/true,
+                      /*disableIpv6=*/false,
+                      /*expectV4Received=*/false,
+                      /*expectV6Received=*/true},
+        AfiFilterCase{/*disableIpv4=*/false,
+                      /*disableIpv6=*/true,
+                      /*expectV4Received=*/true,
+                      /*expectV6Received=*/false}));
+
+/*
+ * AFI filtering on ingress (receiveRoutes) drops routes of a family the
+ * RECEIVING peer has disabled, mirroring production where the negotiated
+ * MP-BGP capability gates the NLRI parser. This is only observable with
+ * asymmetric config: the sender (A) disables nothing and advertises both
+ * families, while the receiver (B) has a family disabled and must drop it on
+ * ingress. Parameterized over which AFI B disables.
+ */
+class BgpSimulatorIngressAfiFilterTest
+    : public ::testing::TestWithParam<AfiFilterCase> {};
+
+TEST_P(BgpSimulatorIngressAfiFilterTest, FiltersDisabledAfiOnIngress) {
+  const AfiFilterCase& tc = GetParam();
+
+  // Sender A originates both families and disables nothing.
+  thrift::BgpConfig cfgA = makeConfig("10.0.0.1", 65000);
+  cfgA.peers() = {makePeer("10.0.0.2", "10.0.0.1")};
+  cfgA.networks4() = {makeNetwork("10.50.0.0/24")};
+  cfgA.networks6() = {makeNetwork("2001:db8::/32")};
+
+  // Receiver B disables a family on its session toward A.
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", 65000);
+  thrift::BgpPeer peerB = makePeer("10.0.0.1", "10.0.0.2");
+  peerB.disable_ipv4_afi() = tc.disableIpv4;
+  peerB.disable_ipv6_afi() = tc.disableIpv6;
+  cfgB.peers() = {peerB};
+
+  BgpSimulator sim;
+  sim.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+  sim.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+  sim.resolvePeerLinks();
+
+  const size_t iterations = sim.run(/*maxIterations=*/50);
+  EXPECT_LT(iterations, 50u);
+
+  const BgpSwitch& b = *sim.switches()[1];
+  const auto v4prefix = folly::IPAddress::createNetwork("10.50.0.0/24");
+  const auto v6prefix = folly::IPAddress::createNetwork("2001:db8::/32");
+
+  EXPECT_EQ(
+      tc.expectV4Received, b.routingTable().getEntry(v4prefix) != nullptr);
+  EXPECT_EQ(
+      tc.expectV6Received, b.routingTable().getEntry(v6prefix) != nullptr);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BgpSimulator,
+    BgpSimulatorIngressAfiFilterTest,
+    ::testing::Values(
+        AfiFilterCase{/*disableIpv4=*/true,
+                      /*disableIpv6=*/false,
+                      /*expectV4Received=*/false,
+                      /*expectV6Received=*/true},
+        AfiFilterCase{/*disableIpv4=*/false,
+                      /*disableIpv6=*/true,
+                      /*expectV4Received=*/true,
+                      /*expectV6Received=*/false}));
+
 } // namespace facebook::bgp

@@ -488,6 +488,10 @@ void BgpSwitch::propagateRoutes() {
     const PeerType egressType = peer.peerType();
     std::vector<RouteUpdate> updates;
     for (const auto& prefix : prefixes) {
+      if ((prefix.first.isV4() && peer.disableIpv4Afi()) ||
+          (prefix.first.isV6() && peer.disableIpv6Afi())) {
+        continue;
+      }
       const SimRibEntry* entry = routingTable_.getEntry(prefix);
       if (entry == nullptr) {
         continue;
@@ -538,6 +542,20 @@ void BgpSwitch::receiveRoutes(
   const bool medMissingAsWorst = routingTable_.config().enableMedMissingAsWorst;
 
   for (const auto& update : routes) {
+    /*
+     * AFI filtering on ingress mirrors production: when a session has an
+     * address family disabled, the negotiated MP-BGP capability for that AFI is
+     * off, so production's NLRI parser drops those prefixes before they ever
+     * reach the AdjRib (BgpMessageParserUtils::parseMpNlri). Drop the disabled
+     * family here for the same effect. This only changes behavior when the
+     * sender did not also disable the family (asymmetric config); with
+     * symmetric config the egress guard in propagateRoutes already omits them.
+     */
+    if ((update.prefix.first.isV4() && recvPeer->disableIpv4Afi()) ||
+        (update.prefix.first.isV6() && recvPeer->disableIpv6Afi())) {
+      continue;
+    }
+
     std::shared_ptr<const BgpPath> path = update.path;
     if (path == nullptr) {
       continue;
