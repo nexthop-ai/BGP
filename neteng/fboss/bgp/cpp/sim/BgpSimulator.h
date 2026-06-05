@@ -55,6 +55,29 @@ class BgpSimulator {
    */
   void loadConfigs(const std::vector<std::string>& configPaths);
 
+  /*
+   * Load an aggregated config file: a JSON object with a single outer wrapper
+   * key whose value maps switch name -> BgpConfig (the format produced by the
+   * emulator `routes save-bgp-configs` command, where each inner value is a
+   * switch's BGPCPP running config). The wrapper key's name is irrelevant and
+   * is stripped before parsing. For example:
+   *
+   *   {
+   *     "bgp_configs": {
+   *       "switch_name1": { ...BgpConfig... },
+   *       "switch_name2": { ...BgpConfig... }
+   *     }
+   *   }
+   *
+   * One BgpSwitch is built per inner map entry, named by the map key, with
+   * entries processed in sorted-name order for deterministic output. Throws if
+   * the file cannot be read, is not a JSON object with exactly one wrapper key,
+   * any entry is not a valid switch config, or a switch name collides with one
+   * already loaded (including duplicates across multiple aggregated files
+   * passed in one invocation).
+   */
+  void loadAggregatedConfig(const std::string& configPath);
+
   // Add a pre-built switch (for programmatic topologies and tests).
   void addSwitch(std::shared_ptr<BgpSwitch> bgpSwitch);
 

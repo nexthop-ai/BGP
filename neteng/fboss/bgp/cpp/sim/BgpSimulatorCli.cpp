@@ -92,10 +92,17 @@ std::vector<std::string> collectConfigPaths(
 
 int runSimulation(
     const std::vector<std::string>& configPaths,
-    std::ostream& os) {
+    std::ostream& os,
+    bool aggregated) {
   BgpSimulator simulator;
   try {
-    simulator.loadConfigs(configPaths);
+    if (aggregated) {
+      for (const auto& path : configPaths) {
+        simulator.loadAggregatedConfig(path);
+      }
+    } else {
+      simulator.loadConfigs(configPaths);
+    }
     simulator.resolvePeerLinks();
     const size_t iterations = simulator.run();
     const bool converged = iterations < BgpSimulator::kDefaultMaxIterations;

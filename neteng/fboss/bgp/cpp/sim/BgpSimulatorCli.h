@@ -34,9 +34,17 @@ std::vector<std::string> collectConfigPaths(
  * Load the given per-switch configs, resolve peer links, run the simulation to
  * convergence, and dump each switch's RIB to `os`. Returns 0 on success or 1 on
  * error (the error is also written to `os`).
+ *
+ * When `aggregated` is true, each path is instead an aggregated config file: a
+ * JSON object with a single outer wrapper key whose value maps switch name ->
+ * BgpConfig (the format produced by the emulator `routes save-bgp-configs`
+ * command), e.g. `{"bgp_configs": {"switch_name1": {...}, "switch_name2":
+ * {...}}}`. Every switch in the map is loaded; directory expansion does not
+ * apply.
  */
 int runSimulation(
     const std::vector<std::string>& configPaths,
-    std::ostream& os);
+    std::ostream& os,
+    bool aggregated = false);
 
 } // namespace facebook::bgp

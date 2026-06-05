@@ -18,14 +18,36 @@
 #include <string>
 #include <vector>
 
+#include <gflags/gflags.h>
+
 #include <folly/init/Init.h>
 
 #include "neteng/fboss/bgp/cpp/sim/BgpSimulatorCli.h"
+
+DEFINE_bool(
+    aggregated_config,
+    false,
+    "Treat each argument as an aggregated config file: a JSON object with a "
+    "single outer wrapper key whose value maps switch name -> BgpConfig (as "
+    "produced by the emulator `routes save-bgp-configs` command, e.g. "
+    "{\"bgp_configs\": {\"switch_name1\": {...}, \"switch_name2\": {...}}}), "
+    "instead of a per-switch config file or a directory of them.");
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv);
 
   const std::vector<std::string> args(argv + 1, argv + argc);
+
+  if (FLAGS_aggregated_config) {
+    if (args.empty()) {
+      std::cerr << "Usage: " << argv[0]
+                << " --aggregated_config <aggregated_config_file>..."
+                << std::endl;
+      return 1;
+    }
+    return facebook::bgp::runSimulation(args, std::cout, /*aggregated=*/true);
+  }
+
   const auto configPaths = facebook::bgp::collectConfigPaths(args);
   if (configPaths.empty()) {
     std::cerr << "Usage: " << argv[0] << " <config_dir | config_file>..."

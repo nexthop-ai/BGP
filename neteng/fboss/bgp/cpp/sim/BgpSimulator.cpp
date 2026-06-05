@@ -17,11 +17,20 @@
 #include "neteng/fboss/bgp/cpp/sim/BgpSimulator.h"
 
 #include <filesystem>
+#include <map>
+#include <stdexcept>
 #include <utility>
 
+#include <fmt/format.h>
+#include <folly/ExceptionString.h>
+#include <folly/FileUtil.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
+#include <folly/json.h>
 #include <folly/logging/xlog.h>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
 
+#include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
 #include "neteng/fboss/bgp/cpp/config/Config.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 
@@ -74,6 +83,107 @@ void BgpSimulator::loadConfigs(const std::vector<std::string>& configPaths) {
 
 void BgpSimulator::addSwitch(std::shared_ptr<BgpSwitch> bgpSwitch) {
   switches_.push_back(std::move(bgpSwitch));
+}
+
+void BgpSimulator::loadAggregatedConfig(const std::string& configPath) {
+  std::string contents;
+  if (!folly::readFile(configPath.c_str(), contents)) {
+    throw std::runtime_error(
+        fmt::format("Could not read aggregated config file: {}", configPath));
+  }
+
+  /*
+   * Only the parse itself can throw a JSON syntax error; keep the try/catch
+   * narrow so structural-validation failures below report their own accurate
+   * message instead of being rewrapped as "not valid JSON".
+   */
+  folly::dynamic root;
+  try {
+    root = folly::parseJson(contents);
+  } catch (const std::exception& ex) {
+    throw std::runtime_error(
+        fmt::format(
+            "Aggregated config {} is not valid JSON: {}",
+            configPath,
+            folly::exceptionStr(ex)));
+  }
+
+  /*
+   * Strip the single outer wrapper key (its name is irrelevant) to get the
+   * switch-name -> BgpConfig map. Read out into a separate object: assigning a
+   * sub-reference back onto its owning dynamic is a use-after-free.
+   */
+  if (!root.isObject() || root.size() != 1) {
+    throw std::runtime_error(
+        fmt::format(
+            "Aggregated config {} must be a JSON object with a single "
+            "top-level wrapper key mapping to switch name -> BgpConfig",
+            configPath));
+  }
+  folly::dynamic parsed = std::move(root.items().begin()->second);
+  if (!parsed.isObject()) {
+    throw std::runtime_error(
+        fmt::format(
+            "Aggregated config {} wrapper value must be a JSON object mapping "
+            "switch name -> BgpConfig",
+            configPath));
+  }
+
+  /*
+   * Collect into a std::map so switches are built in deterministic (sorted by
+   * name) order, mirroring the sorted file order collectConfigPaths produces
+   * for directory input. Each value is parsed with the same
+   * SimpleJSONSerializer path the production Config parser uses for a single
+   * per-switch config.
+   */
+  std::map<std::string, thrift::BgpConfig> configsByName;
+  for (const auto& [nameDyn, configDyn] : parsed.items()) {
+    const auto name = nameDyn.asString();
+    thrift::BgpConfig config;
+    try {
+      apache::thrift::SimpleJSONSerializer::deserialize(
+          folly::toJson(configDyn), config);
+    } catch (const std::exception& ex) {
+      throw std::runtime_error(
+          fmt::format(
+              "Could not parse BgpConfig for switch '{}' in aggregated config "
+              "{}: {}",
+              name,
+              configPath,
+              folly::exceptionStr(ex)));
+    }
+    if (!configsByName.emplace(name, std::move(config)).second) {
+      throw std::runtime_error(
+          fmt::format(
+              "Aggregated config {} contains duplicate switch name '{}'",
+              configPath,
+              name));
+    }
+  }
+
+  /*
+   * Build switches in deterministic (sorted by name) order. Guard against a
+   * switch name that was already loaded by a previous aggregated file on the
+   * same command line: configsByName only dedups within this file, so without
+   * this check overlapping names across files would be silently appended and
+   * later surface only as an address-collision warning in buildAddrToSwitchMap.
+   */
+  folly::F14FastSet<std::string> existingNames;
+  existingNames.reserve(switches_.size());
+  for (const auto& sw : switches_) {
+    existingNames.insert(sw->name());
+  }
+  for (auto& [name, config] : configsByName) {
+    if (!existingNames.insert(name).second) {
+      throw std::runtime_error(
+          fmt::format(
+              "Aggregated config {} contains switch name '{}' that was already "
+              "loaded (duplicate switch name across config files)",
+              configPath,
+              name));
+    }
+    switches_.push_back(std::make_shared<BgpSwitch>(name, std::move(config)));
+  }
 }
 
 folly::F14FastMap<folly::IPAddress, std::shared_ptr<BgpSwitch>>

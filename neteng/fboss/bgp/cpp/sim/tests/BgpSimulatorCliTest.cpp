@@ -40,7 +40,7 @@ TEST_F(BgpSimulatorCliTest, RunSimulationDumpsRib) {
       "neteng/fboss/bgp/cpp/tests/sample_configs/stand_alone_conf.json");
 
   std::ostringstream oss;
-  const int rc = runSimulation({configPath}, oss);
+  const int rc = runSimulation({configPath}, oss, /*aggregated=*/false);
 
   EXPECT_EQ(0, rc);
   const std::string out = oss.str();
@@ -99,6 +99,40 @@ TEST_F(BgpSimulatorCliTest, CollectConfigPathsSortsArguments) {
 TEST_F(BgpSimulatorCliTest, NonExistentConfigReturnsError) {
   std::ostringstream oss;
   const int rc = runSimulation({"/tmp/bgp_sim_does_not_exist.json"}, oss);
+
+  EXPECT_EQ(1, rc);
+  EXPECT_NE(std::string::npos, oss.str().find("Error"));
+}
+
+/*
+ * Aggregated mode loads every switch from a single switch-name -> BgpConfig
+ * map file and dumps one RIB section per switch, keyed by the map's names.
+ */
+TEST_F(BgpSimulatorCliTest, RunSimulationAggregatedDumpsAllSwitches) {
+  const auto configPath = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/sim/tests/sample_config/aggregated_2_switch.json");
+
+  std::ostringstream oss;
+  const int rc = runSimulation({configPath}, oss, /*aggregated=*/true);
+
+  EXPECT_EQ(0, rc);
+  const std::string out = oss.str();
+  EXPECT_NE(std::string::npos, out.find("Loaded 2 switch(es)"));
+  EXPECT_NE(std::string::npos, out.find("=== Switch rtsw001.test ==="));
+  EXPECT_NE(std::string::npos, out.find("=== Switch rtsw002.test ==="));
+}
+
+/*
+ * Aggregated mode on a per-switch (single BgpConfig) file fails cleanly: such a
+ * file is not a switch-name -> BgpConfig map, so the load throws and the error
+ * is surfaced (non-zero exit).
+ */
+TEST_F(BgpSimulatorCliTest, RunSimulationAggregatedRejectsSingleConfig) {
+  const auto configPath = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/tests/sample_configs/stand_alone_conf.json");
+
+  std::ostringstream oss;
+  const int rc = runSimulation({configPath}, oss, /*aggregated=*/true);
 
   EXPECT_EQ(1, rc);
   EXPECT_NE(std::string::npos, oss.str().find("Error"));

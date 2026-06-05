@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -199,6 +200,65 @@ TEST_F(BgpSimulatorTest, DuplicateSwitchNamesWarn) {
             return entry.first.getLevel() >= folly::LogLevel::WARN;
           }))
       << "expected a WARN about the duplicate switch name";
+}
+
+/*
+ * loadAggregatedConfig() parses a single switch-name -> BgpConfig map file into
+ * one BgpSwitch per entry, named by the map key (not the file stem), in sorted
+ * name order, and the resulting switches link up exactly like per-file loading.
+ */
+TEST_F(BgpSimulatorTest, LoadAggregatedConfigBuildsSwitchesByName) {
+  const auto configPath = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/sim/tests/sample_config/aggregated_2_switch.json");
+
+  BgpSimulator sim;
+  sim.loadAggregatedConfig(configPath);
+
+  ASSERT_EQ(2u, sim.numSwitches());
+  EXPECT_EQ("rtsw001.test", sim.switches()[0]->name());
+  EXPECT_EQ("rtsw002.test", sim.switches()[1]->name());
+  EXPECT_EQ(65000u, sim.switches()[0]->localAsn());
+
+  sim.resolvePeerLinks();
+  EXPECT_TRUE(sim.switches()[0]->peers().front().isLinked());
+  EXPECT_TRUE(sim.switches()[1]->peers().front().isLinked());
+}
+
+/*
+ * A per-switch config file is a single BgpConfig object, not a switch-name ->
+ * BgpConfig map, so loading it as aggregated must throw.
+ */
+TEST_F(BgpSimulatorTest, LoadAggregatedConfigRejectsSingleConfig) {
+  const auto configPath = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/tests/sample_configs/stand_alone_conf.json");
+
+  BgpSimulator sim;
+  EXPECT_THROW(sim.loadAggregatedConfig(configPath), std::exception);
+}
+
+/*
+ * An unreadable aggregated config path throws rather than silently producing an
+ * empty topology.
+ */
+TEST_F(BgpSimulatorTest, LoadAggregatedConfigMissingFileThrows) {
+  BgpSimulator sim;
+  EXPECT_THROW(
+      sim.loadAggregatedConfig("/tmp/bgp_sim_aggregated_does_not_exist.json"),
+      std::exception);
+}
+
+/*
+ * Switch names must be unique across multiple aggregated files in one
+ * invocation: loading a file whose switch names were already loaded throws
+ * (here the same file is loaded twice).
+ */
+TEST_F(BgpSimulatorTest, LoadAggregatedConfigRejectsDuplicateAcrossFiles) {
+  const auto configPath = getAbsoluteFilePath(
+      "neteng/fboss/bgp/cpp/sim/tests/sample_config/aggregated_2_switch.json");
+
+  BgpSimulator sim;
+  sim.loadAggregatedConfig(configPath);
+  EXPECT_THROW(sim.loadAggregatedConfig(configPath), std::exception);
 }
 
 /*
