@@ -155,6 +155,29 @@ TEST_F(BgpPeerTest, RemoteAsBothSetThrows) {
   EXPECT_THROW(BgpPeer p(peer), facebook::bgp::BgpError);
 }
 
+/*
+ * A next_hop4 string that does not parse as an IP address is rejected at
+ * construction with a BgpError, rather than failing lazily during route
+ * propagation (BgpPeer.cpp validateNextHop).
+ */
+TEST_F(BgpPeerTest, MalformedNextHopThrows) {
+  thrift::BgpPeer peer = makeMinimalPeer();
+  peer.next_hop4() = "not-an-ip";
+
+  EXPECT_THROW(BgpPeer p(peer), facebook::bgp::BgpError);
+}
+
+/*
+ * A next_hop4 holding a well-formed IPv6 address is the wrong family and is
+ * rejected at construction with a BgpError (BgpPeer.cpp validateNextHop).
+ */
+TEST_F(BgpPeerTest, WrongFamilyNextHopThrows) {
+  thrift::BgpPeer peer = makeMinimalPeer();
+  peer.next_hop4() = "2001:db8::1";
+
+  EXPECT_THROW(BgpPeer p(peer), facebook::bgp::BgpError);
+}
+
 // 2-byte ASN is used when no 4-byte field is present.
 TEST_F(BgpPeerTest, TwoByteAsnWhenNoFourByte) {
   thrift::BgpPeer peer = makeMinimalPeer();

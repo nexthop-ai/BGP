@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <folly/IPAddress.h>
@@ -39,6 +41,7 @@
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSimulator.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
+#include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 
 namespace facebook::bgp {
@@ -80,14 +83,15 @@ auto loadSamplePolicies() {
   return *config.getConfig().policies();
 }
 
-// Build a published BgpPath whose AS-path is the given AS sequence.
-std::shared_ptr<const BgpPath> makePathWithAsPath(
+// Build a published BgpPath with the given nexthop and AS sequence.
+std::shared_ptr<const BgpPath> makePathWithNexthop(
+    const folly::IPAddress& nexthop,
     const std::vector<uint32_t>& asns) {
   neteng::fboss::bgp_attr::TAsPathSeg seg;
   seg.seg_type() = neteng::fboss::bgp_attr::TAsPathSegType::AS_SEQUENCE;
   seg.asns_4_byte() = std::vector<int64_t>(asns.begin(), asns.end());
   nettools::bgplib::BgpPathC pathC;
-  pathC.nexthop = folly::IPAddress("10.0.0.1");
+  pathC.nexthop = nexthop;
   nettools::bgplib::BgpAttributesC attrs;
   attrs.origin = nettools::bgplib::BgpAttrOrigin::BGP_ORIGIN_IGP;
   attrs.localPref = 100;
@@ -96,6 +100,12 @@ std::shared_ptr<const BgpPath> makePathWithAsPath(
   auto path = std::make_shared<BgpPath>(static_cast<BgpPathFields>(pathC));
   path->publish();
   return path;
+}
+
+// Build a published BgpPath whose AS-path is the given AS sequence.
+std::shared_ptr<const BgpPath> makePathWithAsPath(
+    const std::vector<uint32_t>& asns) {
+  return makePathWithNexthop(folly::IPAddress("10.0.0.1"), asns);
 }
 
 } // namespace
@@ -590,4 +600,290 @@ INSTANTIATE_TEST_SUITE_P(
                       /*expectV4Received=*/true,
                       /*expectV6Received=*/false}));
 
+/*
+ * propagateRoutes applies next-hop-self to an advertised route mirroring
+ * production AdjRib::shouldApplyNexthopSelf precedence:
+ *   1. a zero nexthop is invalid in a BGP UPDATE and is always rewritten;
+ *   2. otherwise an egress-policy SetNexthop wins over next-hop-self;
+ *   3. otherwise next-hop-self applies for eBGP / explicitly configured peers
+ *      (and never for iBGP / confed-external without an explicit flag).
+ * The rewrite value is the peer's configured next_hop for the AFI, falling
+ * back to the local router-id when unset/zero.
+ *
+ * Each case injects a route into switch A with a controlled pre-advertisement
+ * nexthop (so zero and non-zero inputs can both be exercised), then checks the
+ * nexthop switch B receives. Parameterized over session type (peer AS / confed
+ * flag), next_hop_self, AFI, configured next-hop, egress policy, and the
+ * incoming nexthop.
+ */
+struct NextHopSelfCase {
+  // Human-readable case label (used as the test instance name).
+  std::string description;
+  // A's local AS and the A->B peer's remote AS. Equal => iBGP, differ => eBGP
+  // (or confed-external when isConfedPeer is set).
+  int64_t localAs;
+  int64_t peerRemoteAs;
+  bool isConfedPeer;
+  bool nextHopSelf;
+  bool isV6;
+  // The A->B peer's configured next_hop4/next_hop6; empty => unset, which
+  // exercises the router-id fallback.
+  std::string peerNextHop;
+  // When set, A installs an egress SetNexthop policy toward B with this value.
+  std::optional<folly::IPAddress> egressPolicyNexthop;
+  // Nexthop of the route A learns (and would advertise before NH-self logic).
+  folly::IPAddress incomingNexthop;
+  std::string prefix;
+  folly::IPAddress expectedNexthop;
+  // When true, negotiate v4-over-v6 so even v4 prefixes use the v6 nexthop
+  // (RFC 5549). Trailing default keeps existing positional initializers valid.
+  bool v4OverV6Nexthop = false;
+};
+
+class BgpSimulatorNextHopSelfTest
+    : public ::testing::TestWithParam<NextHopSelfCase> {};
+
+TEST_P(BgpSimulatorNextHopSelfTest, AppliesNextHopSelf) {
+  // Upstream AS for the injected route; distinct from all session ASes so the
+  // route never trips A's or B's AS-path loop check.
+  constexpr int64_t kUpstreamAs = 64500;
+  const NextHopSelfCase& tc = GetParam();
+
+  thrift::BgpConfig cfgA = makeConfig("10.0.0.1", tc.localAs);
+
+  // The session under test: A's peer toward B.
+  thrift::BgpPeer peerToB = makePeer("10.0.0.2", "10.0.0.1");
+  peerToB.remote_as_4_byte() = tc.peerRemoteAs;
+  peerToB.is_confed_peer() = tc.isConfedPeer;
+  peerToB.next_hop_self() = tc.nextHopSelf;
+  peerToB.v4_over_v6_nexthop() = tc.v4OverV6Nexthop;
+  if (tc.isV6) {
+    peerToB.next_hop6() = tc.peerNextHop;
+  } else {
+    peerToB.next_hop4() = tc.peerNextHop;
+  }
+  if (tc.egressPolicyNexthop.has_value()) {
+    const std::string kPolicy = "EGRESS_SET_NEXTHOP";
+    // Match-all term that sets the nexthop and accepts (PERMIT).
+    cfgA.policies() = createBgpPolicies(
+        kPolicy,
+        /*matches=*/{},
+        /*actions=*/
+        {createBgpPolicyNexthopAction(*tc.egressPolicyNexthop),
+         createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT)});
+    peerToB.egress_policy_name() = kPolicy;
+  }
+  /*
+   * A second, unlinked peer toward an upstream source. Used only so A can
+   * accept an injected route (receiveRoutes resolves the receiving peer by the
+   * source's local address); it is never advertised to.
+   */
+  thrift::BgpPeer peerFromSrc = makePeer("10.0.0.3", "10.0.0.1");
+  cfgA.peers() = {peerToB, peerFromSrc};
+
+  thrift::BgpConfig cfgB = makeConfig("10.0.0.2", tc.peerRemoteAs);
+  cfgB.peers() = {makePeer("10.0.0.1", "10.0.0.2")};
+
+  BgpSimulator sim;
+  sim.addSwitch(std::make_shared<BgpSwitch>("A", cfgA));
+  sim.addSwitch(std::make_shared<BgpSwitch>("B", cfgB));
+  sim.resolvePeerLinks();
+  BgpSwitch& a = *sim.switches()[0];
+  BgpSwitch& b = *sim.switches()[1];
+
+  /*
+   * Inject the route into A from a modeled upstream source so the
+   * pre-advertisement nexthop is controlled independent of origination
+   * defaults (which always carry a zero nexthop).
+   */
+  thrift::BgpPeer srcCfg = makePeer("10.0.0.1", "10.0.0.3");
+  srcCfg.remote_as_4_byte() = kUpstreamAs;
+  BgpPeer fromSrc(srcCfg);
+  fromSrc.setLocalAsn(kUpstreamAs);
+  fromSrc.setRouterId(folly::IPAddress("10.0.0.3").asV4().toLongHBO());
+
+  const auto prefix = folly::IPAddress::createNetwork(tc.prefix);
+  a.receiveRoutes(
+      fromSrc,
+      "src",
+      {{prefix, makePathWithNexthop(tc.incomingNexthop, {kUpstreamAs})}});
+  a.routingTable().runBestPathSelection();
+  a.propagateRoutes();
+  b.routingTable().runBestPathSelection();
+
+  const SimRibEntry* entry = b.routingTable().getEntry(prefix);
+  ASSERT_NE(nullptr, entry);
+  ASSERT_NE(nullptr, entry->getBestPath());
+  EXPECT_EQ(tc.expectedNexthop, entry->getBestPath()->attrs->getNexthop());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BgpSimulator,
+    BgpSimulatorNextHopSelfTest,
+    ::testing::Values(
+        // eBGP peer without next_hop_self still rewrites to its next_hop
+        // (implicit eBGP next-hop-self).
+        NextHopSelfCase{/*description=*/"ebgp_implicit_v4",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65001,
+                        /*isConfedPeer=*/false,
+                        /*nextHopSelf=*/false,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"10.0.0.9",
+                        /*egressPolicyNexthop=*/std::nullopt,
+                        /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("10.0.0.9")},
+        // iBGP peer without next_hop_self preserves a (non-zero) nexthop.
+        NextHopSelfCase{/*description=*/"ibgp_preserves_v4",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65000,
+                        /*isConfedPeer=*/false,
+                        /*nextHopSelf=*/false,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"10.0.0.9",
+                        /*egressPolicyNexthop=*/std::nullopt,
+                        /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("172.16.0.1")},
+        // iBGP peer with explicit next_hop_self rewrites to its next_hop.
+        NextHopSelfCase{/*description=*/"ibgp_explicit_nexthopself_v4",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65000,
+                        /*isConfedPeer=*/false,
+                        /*nextHopSelf=*/true,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"10.0.0.9",
+                        /*egressPolicyNexthop=*/std::nullopt,
+                        /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("10.0.0.9")},
+        // Confed-external peer (differing AS, is_confed_peer) without
+        // next_hop_self gets NO implicit rewrite (keys on EXTERNAL only).
+        NextHopSelfCase{/*description=*/"confed_preserves_v4",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65001,
+                        /*isConfedPeer=*/true,
+                        /*nextHopSelf=*/false,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"10.0.0.9",
+                        /*egressPolicyNexthop=*/std::nullopt,
+                        /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("172.16.0.1")},
+        // Egress-policy SetNexthop wins over implicit eBGP next-hop-self.
+        NextHopSelfCase{/*description=*/"policy_nexthop_wins_over_ebgp",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65001,
+                        /*isConfedPeer=*/false,
+                        /*nextHopSelf=*/false,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"10.0.0.9",
+                        /*egressPolicyNexthop=*/folly::IPAddress("10.9.9.9"),
+                        /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("10.9.9.9")},
+        // A policy that sets a zero nexthop is still overridden by
+        // next-hop-self (zero nexthop is invalid in a BGP UPDATE).
+        NextHopSelfCase{
+            /*description=*/"zero_policy_nexthop_forces_nexthopself",
+            /*localAs=*/65000,
+            /*peerRemoteAs=*/65001,
+            /*isConfedPeer=*/false,
+            /*nextHopSelf=*/false,
+            /*isV6=*/false,
+            /*peerNextHop=*/"10.0.0.9",
+            /*egressPolicyNexthop=*/folly::IPAddress("0.0.0.0"),
+            /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+            /*prefix=*/"10.50.0.0/24",
+            /*expectedNexthop=*/folly::IPAddress("10.0.0.9")},
+        // A zero incoming nexthop is always rewritten, even on an iBGP session
+        // without next_hop_self.
+        NextHopSelfCase{/*description=*/"zero_incoming_ibgp_forces_nexthopself",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65000,
+                        /*isConfedPeer=*/false,
+                        /*nextHopSelf=*/false,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"10.0.0.9",
+                        /*egressPolicyNexthop=*/std::nullopt,
+                        /*incomingNexthop=*/folly::IPAddress("0.0.0.0"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("10.0.0.9")},
+        // Zero nexthop with no configured peer next_hop falls back to the
+        // local router-id (v4).
+        NextHopSelfCase{/*description=*/"zero_incoming_routerid_fallback_v4",
+                        /*localAs=*/65000,
+                        /*peerRemoteAs=*/65000,
+                        /*isConfedPeer=*/false,
+                        /*nextHopSelf=*/false,
+                        /*isV6=*/false,
+                        /*peerNextHop=*/"",
+                        /*egressPolicyNexthop=*/std::nullopt,
+                        /*incomingNexthop=*/folly::IPAddress("0.0.0.0"),
+                        /*prefix=*/"10.50.0.0/24",
+                        /*expectedNexthop=*/folly::IPAddress("10.0.0.1")},
+        // next_hop_self rewrites a v6 nexthop to the peer's next_hop6.
+        NextHopSelfCase{
+            /*description=*/"explicit_nexthopself_v6",
+            /*localAs=*/65000,
+            /*peerRemoteAs=*/65000,
+            /*isConfedPeer=*/false,
+            /*nextHopSelf=*/true,
+            /*isV6=*/true,
+            /*peerNextHop=*/"2001:db8::1",
+            /*egressPolicyNexthop=*/std::nullopt,
+            /*incomingNexthop=*/folly::IPAddress("2001:db8:abcd::9"),
+            /*prefix=*/"2001:db8:abcd::/48",
+            /*expectedNexthop=*/folly::IPAddress("2001:db8::1")},
+        // v6 zero nexthop with no configured peer next_hop6 falls back to the
+        // router-id mapped into IPv6.
+        NextHopSelfCase{
+            /*description=*/"zero_incoming_routerid_fallback_v6",
+            /*localAs=*/65000,
+            /*peerRemoteAs=*/65000,
+            /*isConfedPeer=*/false,
+            /*nextHopSelf=*/true,
+            /*isV6=*/true,
+            /*peerNextHop=*/"",
+            /*egressPolicyNexthop=*/std::nullopt,
+            /*incomingNexthop=*/folly::IPAddress("::"),
+            /*prefix=*/"2001:db8:abcd::/48",
+            /*expectedNexthop=*/folly::IPAddress("::ffff:10.0.0.1")},
+        // v4-over-v6 negotiated: a v4 prefix uses the v6 nexthop (RFC 5549).
+        // The v6 branch resolves to the peer's configured next_hop6 ("::1" from
+        // makePeer); a v4 result here would mean the wrong branch was taken
+        // (next_hop4 is unset, so the v4 branch would yield the router-id).
+        NextHopSelfCase{
+            /*description=*/"v4_over_v6_negotiated_v4_prefix_uses_v6_nexthop",
+            /*localAs=*/65000,
+            /*peerRemoteAs=*/65001,
+            /*isConfedPeer=*/false,
+            /*nextHopSelf=*/true,
+            /*isV6=*/false,
+            /*peerNextHop=*/"",
+            /*egressPolicyNexthop=*/std::nullopt,
+            /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+            /*prefix=*/"10.50.0.0/24",
+            /*expectedNexthop=*/folly::IPAddress("::1"),
+            /*v4OverV6Nexthop=*/true},
+        // v4-over-v6 negotiated: a configured v4 next_hop is ignored in favor
+        // of the v6 nexthop (peer's next_hop6 "::1") for a v4 prefix.
+        NextHopSelfCase{
+            /*description=*/
+            "v4_over_v6_negotiated_ignores_configured_v4_nexthop",
+            /*localAs=*/65000,
+            /*peerRemoteAs=*/65001,
+            /*isConfedPeer=*/false,
+            /*nextHopSelf=*/true,
+            /*isV6=*/false,
+            /*peerNextHop=*/"10.0.0.9",
+            /*egressPolicyNexthop=*/std::nullopt,
+            /*incomingNexthop=*/folly::IPAddress("172.16.0.1"),
+            /*prefix=*/"10.50.0.0/24",
+            /*expectedNexthop=*/folly::IPAddress("::1"),
+            /*v4OverV6Nexthop=*/true}),
+    [](const ::testing::TestParamInfo<NextHopSelfCase>& info) {
+      return info.param.description;
+    });
 } // namespace facebook::bgp

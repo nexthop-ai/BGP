@@ -176,6 +176,19 @@ std::shared_ptr<BgpPath> buildOriginatedPath(
   return path;
 }
 
+/*
+ * Return a published copy of `path` with its nexthop replaced by `nh`.
+ * Used by next-hop-self rewriting in propagateRoutes.
+ */
+std::shared_ptr<const BgpPath> cloneWithNexthop(
+    const std::shared_ptr<const BgpPath>& path,
+    const folly::IPAddress& nh) {
+  auto copy = path->clone();
+  copy->setNexthop(nh);
+  copy->publish();
+  return copy;
+}
+
 // Map a peer-session classification to the RIB's route-origin enum.
 RouteOrigin toRouteOrigin(PeerType type) {
   switch (type) {
@@ -454,7 +467,8 @@ BgpSwitch::findPeerToward(const folly::IPAddress& neighborAddr) {
 std::shared_ptr<const BgpPath> BgpSwitch::applyRoutePolicy(
     const std::string& policyName,
     const folly::CIDRNetwork& prefix,
-    const std::shared_ptr<const BgpPath>& path) {
+    const std::shared_ptr<const BgpPath>& path,
+    bool* isNexthopSetByPolicy) {
   if (!policyManager_ || !policyManager_->isPolicyPresent(policyName)) {
     throw std::runtime_error(
         fmt::format(
@@ -469,8 +483,12 @@ std::shared_ptr<const BgpPath> BgpSwitch::applyRoutePolicy(
    * shared_ptr<BgpPath> parameter.
    */
   auto inAttrs = std::const_pointer_cast<BgpPath>(path);
+  auto actionData = std::make_shared<BgpPolicyActionData>();
   auto policyOut = policyManager_->applyPolicy(
-      policyName, PolicyInMessage({prefix}, inAttrs));
+      policyName, PolicyInMessage({prefix}, inAttrs, actionData));
+  if (isNexthopSetByPolicy != nullptr) {
+    *isNexthopSetByPolicy = actionData->isNexthopSetByPolicy;
+  }
   const auto it = policyOut.result.find(prefix);
   if (it == policyOut.result.end() || !it->second->attrs) {
     return nullptr;
@@ -486,6 +504,31 @@ void BgpSwitch::propagateRoutes() {
       continue;
     }
     const PeerType egressType = peer.peerType();
+    const bool wantNhSelf =
+        peer.nextHopSelf() || egressType == PeerType::EXTERNAL;
+    /*
+     * Per-AFI next-hop-self values, mirroring production
+     * AdjRib::getNewNexthopFromAttributesOut: use the peer's configured next
+     * hop, falling back to the local router-id when it is unset or zero. The
+     * resolved values are always valid, so a zero nexthop is never advertised.
+     */
+    const auto routerIdV4 =
+        folly::IPAddressV4::fromLongHBO(static_cast<uint32_t>(routerId_));
+    const auto resolveNhSelf = [&](bool isV4) -> folly::IPAddress {
+      const std::string& configured = isV4 ? peer.nextHop4() : peer.nextHop6();
+      if (!configured.empty()) {
+        const folly::IPAddress nh(configured);
+        if (!nh.isZero()) {
+          return nh;
+        }
+      }
+      return isV4
+          ? folly::IPAddress(routerIdV4)
+          : folly::IPAddress(
+                folly::IPAddress::createIPv6(folly::IPAddress(routerIdV4)));
+    };
+    const folly::IPAddress nhSelf4 = resolveNhSelf(/*isV4=*/true);
+    const folly::IPAddress nhSelf6 = resolveNhSelf(/*isV4=*/false);
     std::vector<RouteUpdate> updates;
     for (const auto& prefix : prefixes) {
       if ((prefix.first.isV4() && peer.disableIpv4Afi()) ||
@@ -501,10 +544,12 @@ void BgpSwitch::propagateRoutes() {
         continue;
       }
       std::shared_ptr<const BgpPath> path = bestPath->attrs;
+      bool nexthopSetByPolicy = false;
       if (!peer.egressPolicyName().empty()) {
-        path = applyRoutePolicy(peer.egressPolicyName(), prefix, path);
+        path = applyRoutePolicy(
+            peer.egressPolicyName(), prefix, path, &nexthopSetByPolicy);
         if (!path) {
-          continue; // egress policy rejected this prefix for this peer
+          continue;
         }
       }
       /*
@@ -512,6 +557,26 @@ void BgpSwitch::propagateRoutes() {
        * AS-path grows across hops and downstream loop detection can fire.
        */
       path = applyEgressAsPath(path, egressType, localAsn_, localConfedAsn_);
+      /*
+       * Mirror production AdjRib::shouldApplyNexthopSelf precedence:
+       *   1. a zero nexthop is invalid in a BGP UPDATE and is always rewritten;
+       *   2. otherwise an egress-policy SetNexthop wins over next-hop-self;
+       *   3. otherwise apply next-hop-self for eBGP / explicitly configured
+       *      peers.
+       *
+       * The rewrite AFI now mirrors production getNewNexthopFromAttributesOut:
+       * use the v4 nexthop only when v4-over-v6 is NOT negotiated and the
+       * prefix is v4; otherwise use the v6 nexthop. When v4-over-v6 is
+       * negotiated even v4 prefixes carry the v6 nexthop (RFC 5549).
+       *
+       * Link-local v6 eBGP nexthop handling is an ingress concern and is
+       * intentionally not modeled in this egress path.
+       */
+      if (path->getNexthop().isZero() || (wantNhSelf && !nexthopSetByPolicy)) {
+        const bool useV4Nexthop =
+            !peer.v4OverV6Nexthop() && prefix.first.isV4();
+        path = cloneWithNexthop(path, useV4Nexthop ? nhSelf4 : nhSelf6);
+      }
       updates.push_back(RouteUpdate{prefix, std::move(path)});
     }
     if (!updates.empty()) {

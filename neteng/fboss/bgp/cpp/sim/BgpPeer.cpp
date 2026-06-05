@@ -68,6 +68,40 @@ folly::IPAddress parseIpDefensive(const std::string& addr) {
 }
 
 /*
+ * Validate a configured next-hop string at construction. Empty means unset
+ * (callers fall back to the local router-id). A non-empty value must parse and
+ * match the expected address family; reject malformed or wrong-family values
+ * here with a descriptive error rather than throwing opaquely later during
+ * route propagation.
+ */
+void validateNextHop(
+    const std::string& value,
+    bool isV4,
+    const std::string& peerAddr) {
+  if (value.empty()) {
+    return;
+  }
+  const auto maybeIp = folly::IPAddress::tryFromString(value);
+  if (maybeIp.hasError()) {
+    throw BgpError(
+        fmt::format(
+            "Peer {} has a malformed next_hop{} '{}'",
+            peerAddr,
+            isV4 ? "4" : "6",
+            value));
+  }
+  if (maybeIp.value().isV4() != isV4) {
+    throw BgpError(
+        fmt::format(
+            "Peer {} next_hop{} '{}' is not an IPv{} address",
+            peerAddr,
+            isV4 ? "4" : "6",
+            value,
+            isV4 ? "4" : "6"));
+  }
+}
+
+/*
  * Return the first present optional (a wins over b). Used to apply peer > group
  * inheritance within a single AS width before the 4-byte > 2-byte preference.
  */
@@ -182,6 +216,9 @@ BgpPeer::BgpPeer(const thrift::BgpPeer& peer, const thrift::PeerGroup* group) {
   nextHopSelf_ = resolveBool(
       toOpt(peer.next_hop_self()),
       group ? toOpt(group->next_hop_self()) : std::nullopt);
+  v4OverV6Nexthop_ = resolveBool(
+      toOpt(peer.v4_over_v6_nexthop()),
+      group ? toOpt(group->v4_over_v6_nexthop()) : std::nullopt);
   disableIpv4Afi_ = resolveBool(
       toOpt(peer.disable_ipv4_afi()),
       group ? toOpt(group->disable_ipv4_afi()) : std::nullopt);
@@ -198,6 +235,8 @@ BgpPeer::BgpPeer(const thrift::BgpPeer& peer, const thrift::PeerGroup* group) {
       group ? toOpt(group->egress_policy_name()) : std::nullopt);
 
   // Nexthops and metadata come straight from the peer config.
+  validateNextHop(*peer.next_hop4(), /*isV4=*/true, peerIp_.str());
+  validateNextHop(*peer.next_hop6(), /*isV4=*/false, peerIp_.str());
   nextHop4_ = *peer.next_hop4();
   nextHop6_ = *peer.next_hop6();
   description_ = resolveString(toOpt(peer.description()), std::nullopt);

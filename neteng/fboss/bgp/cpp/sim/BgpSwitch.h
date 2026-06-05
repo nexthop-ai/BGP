@@ -188,11 +188,16 @@ class BgpSwitch {
    * Run a named ingress/egress/origination policy on a path. Returns the
    * (possibly transformed) path, or nullptr if the policy rejected the prefix.
    * Throws if the policy is not configured.
+   *
+   * If `isNexthopSetByPolicy` is non-null, it is set to true when the policy
+   * executed a SetNexthop action (so callers can give a policy-set nexthop
+   * precedence over next-hop-self, mirroring production AdjRibOut behavior).
    */
   std::shared_ptr<const BgpPath> applyRoutePolicy(
       const std::string& policyName,
       const folly::CIDRNetwork& prefix,
-      const std::shared_ptr<const BgpPath>& path);
+      const std::shared_ptr<const BgpPath>& path,
+      bool* isNexthopSetByPolicy = nullptr);
 
   std::string name_;
   uint64_t routerId_{0};

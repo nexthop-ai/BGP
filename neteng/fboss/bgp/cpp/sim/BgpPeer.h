@@ -201,6 +201,9 @@ class BgpPeer {
   bool nextHopSelf() const {
     return nextHopSelf_;
   }
+  bool v4OverV6Nexthop() const {
+    return v4OverV6Nexthop_;
+  }
   bool disableIpv4Afi() const {
     return disableIpv4Afi_;
   }
@@ -251,6 +254,7 @@ class BgpPeer {
   bool isRrClient_{false};
   bool isConfedPeer_{false};
   bool nextHopSelf_{false};
+  bool v4OverV6Nexthop_{false};
   bool disableIpv4Afi_{false};
   bool disableIpv6Afi_{false};
 
