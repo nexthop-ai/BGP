@@ -151,6 +151,16 @@ class BgpSwitch {
       const std::string& fromSwitchName,
       const std::vector<RouteUpdate>& routes);
 
+  /*
+   * Run best-path selection over the local RIB. Returns true if any prefix's
+   * best path changed (used to drive convergence). bestPathChanged() returns
+   * the result of the most recent run.
+   */
+  bool runBestPathSelection();
+  bool bestPathChanged() const {
+    return bestPathChanged_;
+  }
+
  private:
   /*
    * Build peers_ from the config, resolving each peer's peer_group_name to the
@@ -196,9 +206,9 @@ class BgpSwitch {
   RoutingTable routingTable_;
   std::vector<BgpPeer> peers_;
   std::unique_ptr<PolicyManager> policyManager_;
-
   // Guards originateRoutes() so routes are originated at most once.
   bool routesOriginated_{false};
+  bool bestPathChanged_{false};
 };
 
 } // namespace facebook::bgp

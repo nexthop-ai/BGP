@@ -605,4 +605,55 @@ void BgpSwitch::receiveRoutes(
   }
 }
 
+bool BgpSwitch::runBestPathSelection() {
+  const auto prefixes = advertisablePrefixes();
+
+  /*
+   * Snapshot the current best-path identity per prefix before selection,
+   * pairing each snapshot with its prefix so the before/after comparison needs
+   * no positional indexing across parallel vectors (which could silently drift
+   * and is what the array-bounds linter flags). A flat vector is used rather
+   * than a CIDRNetwork-keyed map: the BGP memory rules prohibit ad-hoc
+   * prefix-keyed collections that mirror RIB scale (each costs ~1.8GB at 30M
+   * routes), and this snapshot is transient per selection batch.
+   *
+   * The snapshot holds an owning shared_ptr (not a raw pointer): selection can
+   * deselect and destroy a previously-best SimRouteInfo, after which a raw
+   * snapshot pointer would dangle. Even reading the dangling pointer value for
+   * the != comparison is undefined behavior once the object's lifetime ends, so
+   * we retain ownership to guarantee the snapshotted objects outlive the
+   * comparison below.
+   */
+  std::vector<
+      std::pair<folly::CIDRNetwork, std::shared_ptr<const SimRouteInfo>>>
+      before;
+  before.reserve(prefixes.size());
+  for (const auto& prefix : prefixes) {
+    const SimRibEntry* entry = routingTable_.getEntry(prefix);
+    before.emplace_back(
+        prefix,
+        entry ? entry->getBestPath() : std::shared_ptr<const SimRouteInfo>{});
+  }
+
+  routingTable_.runBestPathSelection();
+
+  bool changed = false;
+  for (const auto& [prefix, previous] : before) {
+    const SimRibEntry* entry = routingTable_.getEntry(prefix);
+    const SimRouteInfo* now =
+        (entry && entry->getBestPath()) ? entry->getBestPath().get() : nullptr;
+
+    /*
+     * Best path selection must account for all paths if/when UCOMP/LBW/ECMP
+     * aggregates are supported.
+     */
+    if (now != previous.get()) {
+      changed = true;
+      break;
+    }
+  }
+  bestPathChanged_ = changed;
+  return changed;
+}
+
 } // namespace facebook::bgp

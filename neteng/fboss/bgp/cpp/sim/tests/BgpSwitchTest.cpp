@@ -29,9 +29,11 @@
 #include <folly/IPAddress.h>
 
 #include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
+#include "configerator/structs/neteng/fboss/bgp/if/gen-cpp2/bgp_attr_types.h"
 #include "neteng/fboss/bgp/cpp/common/BgpPath.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/Config.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigUtils.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
@@ -68,6 +70,41 @@ thrift::BgpNetwork makeNetwork(
     net.policy_name() = *policyName;
   }
   return net;
+}
+
+// A published path with the given local-pref and AS-sequence.
+std::shared_ptr<const BgpPath> makePath(
+    uint32_t localPref,
+    const std::vector<uint32_t>& asns) {
+  nettools::bgplib::BgpPathC pathC;
+  pathC.nexthop = folly::IPAddress("10.0.0.254");
+  nettools::bgplib::BgpAttributesC attrs;
+  attrs.origin = nettools::bgplib::BgpAttrOrigin::BGP_ORIGIN_IGP;
+  attrs.localPref = localPref;
+  if (!asns.empty()) {
+    neteng::fboss::bgp_attr::TAsPathSeg seg;
+    seg.seg_type() = neteng::fboss::bgp_attr::TAsPathSegType::AS_SEQUENCE;
+    seg.asns_4_byte() = std::vector<int64_t>(asns.begin(), asns.end());
+    attrs.asPath = createBgpAttrAsPathDedup({seg});
+  }
+  pathC.attrs = std::move(attrs);
+  auto path = std::make_shared<BgpPath>(static_cast<BgpPathFields>(pathC));
+  path->publish();
+  return path;
+}
+
+// The sender's peer (its localAddr identifies the session to the receiver).
+BgpPeer makeFromPeer(const std::string& localAddr, uint64_t routerId) {
+  thrift::BgpPeer cfg;
+  cfg.peer_addr() = "10.0.0.1";
+  cfg.local_addr() = localAddr;
+  cfg.next_hop4() = localAddr;
+  cfg.next_hop6() = "::1";
+  cfg.remote_as_4_byte() = 65000;
+  BgpPeer peer(cfg);
+  peer.setLocalAsn(65010);
+  peer.setRouterId(routerId);
+  return peer;
 }
 
 } // namespace
@@ -358,6 +395,53 @@ TEST_F(BgpSwitchTest, ReceiveRoutesDropsPeerLocalAsLoop) {
   const auto& received = sw.peers().front().receivedRoutes();
   ASSERT_EQ(1u, received.size());
   EXPECT_EQ(okPrefix, received.front().cidr);
+}
+
+/*
+ * Best-path selection prefers the higher local-pref path even when it has a
+ * longer AS-path, matching production ordering.
+ */
+TEST_F(BgpSwitchTest, BestPathPrefersHigherLocalPref) {
+  thrift::BgpConfig config = makeBaseConfig();
+  config.peers() = {makeMinimalPeer("10.0.0.2"), makeMinimalPeer("10.0.0.3")};
+  BgpSwitch sw("sw", config);
+
+  const auto prefix = folly::IPAddress::createNetwork("10.70.0.0/24");
+  BgpPeer fromLow = makeFromPeer("10.0.0.2", /*routerId=*/2);
+  BgpPeer fromHigh = makeFromPeer("10.0.0.3", /*routerId=*/3);
+  // Lower local-pref but shorter AS-path.
+  sw.receiveRoutes(fromLow, "low", {{prefix, makePath(100, {65010})}});
+  // Higher local-pref with a longer AS-path -> should still win.
+  sw.receiveRoutes(
+      fromHigh, "high", {{prefix, makePath(200, {65010, 65011, 65012})}});
+
+  EXPECT_TRUE(sw.runBestPathSelection());
+  const SimRibEntry* entry = sw.routingTable().getEntry(prefix);
+  ASSERT_NE(nullptr, entry);
+  ASSERT_NE(nullptr, entry->getBestPath());
+  EXPECT_EQ(200, entry->getBestPath()->getBgpLocalPreference());
+}
+
+/*
+ * With equal local-pref, best-path selection breaks the tie on the shorter
+ * AS-path length.
+ */
+TEST_F(BgpSwitchTest, BestPathTiebreaksOnAsPathLen) {
+  thrift::BgpConfig config = makeBaseConfig();
+  config.peers() = {makeMinimalPeer("10.0.0.2"), makeMinimalPeer("10.0.0.3")};
+  BgpSwitch sw("sw", config);
+
+  const auto prefix = folly::IPAddress::createNetwork("10.71.0.0/24");
+  BgpPeer fromShort = makeFromPeer("10.0.0.2", /*routerId=*/2);
+  BgpPeer fromLong = makeFromPeer("10.0.0.3", /*routerId=*/3);
+  sw.receiveRoutes(fromShort, "short", {{prefix, makePath(100, {65010})}});
+  sw.receiveRoutes(fromLong, "long", {{prefix, makePath(100, {65010, 65011})}});
+
+  EXPECT_TRUE(sw.runBestPathSelection());
+  const SimRibEntry* entry = sw.routingTable().getEntry(prefix);
+  ASSERT_NE(nullptr, entry);
+  ASSERT_NE(nullptr, entry->getBestPath());
+  EXPECT_EQ(1, entry->getBestPath()->getBgpAsPathLen());
 }
 
 } // namespace facebook::bgp
