@@ -16,16 +16,20 @@
 
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include <fmt/format.h>
 #include <folly/IPAddress.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 #include <folly/logging/xlog.h>
 
+#include "neteng/fboss/bgp/cpp/adjrib/AdjRibCommon.h"
 #include "neteng/fboss/bgp/cpp/common/BgpPath.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
@@ -33,6 +37,7 @@
 #include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyStructs.h"
+#include "neteng/fboss/bgp/cpp/sim/SimRouteInfo.h"
 
 namespace facebook::bgp {
 
@@ -169,6 +174,71 @@ std::shared_ptr<BgpPath> buildOriginatedPath(
    */
   path->setWeight(kLocalRouteWeight);
   return path;
+}
+
+// Map a peer-session classification to the RIB's route-origin enum.
+RouteOrigin toRouteOrigin(PeerType type) {
+  switch (type) {
+    case PeerType::INTERNAL:
+      return RouteOrigin::INTERNAL;
+    case PeerType::EXTERNAL:
+      return RouteOrigin::EXTERNAL;
+    case PeerType::CONFED_EXTERNAL:
+      return RouteOrigin::CONFED_EXTERNAL;
+  }
+  return RouteOrigin::EXTERNAL;
+}
+
+/*
+ * The ASN that makes the path a loop for this switch, or std::nullopt when the
+ * AS-path is loop-free. Mirrors production AdjRib::hasAsPathLoop
+ * (adjrib/AdjRibUtil.cpp), which checks both the switch global ASN and the
+ * per-peer effective local-AS against the regular AS segments:
+ *  - globalAsn (the confederation identifier when this switch is a
+ *    confederation member) and peerLocalAs (the per-peer local-AS, which
+ *    includes the RFC 7705 local-as override) loop only if they appear in a
+ *    regular AS segment (AS_SEQUENCE / AS_SET);
+ *  - the confederation sub-AS (local_confed_as) loops only if it appears in a
+ *    confederation segment (AS_CONFED_SEQUENCE / AS_CONFED_SET), and is checked
+ *    only when this switch is a confederation member (localConfedAsn set).
+ * Checking peerLocalAs in addition to globalAsn matches production: a route
+ * carrying a peer's overridden local-AS is a loop even though it never carries
+ * the switch global ASN. Matching each ASN against just its applicable segment
+ * type avoids the false positives a blanket hasAsn() scan produces. Each ASN
+ * is guarded against 0 (unset); when peerLocalAs == globalAsn the second check
+ * is a harmless redundant scan.
+ *
+ * Returning the matched ASN (rather than a bare bool) lets callers log the
+ * actual culprit: with a per-peer local-AS override the loop is triggered by
+ * peerLocalAs, not globalAsn, so reporting globalAsn would mislead debugging.
+ */
+std::optional<uint32_t> asPathLoopAsn(
+    const BgpPath& path,
+    uint32_t globalAsn,
+    uint32_t peerLocalAs,
+    const std::optional<uint32_t>& localConfedAsn) {
+  const auto inRegularSegment = [](const auto& seg, uint32_t asn) {
+    return std::find(seg.asSequence.begin(), seg.asSequence.end(), asn) !=
+        seg.asSequence.end() ||
+        seg.asSet.count(asn) != 0;
+  };
+  for (const auto& seg : path.getAsPath().get()) {
+    if (globalAsn != 0 && inRegularSegment(seg, globalAsn)) {
+      return globalAsn;
+    }
+    if (peerLocalAs != 0 && inRegularSegment(seg, peerLocalAs)) {
+      return peerLocalAs;
+    }
+    if (localConfedAsn.has_value() &&
+        (std::find(
+             seg.asConfedSequence.begin(),
+             seg.asConfedSequence.end(),
+             *localConfedAsn) != seg.asConfedSequence.end() ||
+         seg.asConfedSet.count(*localConfedAsn) != 0)) {
+      return *localConfedAsn;
+    }
+  }
+  return std::nullopt;
 }
 
 } // namespace
@@ -370,6 +440,95 @@ std::shared_ptr<const BgpPath> BgpSwitch::applyRoutePolicy(
     return nullptr;
   }
   return it->second->attrs;
+}
+
+void BgpSwitch::receiveRoutes(
+    const BgpPeer& fromPeer,
+    const std::string& fromSwitchName,
+    const std::vector<RouteUpdate>& routes) {
+  BgpPeer* recvPeer = findPeerToward(fromPeer.localIp());
+  if (recvPeer == nullptr) {
+    XLOGF(
+        DBG2,
+        "BgpSwitch {}: received routes from {} but no local peer faces sender "
+        "address {}; dropping",
+        name_,
+        fromSwitchName,
+        fromPeer.localIp().str());
+    return;
+  }
+
+  const uint64_t senderRouterId = fromPeer.routerId();
+  const RouteOrigin origin = toRouteOrigin(recvPeer->peerType());
+  const std::string peerKey = recvPeer->peerIp().str();
+  const bool medMissingAsWorst = routingTable_.config().enableMedMissingAsWorst;
+
+  for (const auto& update : routes) {
+    std::shared_ptr<const BgpPath> path = update.path;
+    if (path == nullptr) {
+      continue;
+    }
+
+    /*
+     * AS-path loop detection runs before ingress policy, mirroring production
+     * AdjRib::validateAttributesIn (the loop check precedes import policy):
+     * drop routes that already carry our ASN.
+     */
+    if (const auto loopAsn = asPathLoopAsn(
+            *path, localAsn_, recvPeer->localAsn(), localConfedAsn_)) {
+      XLOGF(
+          DBG2,
+          "BgpSwitch {}: dropping looped route {} from peer {} (remoteAsn={}) "
+          "via {}: AS {} already in AS-path "
+          "(localAsn={} peerLocalAs={} confedAsn={})",
+          name_,
+          folly::IPAddress::networkToString(update.prefix),
+          recvPeer->peerIp().str(),
+          recvPeer->remoteAsn(),
+          fromSwitchName,
+          *loopAsn,
+          localAsn_,
+          recvPeer->localAsn(),
+          localConfedAsn_.has_value() ? std::to_string(*localConfedAsn_)
+                                      : "none");
+      continue;
+    }
+
+    if (!recvPeer->ingressPolicyName().empty()) {
+      path =
+          applyRoutePolicy(recvPeer->ingressPolicyName(), update.prefix, path);
+      if (!path) {
+        continue; // ingress policy rejected this prefix
+      }
+    }
+
+    /*
+     * Publish the path before storing it (mirrors originateNetwork): a later
+     * egress-policy pass in propagateRoutes const-casts the stored path and
+     * feeds it to PolicyManager, which clones-on-write only for published
+     * inputs. Storing an unpublished policy output risks in-place mutation that
+     * would corrupt both the RIB entry and the recorded ReceivedRoute.
+     * publish() is idempotent, so re-publishing an already-published sender
+     * path is a no-op.
+     */
+    auto publishedPath = std::const_pointer_cast<BgpPath>(path);
+    publishedPath->publish();
+    path = std::move(publishedPath);
+
+    recvPeer->addReceivedRoute(
+        ReceivedRoute{update.prefix, fromSwitchName, path});
+    routingTable_.insertPath(
+        update.prefix,
+        peerKey,
+        std::make_shared<SimRouteInfo>(
+            update.prefix,
+            path,
+            peerKey,
+            senderRouterId,
+            recvPeer->peerIp(),
+            origin,
+            medMissingAsWorst));
+  }
 }
 
 } // namespace facebook::bgp

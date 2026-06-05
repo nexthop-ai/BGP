@@ -363,4 +363,26 @@ TEST_F(BgpPeerTest, SetLocalAsnRemoteEqualsGlobalThrows) {
   EXPECT_THROW(p.setLocalAsn(64000), facebook::bgp::BgpError);
 }
 
+/*
+ * addReceivedRoute replaces the existing entry for the same prefix rather than
+ * appending, so re-advertisements keep receivedRoutes_ bounded. The Adj-RIB-In
+ * is per-session and keyed by prefix alone (mirrors production), so a peer has
+ * exactly one entry per prefix.
+ */
+TEST_F(BgpPeerTest, ReceivedRoutesDedupByPrefix) {
+  thrift::BgpPeer peer = makeMinimalPeer();
+  BgpPeer p(peer);
+
+  const folly::CIDRNetwork cidrA{folly::IPAddress("10.1.0.0"), 24};
+  const folly::CIDRNetwork cidrB{folly::IPAddress("10.2.0.0"), 24};
+  p.addReceivedRoute(ReceivedRoute{cidrA, "switch_b", /*path=*/nullptr});
+  // Re-advertising the same prefix updates in place.
+  p.addReceivedRoute(ReceivedRoute{cidrA, "switch_b", /*path=*/nullptr});
+  EXPECT_EQ(1u, p.receivedRoutes().size());
+
+  // A different prefix is a distinct entry.
+  p.addReceivedRoute(ReceivedRoute{cidrB, "switch_b", /*path=*/nullptr});
+  EXPECT_EQ(2u, p.receivedRoutes().size());
+}
+
 } // namespace facebook::bgp

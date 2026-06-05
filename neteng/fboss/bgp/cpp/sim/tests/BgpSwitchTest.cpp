@@ -23,11 +23,16 @@
 
 #include <gtest/gtest.h>
 
+#include <memory>
+#include <vector>
+
 #include <folly/IPAddress.h>
 
 #include "configerator/structs/neteng/fboss/bgp/gen-cpp2/bgp_config_types.h"
+#include "neteng/fboss/bgp/cpp/common/BgpPath.h"
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/Config.h"
+#include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
 #include "neteng/fboss/bgp/cpp/sim/BgpSwitch.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 
@@ -288,6 +293,71 @@ TEST_F(BgpSwitchTest, OriginationPolicyNotConfiguredThrows) {
   ASSERT_EQ(nullptr, sw.policyManager());
 
   EXPECT_THROW(sw.originateRoutes(), std::runtime_error);
+}
+
+/*
+ * Per-peer local-AS loop detection: a peer configured with a local-AS
+ * override (RFC 7705) must reject a received route whose AS-path carries the
+ * overridden ASN as a loop, even though that ASN never appears as the switch
+ * global ASN. An otherwise-identical route that does not carry the override is
+ * accepted. Mirrors production AdjRib::hasAsPathLoop, which checks both the
+ * global ASN and the per-peer effective local-AS.
+ */
+TEST_F(BgpSwitchTest, ReceiveRoutesDropsPeerLocalAsLoop) {
+  // Switch global ASN 65000; one EBGP peer with local-AS override 65111.
+  thrift::BgpConfig config = makeBaseConfig();
+  thrift::BgpPeer peer = makeMinimalPeer("10.0.0.2");
+  peer.remote_as_4_byte() = 64000;
+  peer.local_as_4_byte() = 65111;
+  config.peers() = {peer};
+
+  BgpSwitch sw("rsw_localas", config);
+  ASSERT_EQ(1u, sw.peers().size());
+  /*
+   * Precondition: the peer's effective local-AS is the override, distinct from
+   * the switch global ASN, so only the per-peer check can catch this loop.
+   */
+  ASSERT_EQ(65111u, sw.peers().front().localAsn());
+  ASSERT_EQ(65000u, sw.localAsn());
+
+  /*
+   * The sender peer: its local address is this switch's peer's neighbor
+   * address, so receiveRoutes() resolves it to the local facing peer.
+   */
+  thrift::BgpPeer senderCfg;
+  senderCfg.peer_addr() = "10.0.0.254";
+  senderCfg.local_addr() = "10.0.0.2";
+  senderCfg.next_hop4() = "10.0.0.2";
+  senderCfg.next_hop6() = "::1";
+  BgpPeer sender(senderCfg);
+
+  const auto makePath = [](const std::vector<uint32_t>& asSeq) {
+    nettools::bgplib::BgpAttrAsPathC asPath;
+    asPath.push_back(nettools::bgplib::BgpAttrAsPathSegmentC::fromAsSeq(asSeq));
+    auto path = std::make_shared<BgpPath>();
+    path->setNexthop(folly::IPAddress("10.0.0.2"));
+    path->setAsPath(std::move(asPath));
+    path->publish();
+    return std::shared_ptr<const BgpPath>(path);
+  };
+
+  const auto loopPrefix = folly::IPAddress::createNetwork("10.1.0.0/24");
+  const auto okPrefix = folly::IPAddress::createNetwork("10.2.0.0/24");
+  /*
+   * loopPrefix carries the peer's overridden local-AS -> dropped as a loop.
+   * okPrefix carries neither the override nor the global ASN -> accepted.
+   */
+  std::vector<RouteUpdate> routes{
+      RouteUpdate{loopPrefix, makePath({64000, 65111})},
+      RouteUpdate{okPrefix, makePath({64000})},
+  };
+
+  sw.receiveRoutes(sender, "sender_switch", routes);
+
+  // Only the non-looped prefix is recorded on the receiving peer.
+  const auto& received = sw.peers().front().receivedRoutes();
+  ASSERT_EQ(1u, received.size());
+  EXPECT_EQ(okPrefix, received.front().cidr);
 }
 
 } // namespace facebook::bgp
