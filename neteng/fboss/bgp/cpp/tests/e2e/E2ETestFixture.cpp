@@ -21,6 +21,7 @@
 #include <folly/coro/BlockingWait.h>
 
 #include "fboss/lib/CommonUtils.h"
+#include "neteng/fboss/bgp/cpp/changeTracker/ChangeItem.h"
 #include "neteng/fboss/bgp/cpp/common/FeatureFlags.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/BgpMessageParser.h"
@@ -1113,16 +1114,22 @@ BgpPeerDisplayInfo createDisplayInfo(
   displayInfo.peeringParams.holdTime =
       cfg.holdTime.value_or(std::chrono::seconds(90));
   displayInfo.peeringParams.description = cfg.description.value_or("");
-  displayInfo.peeringParams.isAfiIpv4Configured = true;
-  displayInfo.peeringParams.isAfiIpv6Configured = true;
+  /*
+   * Honor per-peer AFI disable flags so a peer can negotiate a single AFI
+   * (and therefore send a single EoR). Default (flag unset) keeps both AFIs.
+   */
+  const bool v4Enabled = !cfg.disableIpv4Afi.value_or(false);
+  const bool v6Enabled = !cfg.disableIpv6Afi.value_or(false);
+  displayInfo.peeringParams.isAfiIpv4Configured = v4Enabled;
+  displayInfo.peeringParams.isAfiIpv6Configured = v6Enabled;
   displayInfo.peeringParams.nexthopV4 = cfg.nexthopV4;
   displayInfo.peeringParams.nexthopV6 = cfg.nexthopV6;
   displayInfo.peeringParams.advertiseLinkBandwidth = cfg.advertiseLinkBandwidth;
   displayInfo.peeringParams.receiveLinkBandwidth = cfg.receiveLinkBandwidth;
   displayInfo.peeringParams.linkBandwidthBps = cfg.linkBandwidthBps;
   displayInfo.remoteBgpId = peerId.remoteBgpId;
-  displayInfo.negotiatedCapabilities.mpExtV4Unicast() = true;
-  displayInfo.negotiatedCapabilities.mpExtV6Unicast() = true;
+  displayInfo.negotiatedCapabilities.mpExtV4Unicast() = v4Enabled;
+  displayInfo.negotiatedCapabilities.mpExtV6Unicast() = v6Enabled;
   /* Enable 4-byte ASN capability (most common at Meta, required for ASNs >
    * 65535) */
   displayInfo.negotiatedCapabilities.as4byte() = true;
@@ -2331,6 +2338,153 @@ std::shared_ptr<AdjRib> E2ETestFixture::getAdjRibByAddr(
     }
   }
   return nullptr;
+}
+
+bool E2ETestFixture::waitForChangeListConsumerReady(
+    const folly::IPAddress& peerAddr,
+    int maxRetries) {
+  if (!peerManager_) {
+    XLOG(
+        ERR,
+        "PeerManager must be created before calling waitForChangeListConsumerReady");
+    return false;
+  }
+
+  bool ready = false;
+  WITH_RETRIES_N(maxRetries, {
+    /*
+     * Run on PeerManager's event base: adjRibs_ and the change-list consumer
+     * state are only accessed from that thread.
+     */
+    peerManager_->getEventBase().runInEventBaseThreadAndWait([&]() {
+      auto adjRib = getAdjRibByAddr(peerAddr);
+      if (!adjRib) {
+        ready = false;
+        return;
+      }
+      const auto& consumer = adjRib->getChangeListConsumer();
+      ready = consumer && consumer->isReady();
+    });
+    EXPECT_EVENTUALLY_TRUE(ready);
+  });
+  return ready;
+}
+
+bool E2ETestFixture::waitForChangeListConsumerPended(
+    const folly::IPAddress& peerAddr,
+    const folly::CIDRNetwork& prefix,
+    int maxRetries) {
+  if (!peerManager_) {
+    XLOG(
+        ERR,
+        "PeerManager must be created before calling waitForChangeListConsumerPended");
+    return false;
+  }
+
+  bool pended = false;
+  WITH_RETRIES_N(maxRetries, {
+    /*
+     * Run on PeerManager's event base: adjRibs_ and the change-list consumer
+     * state are only accessed from that thread.
+     */
+    peerManager_->getEventBase().runInEventBaseThreadAndWait([&]() {
+      auto adjRib = getAdjRibByAddr(peerAddr);
+      if (!adjRib) {
+        pended = false;
+        return;
+      }
+      const auto& consumer = adjRib->getChangeListConsumer();
+      auto* marker = consumer ? consumer->getMarker() : nullptr;
+      pended = marker != nullptr && marker->getTypedObject().prefix == prefix;
+    });
+    EXPECT_EVENTUALLY_TRUE(pended);
+  });
+  return pended;
+}
+
+std::optional<bool> E2ETestFixture::checkRibOutNexthopSetByPolicy(
+    const folly::IPAddress& peerAddr,
+    const folly::CIDRNetwork& prefix) {
+  std::optional<bool> result;
+  if (!peerManager_) {
+    return result;
+  }
+  peerManager_->getEventBase().runInEventBaseThreadAndWait([&]() {
+    auto adjRib = getAdjRibByAddr(peerAddr);
+    if (!adjRib) {
+      return;
+    }
+    auto* entry = adjRib->getRibEntry(/*ingress=*/false, prefix);
+    if (entry) {
+      result = entry->isNexthopSetByPolicy();
+    }
+  });
+  return result;
+}
+
+std::vector<E2ETestFixture::OutboundMessage>
+E2ETestFixture::drainAllOutboundMessages(
+    const BgpPeerId& peerId,
+    int idleRetries) {
+  std::vector<OutboundMessage> result;
+  auto queues = getPeerQueues(peerId);
+  if (!queues) {
+    return result;
+  }
+  const bool useBoundedQueue =
+      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
+
+  while (true) {
+    /*
+     * Wait for a message to become available. Popping unblocks the queue so
+     * sendBgpUpdates / the change-list timer can emit the next message; allow
+     * idleRetries x 50ms of quiet (covers the MRAI timer) before concluding the
+     * queue is fully drained.
+     */
+    bool available = false;
+    for (int i = 0; i < idleRetries; ++i) {
+      bool empty = useBoundedQueue ? queues->boundedAdjRibOutQ->empty()
+                                   : queues->adjRibOutQ->empty();
+      if (!empty) {
+        available = true;
+        break;
+      }
+      if (rib_) {
+        rib_->getEventBase().runInEventBaseThreadAndWait([]() {});
+      }
+      if (peerManager_) {
+        peerManager_->getEventBase().runInEventBaseThreadAndWait([]() {});
+      }
+      // NOLINTNEXTLINE(facebook-hte-BadCall-sleep_for)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!available) {
+      break;
+    }
+
+    auto msg = popFromQueue(*queues, useBoundedQueue);
+    if (!msg.has_value()) {
+      continue;
+    }
+    OutboundMessage out;
+    if (isEoRMessage(*msg)) {
+      out.isEoR = true;
+    } else if (isUpdateMessage(*msg)) {
+      if (auto* updatePtr =
+              std::get_if<std::shared_ptr<const BgpUpdate2>>(&(*msg))) {
+        out.update = *updatePtr;
+      } else if (
+          auto* descPtr =
+              std::get_if<nettools::bgplib::UpdateDescriptor>(&(*msg))) {
+        auto deser = deserializeUpdateDescriptor(*descPtr);
+        if (deser.has_value()) {
+          out.update = *deser;
+        }
+      }
+    }
+    result.push_back(std::move(out));
+  }
+  return result;
 }
 
 void E2ETestFixture::deleteRoute(

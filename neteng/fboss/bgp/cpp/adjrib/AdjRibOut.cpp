@@ -894,7 +894,10 @@ void AdjRib::processRibAnnouncedEntry(
       getPostOutPolicyAttributesAndInfo(
           update, adjRibEntry, prePolicyAttrs, updatePeerIdStr);
 
-  /* Store flag on AdjRibEntry for CLI display (AdjRibShow). */
+  /* Preserve previous value of the isNexthopSetByPolicy flag for comparison. */
+  bool wasNexthopSetByPolicy = adjRibEntry->isNexthopSetByPolicy();
+
+  /* Now update flag on AdjRibEntry for CLI display (AdjRibShow). */
   adjRibEntry->setNexthopSetByPolicy(postPolicyInfo.isNexthopSetByPolicy);
 
   if (!policyCachedAttrs) {
@@ -917,7 +920,9 @@ void AdjRib::processRibAnnouncedEntry(
   }
 
   auto newNexthop = getNewNexthopFromAttributesOut(
-      update.prefix.first.isV4(), policyCachedAttrs);
+      update.prefix.first.isV4(),
+      policyCachedAttrs,
+      postPolicyInfo.isNexthopSetByPolicy);
 
   // ignore announcement with unsupported nexthop encoding
   if (!newNexthop.empty() && !isNexthopSupported(update.prefix, newNexthop)) {
@@ -956,7 +961,8 @@ void AdjRib::processRibAnnouncedEntry(
     // We are doing deep compare to avoid notifying peer in cases where
     // due to policy changes of attributes, we end up with same contents
     // but different BgpPath shared_ptr
-    if (*adjRibEntry->getPostAttr() == *postOutAttrsNew) {
+    if (*adjRibEntry->getPostAttr() == *postOutAttrsNew &&
+        (wasNexthopSetByPolicy == adjRibEntry->isNexthopSetByPolicy())) {
       XLOGF(
           DBG3,
           "Skip announcing {} from [{}] to {}. "

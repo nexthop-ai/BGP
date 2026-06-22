@@ -575,6 +575,60 @@ class E2ETestFixture : public ::testing::Test {
   size_t getPeerQueueSize(const BgpPeerId& peerId);
 
   /*
+   * Wait until the peer's egress AdjRib change-list consumer is ready, i.e. it
+   * has reached the end of the change list (all published updates consumed into
+   * the packing list). Polls PeerManager for the peer's AdjRib. Returns true
+   * once the consumer is ready, false on timeout. Pair with
+   * waitForRouteInShadowRib (which confirms the update was published) to gate
+   * on "the update has been consumed into the packing list".
+   */
+  bool waitForChangeListConsumerReady(
+      const folly::IPAddress& peerAddr,
+      int maxRetries = 50);
+
+  /*
+   * Wait until the peer's egress AdjRib change-list consumer is pended on the
+   * change-list item for the given prefix, i.e. its marker points at the
+   * ShadowRibEntry change for that prefix (published but not yet consumed into
+   * the packing list). Use after injecting an update while the egress queue is
+   * backpressured to confirm the update is sitting unconsumed in the change
+   * list. Returns true once the marker is on that prefix, false on timeout.
+   */
+  bool waitForChangeListConsumerPended(
+      const folly::IPAddress& peerAddr,
+      const folly::CIDRNetwork& prefix,
+      int maxRetries = 50);
+
+  /*
+   * Read the egress (RIB-OUT) AdjRibEntry's isNexthopSetByPolicy() flag for a
+   * prefix on the peer. Returns std::nullopt if no egress entry exists. Runs on
+   * PeerManager's event base.
+   */
+  std::optional<bool> checkRibOutNexthopSetByPolicy(
+      const folly::IPAddress& peerAddr,
+      const folly::CIDRNetwork& prefix);
+
+  /*
+   * One message drained from a peer's egress queue, preserving order. Either an
+   * EoR (isEoR=true, update=null) or an UPDATE (update set).
+   */
+  struct OutboundMessage {
+    bool isEoR{false};
+    std::shared_ptr<const BgpUpdate2> update;
+  };
+
+  /*
+   * Pop every message currently obtainable from the peer's egress queue into a
+   * vector, in order, without dropping any. Waits (event-base flush + brief
+   * sleep) for asynchronously / timer-emitted messages, and stops once the
+   * queue stays empty for idleRetries consecutive checks. Use to verify the
+   * exact order and cardinality of emitted messages.
+   */
+  std::vector<OutboundMessage> drainAllOutboundMessages(
+      const BgpPeerId& peerId,
+      int idleRetries = 10);
+
+  /*
    * Drain a peer's queue completely by reading all messages
    * Useful for unblocking peers in tests
    *
