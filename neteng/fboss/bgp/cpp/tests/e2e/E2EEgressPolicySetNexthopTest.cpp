@@ -234,4 +234,102 @@ TEST_F(
   EXPECT_TRUE(*nhSetByPolicy);
 }
 
+/*
+ * Backpressure + announce-then-withdraw (the stale-route SEV scenario).
+ *
+ * An announcement whose egress SetNexthop fired (isNexthopSetByPolicy=true) is
+ * parked in the packing list while the egress queue is blocked. The prefix is
+ * then withdrawn. The withdrawal must coalesce with the still-pending flag=true
+ * announce, so the peer receives the prefix exactly once -- as a withdrawal.
+ *
+ * Without the both-flags cleanup in tryUpdateAttrToPrefixMapImpl, the flag=true
+ * announce is orphaned (the withdraw only probes the flag=false bucket) and is
+ * emitted alongside the withdrawal, re-installing the route on the peer after
+ * the withdrawal -- exactly the production stale route.
+ */
+TEST_F(
+    E2EEgressPolicySetNexthopTest,
+    BackpressureCollapsesAnnounceThenWithdraw_OnlyWithdrawalEmitted) {
+  /* Arrange: peers + egress policy, with a tiny queue (block after 1 item). */
+  addPeer(makeSource());
+  addPeer(makeDestWithPolicy());
+  setupEgressPolicy();
+  createRib();
+  setEorTimeSeconds(0);
+  createPeerManager(
+      /*enableUpdateGroup=*/false, /*enableEgressBackpressure=*/true);
+
+  setDefaultQueueSizes(/*capacity=*/2, /*highWm=*/1, /*lowWm=*/0);
+  bringUpPeer(kPeerAddr3);
+  bringUpPeer(kPeerAddr5);
+
+  BgpPeerId srcId{kPeerAddr3, kPeerAddr3.asV4().toLongHBO()};
+  BgpPeerId dstId{kPeerAddr5, kPeerAddr5.asV4().toLongHBO()};
+  sendEoRToPeer(srcId);
+  sendEoRToPeer(dstId);
+  ASSERT_TRUE(waitForEoR(srcId));
+
+  /* The dest's single EoR keeps its egress queue blocked (highWm=1). */
+  ASSERT_TRUE(waitForPeerQueueBlocked(dstId));
+
+  const folly::CIDRNetwork expectedCidr{folly::IPAddress(kPrefix), kPrefixLen};
+
+  /*
+   * Announce kPrefix WITH the community so term1's SetNexthop fires
+   * (isNexthopSetByPolicy=true). It is consumed into the packing list under the
+   * flag=true bucket while the queue stays blocked.
+   */
+  addRoute(
+      "v4",
+      kPrefix,
+      kPrefixLen,
+      kPeerAddr3,
+      kPolicyNexthop,
+      kAsPath,
+      kSetNexthopCommunity);
+  ASSERT_TRUE(waitForRouteInShadowRib(expectedCidr));
+  ASSERT_TRUE(waitForChangeListConsumerReady(kPeerAddr5));
+  ASSERT_TRUE(isPeerQueueBlocked(dstId));
+  {
+    auto nhSetByPolicy =
+        checkRibOutNexthopSetByPolicy(kPeerAddr5, expectedCidr);
+    ASSERT_TRUE(nhSetByPolicy.has_value());
+    EXPECT_TRUE(*nhSetByPolicy); /* announce staged with flag=true */
+  }
+
+  /*
+   * Withdraw kPrefix. The queue is still blocked, so the change-list consumer
+   * cannot drain; the withdrawal is pended on kPrefix's change item.
+   */
+  deleteRoute("v4", kPrefix, kPrefixLen, kPeerAddr3);
+  ASSERT_TRUE(waitForChangeListConsumerPended(kPeerAddr5, expectedCidr));
+
+  /*
+   * Drain every emitted message in order. Popping the EoR unblocks the queue;
+   * the consumer drains the withdrawal, which coalesces against the still-
+   * pending flag=true announce (both-flags cleanup), so kPrefix is emitted
+   * exactly once -- a withdrawal, with no orphaned announcement.
+   */
+  auto drained = drainAllOutboundMessagesToOrderedVec(dstId);
+
+  int announceCnt = 0;
+  int withdrawCnt = 0;
+  for (const auto& msg : drained) {
+    if (msg.update == nullptr) {
+      continue;
+    }
+    if (findPrefixInAnnouncements(
+            *msg.update, /*isV4=*/true, expectedCidr, /*addPathId=*/0)) {
+      ++announceCnt;
+    }
+    if (findPrefixInWithdrawals(
+            *msg.update, /*isV4=*/true, expectedCidr, /*addPathId=*/0)) {
+      ++withdrawCnt;
+    }
+  }
+  EXPECT_EQ(
+      0, announceCnt); /* orphan announce coalesced by both-flags cleanup */
+  EXPECT_EQ(1, withdrawCnt); /* prefix emitted exactly once, as a withdrawal */
+}
+
 } // namespace facebook::bgp
