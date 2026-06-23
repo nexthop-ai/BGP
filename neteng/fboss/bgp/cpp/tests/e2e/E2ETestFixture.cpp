@@ -2048,107 +2048,15 @@ size_t E2ETestFixture::drainPeerQueueCompletely(
     const BgpPeerId& peerId,
     int maxRetries,
     int maxMessages) {
-  auto queues = getPeerQueues(peerId);
-  if (!queues) {
-    XLOGF(
-        WARN,
-        "drainPeerQueueCompletely: peer {} not found",
-        peerId.peerAddr.str());
-    return 0;
-  }
-
-  const bool useBoundedQueue =
-      FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
-
-  XLOGF(
-      INFO,
-      "drainPeerQueueCompletely: draining queue for peer {} (useBoundedQueue={}, maxRetries={}, maxMessages={})",
-      peerId.peerAddr.str(),
-      useBoundedQueue,
-      maxRetries,
-      maxMessages);
-
-  size_t drained = 0;
-  int emptyRetries = 0;
-
-  while (true) {
-    /*
-     * Check if we've hit the message limit.
-     * This prevents infinite draining if messages keep arriving.
-     */
-    if (maxMessages > 0 && static_cast<int>(drained) >= maxMessages) {
-      XLOGF(
-          INFO,
-          "drainPeerQueueCompletely: hit max messages limit ({}), stopping",
-          maxMessages);
-      break;
-    }
-
-    /*
-     * Check queue state BEFORE calling pop().
-     *
-     * pop() blocks indefinitely if the queue is empty and not closed.
-     * We check empty() first to avoid blocking when the queue is drained.
-     *
-     * If queue is empty, messages might be in-flight (async processing).
-     * Pump event loops and retry to allow messages to arrive.
-     */
-    bool queueEmpty = useBoundedQueue ? queues->boundedAdjRibOutQ->empty()
-                                      : queues->adjRibOutQ->empty();
-
-    if (queueEmpty) {
-      // Queue is empty - messages might be in-flight
-      if (emptyRetries >= maxRetries) {
-        XLOGF(
-            INFO,
-            "drainPeerQueueCompletely: queue empty after {} retries, stopping",
-            emptyRetries);
-        break;
-      }
-      emptyRetries++;
-      XLOGF(
-          DBG2,
-          "drainPeerQueueCompletely: queue empty, retry {}/{}",
-          emptyRetries,
-          maxRetries);
-
-      // Pump event loops by scheduling a no-op and waiting for it to complete.
-      // This allows any pending async work to execute.
-      // Note: We can't call loopOnce() from a different thread - it will crash.
-      if (rib_) {
-        rib_->getEventBase().runInEventBaseThreadAndWait([]() {});
-      }
-      if (peerManager_) {
-        peerManager_->getEventBase().runInEventBaseThreadAndWait([]() {});
-      }
-      continue;
-    }
-
-    // Queue is NOT empty - safe to pop (we're the only consumer in tests)
-    // Reset retry counter since we found messages
-    emptyRetries = 0;
-
-    auto msg = popFromQueue(*queues, useBoundedQueue);
-    if (!msg.has_value()) {
-      break;
-    }
-    drained++;
-
-    if (isEoRMessage(*msg)) {
-      XLOGF(
-          INFO,
-          "drainPeerQueueCompletely: peer {} got EoR",
-          peerId.peerAddr.str());
-    }
-  }
-
-  XLOGF(
-      INFO,
-      "drainPeerQueueCompletely: drained {} messages from peer {}",
-      drained,
-      peerId.peerAddr.str());
-
-  return drained;
+  /*
+   * Pump-only drain (no sleep between empty retries) that discards the drained
+   * messages and returns the count. Shares the drain loop with
+   * drainAllOutboundMessagesToOrderedVec; callers that need the ordered
+   * messages should use that directly.
+   */
+  return drainAllOutboundMessagesToOrderedVec(
+             peerId, maxRetries, maxMessages, /*sleepMsBetweenRetries=*/0)
+      .size();
 }
 
 /*
@@ -2457,23 +2365,49 @@ std::optional<bool> E2ETestFixture::checkRibOutNexthopSetByPolicy(
 }
 
 std::vector<E2ETestFixture::OutboundMessage>
-E2ETestFixture::drainAllOutboundMessages(
+E2ETestFixture::drainAllOutboundMessagesToOrderedVec(
     const BgpPeerId& peerId,
-    int idleRetries) {
+    int idleRetries,
+    int maxMessages,
+    int sleepMsBetweenRetries) {
   std::vector<OutboundMessage> result;
   auto queues = getPeerQueues(peerId);
   if (!queues) {
+    XLOGF(
+        WARN,
+        "drainAllOutboundMessagesToOrderedVec: peer {} not found",
+        peerId.peerAddr.str());
     return result;
   }
   const bool useBoundedQueue =
       FLAGS_enable_egress_backpressure_in_peer_mgr_tests;
 
+  XLOGF(
+      INFO,
+      "drainAllOutboundMessagesToOrderedVec: draining queue for peer {} (useBoundedQueue={}, idleRetries={}, maxMessages={}, sleepMsBetweenRetries={})",
+      peerId.peerAddr.str(),
+      useBoundedQueue,
+      idleRetries,
+      maxMessages,
+      sleepMsBetweenRetries);
+
   while (true) {
+    /* Stop once we've drained the message cap (0 == unlimited). */
+    if (maxMessages > 0 && static_cast<int>(result.size()) >= maxMessages) {
+      XLOGF(
+          INFO,
+          "drainAllOutboundMessagesToOrderedVec: hit max messages limit ({}), stopping",
+          maxMessages);
+      break;
+    }
     /*
      * Wait for a message to become available. Popping unblocks the queue so
      * sendBgpUpdates / the change-list timer can emit the next message; allow
-     * idleRetries x 50ms of quiet (covers the MRAI timer) before concluding the
-     * queue is fully drained.
+     * idleRetries quiet checks before concluding the queue is fully drained.
+     * Between checks we pump the RIB and PeerManager event bases. When
+     * sleepMsBetweenRetries > 0 we also sleep that long to wait out
+     * timer-driven emits (e.g. the MRAI timer); sleepMsBetweenRetries == 0
+     * means pump-only (used by drainPeerQueueCompletely).
      */
     bool available = false;
     for (int i = 0; i < idleRetries; ++i) {
@@ -2489,10 +2423,17 @@ E2ETestFixture::drainAllOutboundMessages(
       if (peerManager_) {
         peerManager_->getEventBase().runInEventBaseThreadAndWait([]() {});
       }
-      // NOLINTNEXTLINE(facebook-hte-BadCall-sleep_for)
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      if (sleepMsBetweenRetries > 0) {
+        // NOLINTNEXTLINE(facebook-hte-BadCall-sleep_for)
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(sleepMsBetweenRetries));
+      }
     }
     if (!available) {
+      XLOGF(
+          INFO,
+          "drainAllOutboundMessagesToOrderedVec: queue empty after {} retries, stopping",
+          idleRetries);
       break;
     }
 
@@ -2503,6 +2444,10 @@ E2ETestFixture::drainAllOutboundMessages(
     OutboundMessage out;
     if (isEoRMessage(*msg)) {
       out.isEoR = true;
+      XLOGF(
+          INFO,
+          "drainAllOutboundMessagesToOrderedVec: peer {} got EoR",
+          peerId.peerAddr.str());
     } else if (isUpdateMessage(*msg)) {
       if (auto* updatePtr =
               std::get_if<std::shared_ptr<const BgpUpdate2>>(&(*msg))) {
@@ -2518,6 +2463,13 @@ E2ETestFixture::drainAllOutboundMessages(
     }
     result.push_back(std::move(out));
   }
+
+  XLOGF(
+      INFO,
+      "drainAllOutboundMessagesToOrderedVec: drained {} messages from peer {}",
+      result.size(),
+      peerId.peerAddr.str());
+
   return result;
 }
 

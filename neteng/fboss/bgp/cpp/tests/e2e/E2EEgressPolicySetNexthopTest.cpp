@@ -210,7 +210,7 @@ TEST_F(
    * The flap collapses against the self-nexthop entry already in the packing
    * list, so no stale self-nexthop announcement appears.
    */
-  auto drained = drainAllOutboundMessages(dstId);
+  auto drained = drainAllOutboundMessagesToOrderedVec(dstId);
 
   ASSERT_EQ(2u, drained.size());
   EXPECT_TRUE(drained[0].isEoR);

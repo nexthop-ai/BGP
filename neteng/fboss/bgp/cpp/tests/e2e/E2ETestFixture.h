@@ -624,9 +624,11 @@ class E2ETestFixture : public ::testing::Test {
    * queue stays empty for idleRetries consecutive checks. Use to verify the
    * exact order and cardinality of emitted messages.
    */
-  std::vector<OutboundMessage> drainAllOutboundMessages(
+  std::vector<OutboundMessage> drainAllOutboundMessagesToOrderedVec(
       const BgpPeerId& peerId,
-      int idleRetries = 10);
+      int idleRetries = 10,
+      int maxMessages = 0,
+      int sleepMsBetweenRetries = 50);
 
   /*
    * Drain a peer's queue completely by reading all messages
