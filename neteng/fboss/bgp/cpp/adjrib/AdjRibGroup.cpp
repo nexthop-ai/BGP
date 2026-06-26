@@ -3123,10 +3123,7 @@ void AdjRibOutGroup::checkAndAcceptReadyToJoinPeers() noexcept {
 
   // Accept DSP peers via collapse verification
   if (!dspCandidates.empty()) {
-    auto acceptedPeers = tryAcceptPeersToGroup(dspCandidates);
-    for (const auto& peer : acceptedPeers) {
-      markPeerInSync(peer);
-    }
+    tryAcceptPeersToGroup(dspCandidates);
   }
 }
 
@@ -3162,7 +3159,6 @@ void AdjRibOutGroup::maybeAcceptDSPPeer(
       adjRib->getPeerName(),
       bit);
   if (tryAcceptPeerToGroup(adjRib)) {
-    markPeerInSync(adjRib);
     // Resume the group: it may have been frozen while it had no sync peers.
     scheduleChangeListConsumeTimer();
   }
@@ -3284,6 +3280,14 @@ std::vector<std::shared_ptr<AdjRib>> AdjRibOutGroup::tryAcceptPeersToGroup(
         peer->getPeerName(),
         bit);
     acceptedPeers.push_back(peer);
+  }
+
+  /*
+   * Mark accepted peers in sync after finalization (markPeerInSync erases from
+   * detachedPeers_, so do it outside any detachedPeers_ iteration).
+   */
+  for (const auto& peer : acceptedPeers) {
+    markPeerInSync(peer);
   }
   return acceptedPeers;
 }
