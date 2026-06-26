@@ -2602,6 +2602,20 @@ void AdjRibOutGroup::removePeer(
   bitToAdjRibs_.erase(bit);
   bitManager_.freeConsumerBit(bit);
   adjRib->clearGroupBitPosition();
+
+  /*
+   * Whenever the group still has members but no SYNC peers, recover: clear the
+   * packing list, freeze the consume timer, and try to promote a detached peer
+   * (or stay frozen until one catches up). This is not only the SYNC -> none
+   * transition: the group may already have had no SYNC peers and we just
+   * removed a detached one, which can unblock a different detached peer.
+   *
+   * TODO: optimize -- this runs synchronously per removal. Skip it when nothing
+   * is promotable (no DETACHED_READY_TO_JOIN peers).
+   */
+  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
+    handleNoSyncPeers();
+  }
 }
 
 /*

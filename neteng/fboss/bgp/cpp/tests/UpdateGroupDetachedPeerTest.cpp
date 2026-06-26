@@ -2881,8 +2881,13 @@ class UpdateGroupDetachLifecycleTest : public ::testing::Test {
   }
 
   std::shared_ptr<AdjRib> createAndRegisterPeer(uint64_t bit) {
+    /*
+     * Distinct per-bit IP so each peer gets a distinct peer owner key (keyed on
+     * the peer address); required for tests with multiple peers that each carry
+     * their own per-peer RIB-OUT entries.
+     */
     auto peerId = nettools::bgplib::BgpPeerId(
-        folly::IPAddress("10.0.0.1"),
+        folly::IPAddress(fmt::format("10.0.0.{}", bit + 1)),
         folly::IPAddressV4("255.0.0.1").toLongHBO());
     auto adjRib = std::make_shared<AdjRib>(
         peerId,
@@ -2992,6 +2997,236 @@ class UpdateGroupDetachLifecycleTest : public ::testing::Test {
       nettools::bgplib::kMaxIngressQueueSize};
   MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ_;
 };
+
+/*
+ * unregisterPeer -> removePeer no-sync-peers recovery tests
+ */
+
+/*
+ * Unregistering the last SYNC peer triggers the removePeer recovery sweep,
+ * which immediately promotes every ready detached peer: 3 DFPs (RIB-OUT
+ * identical to the group, accepted directly), 1 DSP needing a full entry
+ * collapse (per-peer copies of all prefixes), and 2 DSPs needing a partial
+ * collapse (one per-peer copy plus already-shared group entries). All 6 end up
+ * SYNC with their RIB-OUT shared with the group.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    UnregisterLastSyncPeerPromotesDfpsAndCollapsesDsps) {
+  const std::array<folly::CIDRNetwork, 3> prefixes = {
+      kV4Prefix1, kV4Prefix2, kV4Prefix3};
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+
+  /*
+   * Group RIB-OUT: 3 prefixes (ribVersion 10). The cached version is bumped
+   * past them so a sync peer shares all of them.
+   */
+  for (const auto& prefix : prefixes) {
+    auto* g = group_->addToLiteTree(
+        group_->LiteTree_, prefix, groupOwnerKey, kPlaceholderPathID);
+    g->setPostAttr(attrs);
+    g->setRibVersion(10);
+  }
+  group_->setLastSeenRibVersion(100);
+
+  // The lone SYNC peer; unregistering it drives the no-sync-peers sweep.
+  auto syncPeer = createAndRegisterPeer(0);
+  setUpJoinedRunningPeer(syncPeer, 0);
+
+  std::vector<std::shared_ptr<AdjRib>> promoted;
+
+  // 3 DFPs: RIB-OUT identical to the group (no per-peer entries).
+  for (uint64_t bit : {1, 2, 3}) {
+    auto dfp = createAndRegisterPeer(bit);
+    dfp->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    dfp->setAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
+    group_->markPeerDetached(dfp);
+    promoted.push_back(dfp);
+  }
+
+  /*
+   * 1 DSP needing a FULL collapse: per-peer copies of all 3 prefixes (matching
+   * the group), all erased on collapse.
+   */
+  auto dspFull = createAndRegisterPeer(4);
+  dspFull->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  dspFull->setDetachedRibVersion(42);
+  group_->markPeerDetached(dspFull);
+  setUpReadyPeerConsumer(dspFull);
+  for (const auto& prefix : prefixes) {
+    group_
+        ->addToLiteTree(
+            group_->LiteTree_,
+            prefix,
+            dspFull->getPeerOwnerKey(),
+            kPlaceholderPathID)
+        ->setPostAttr(attrs);
+  }
+  promoted.push_back(dspFull);
+
+  /*
+   * 2 DSPs needing a PARTIAL collapse: one per-peer copy (kV4Prefix1) plus two
+   * already-shared group entries (ribVersion 10 <= detachedRibVersion 42).
+   */
+  for (uint64_t bit : {5, 6}) {
+    auto dsp = createAndRegisterPeer(bit);
+    dsp->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    dsp->setDetachedRibVersion(42);
+    group_->markPeerDetached(dsp);
+    setUpReadyPeerConsumer(dsp);
+    group_
+        ->addToLiteTree(
+            group_->LiteTree_,
+            kV4Prefix1,
+            dsp->getPeerOwnerKey(),
+            kPlaceholderPathID)
+        ->setPostAttr(attrs);
+    promoted.push_back(dsp);
+  }
+
+  setGroupConsumerReady();
+
+  // Remove the last SYNC peer -> immediate promotion sweep runs.
+  group_->unregisterPeer(syncPeer);
+
+  // All 6 detached peers became SYNC.
+  EXPECT_EQ(group_->getNumInSyncPeers(), 6);
+  for (const auto& peer : promoted) {
+    EXPECT_EQ(peer->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+    EXPECT_TRUE(group_->isPeerInSync(peer->getGroupBitPosition()));
+    EXPECT_FALSE(group_->getDetachedPeers().contains(peer));
+  }
+
+  // Every promoted peer now resolves each prefix to the shared group entry.
+  for (const auto& peer : promoted) {
+    for (const auto& prefix : prefixes) {
+      auto [entry, isPerPeerEntry] = group_->getRibEntrySharedOrPeer(
+          prefix,
+          peer->getPeerOwnerKey(),
+          kPlaceholderPathID,
+          group_->getLastSeenRibVersion());
+      EXPECT_NE(entry, nullptr);
+      EXPECT_FALSE(isPerPeerEntry); // shared with the group
+    }
+  }
+}
+
+/*
+ * Unregistering the last SYNC peer when only a detached peer ahead of the group
+ * (DEP-A) remains promotes it via promoteDetachedPeerToSync: the peer's RIB-OUT
+ * becomes the new group truth (group-only entries it never had are dropped).
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    UnregisterLastSyncPeerPromotesAheadDepAAndAdoptsRibOut) {
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+
+  /*
+   * "Random" existing group RIB-OUT: kV4Prefix1 (also owned by the peer) and
+   * kV4Prefix4 (group-only, the peer never had it).
+   */
+  auto groupAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix4}) {
+    group_
+        ->addToLiteTree(
+            group_->LiteTree_, prefix, groupOwnerKey, kPlaceholderPathID)
+        ->setPostAttr(groupAttrs);
+  }
+  group_->setLastSeenRibVersion(50);
+
+  auto syncPeer = createAndRegisterPeer(0);
+  setUpJoinedRunningPeer(syncPeer, 0);
+
+  /*
+   * DEP-A: detached ahead of the group (detachedRibVersion 0), with its own
+   * diverged RIB-OUT for 3 prefixes.
+   */
+  auto depA = createAndRegisterPeer(1);
+  depA->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  depA->setLastSeenRibVersion(100); // ahead of the group (50)
+  group_->markPeerDetached(depA);
+  setUpReadyPeerConsumer(depA);
+  /*
+   * Group consumer not at end of CL -> peer is "ahead", not
+   * collapse-rejoinable, forcing the promoteDetachedPeerToSync path.
+   */
+  publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.1.0.0"), 24});
+
+  auto peerOwnerKey = depA->getPeerOwnerKey();
+  auto peerAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(2, 0, 0, 0));
+  std::vector<std::pair<folly::CIDRNetwork, AdjRibEntry*>> peerEntries;
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix2, kV4Prefix3}) {
+    auto* e = group_->addToLiteTree(
+        group_->LiteTree_, prefix, peerOwnerKey, kPlaceholderPathID);
+    e->setPostAttr(peerAttrs);
+    peerEntries.emplace_back(prefix, e);
+  }
+
+  group_->unregisterPeer(syncPeer);
+
+  // DEP-A promoted to SYNC; group adopted its RIB version.
+  EXPECT_EQ(depA->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(1));
+  EXPECT_FALSE(group_->getDetachedPeers().contains(depA));
+  EXPECT_EQ(group_->getNumInSyncPeers(), 1);
+  EXPECT_EQ(group_->getLastSeenRibVersion(), 100);
+
+  /*
+   * The group RIB-OUT is now exactly the peer's old RIB-OUT: each peer entry
+   * was re-keyed under the group owner key (same object) and the peer key is
+   * gone.
+   */
+  for (const auto& [prefix, entry] : peerEntries) {
+    EXPECT_EQ(
+        group_->getFromLiteTree(group_->LiteTree_, prefix, groupOwnerKey),
+        entry);
+    EXPECT_EQ(
+        group_->getFromLiteTree(group_->LiteTree_, prefix, peerOwnerKey),
+        nullptr);
+  }
+  // The group-only entry the peer never had was deleted.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix4, groupOwnerKey),
+      nullptr);
+
+  /*
+   * promoteDetachedPeerToSync rebuilt the group consumer; point the fixture at
+   * the live one so TearDown tears down the right consumer.
+   */
+  groupConsumer_ = group_->getChangeListConsumer();
+}
+
+/*
+ * Unregistering the last SYNC peer with no promotable detached peer leaves the
+ * group frozen: nothing is promoted and it stays sync-less.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    UnregisterLastSyncPeerWithNoPromotablePeerStaysFrozen) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+
+  setUpJoinedRunningPeer(adjRib0, 0);
+  ASSERT_EQ(group_->getNumInSyncPeers(), 1);
+
+  /*
+   * adjRib1 is detached but still draining (not DETACHED_READY_TO_JOIN), so
+   * nothing is promotable.
+   */
+  group_->markPeerDetached(adjRib1);
+  adjRib1->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  group_->unregisterPeer(adjRib0);
+
+  /*
+   * No promotable peer -> group stays frozen with no SYNC peers, adjRib1
+   * untouched.
+   */
+  EXPECT_EQ(group_->getNumInSyncPeers(), 0);
+  EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib1));
+}
 
 /*
  * tryAcceptPeerToGroup() tests
