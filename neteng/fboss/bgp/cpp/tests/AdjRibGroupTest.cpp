@@ -16,19 +16,25 @@
 
 #include <gtest/gtest.h>
 
-#define AdjRibOutGroup_TEST_FRIENDS                                  \
-  friend class AdjRibGroupTest;                                      \
-  friend class AdjRibGroupPackingFixture;                            \
-  friend class AdjRibGroupRibOutEntryFixture;                        \
-  friend class AdjRibGroupWithdrawalFixture;                         \
-  friend class AdjRibGroupDistributionFixture;                       \
-  friend class AdjRibGroupPolicyFixture;                             \
-  friend class AdjRibGroupAddPathFixture;                            \
-  FRIEND_TEST(                                                       \
-      AdjRibGroupTest,                                               \
-      BuildAndSendGroupBgpMessages_EmptyPackingListEmitsRejoinLogs); \
-  FRIEND_TEST(                                                       \
-      AdjRibGroupPackingFixture,                                     \
+#define AdjRibOutGroup_TEST_FRIENDS                                        \
+  friend class AdjRibGroupTest;                                            \
+  friend class AdjRibGroupPackingFixture;                                  \
+  friend class AdjRibGroupRibOutEntryFixture;                              \
+  friend class AdjRibGroupWithdrawalFixture;                               \
+  friend class AdjRibGroupDistributionFixture;                             \
+  friend class AdjRibGroupPolicyFixture;                                   \
+  friend class AdjRibGroupAddPathFixture;                                  \
+  FRIEND_TEST(                                                             \
+      AdjRibGroupTest,                                                     \
+      BuildAndSendGroupBgpMessages_EmptyPackingListEmitsRejoinLogs);       \
+  FRIEND_TEST(                                                             \
+      AdjRibGroupTest,                                                     \
+      BuildAndSendGroupBgpMessages_NoSyncPeersDoesNotRestartConsumeTimer); \
+  FRIEND_TEST(                                                             \
+      AdjRibGroupTest,                                                     \
+      BuildAndSendGroupBgpMessages_SyncPeerRestartsConsumeTimer);          \
+  FRIEND_TEST(                                                             \
+      AdjRibGroupPackingFixture,                                           \
       ProcessRibAnnouncedEntryForGroup_NoEgressPolicyWithPolicyManagerDoesNotCrash);
 
 #include <folly/coro/BlockingWait.h>
@@ -191,6 +197,12 @@ TEST_F(AdjRibGroupTest, RegisterGroupConsumer) {
   createAdjRibOutGroup("test_group");
   MockChangeListConsumer();
   auto& messages = subscribeToLogMessages("", folly::LogLevel::DBG2);
+
+  // An in-sync peer so the group is not frozen (numInSyncPeers_ > 0).
+  auto adjRib = createMinimalAdjRib();
+  adjRib->setGroupBitPosition(0);
+  adjRibOutGroup_->setBitToAdjRibForTesting(0, adjRib);
+  adjRibOutGroup_->markPeerInSync(adjRib);
 
   // Activate the consumer and schedule the timer
   adjRibOutGroup_->registerGroupConsumer();
@@ -3962,6 +3974,52 @@ TEST_F(
 
   // Clean up
   adjRibOutGroup_->detachedPeers_.clear();
+}
+
+/*
+ * With no SYNC peers, buildAndSendGroupBgpMessages' cleanup guard must keep the
+ * group frozen: it should NOT restart the consume (packing) timer.
+ */
+TEST_F(
+    AdjRibGroupTest,
+    BuildAndSendGroupBgpMessages_NoSyncPeersDoesNotRestartConsumeTimer) {
+  createAdjRibOutGroup("test_group");
+  MockChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
+  ASSERT_EQ(adjRibOutGroup_->getNumInSyncPeers(), 0);
+
+  /*
+   * buildAndSendGroupBgpMessages' cleanup guard skips rescheduling the consume
+   * timer while the group has no SYNC peers, leaving it frozen.
+   */
+  folly::coro::blockingWait(
+      adjRibOutGroup_->buildAndSendGroupBgpMessages(false));
+  EXPECT_FALSE(adjRibOutGroup_->changeListConsumeTimer_->isScheduled());
+}
+
+/*
+ * Positive control: with a SYNC peer, the cleanup guard reschedules the consume
+ * timer.
+ */
+TEST_F(
+    AdjRibGroupTest,
+    BuildAndSendGroupBgpMessages_SyncPeerRestartsConsumeTimer) {
+  createAdjRibOutGroup("test_group");
+  MockChangeListConsumer();
+  adjRibOutGroup_->registerGroupConsumer();
+
+  // One in-sync peer.
+  auto adjRib = createMinimalAdjRib();
+  adjRib->setGroupBitPosition(0);
+  adjRibOutGroup_->setBitToAdjRibForTesting(0, adjRib);
+  adjRibOutGroup_->markPeerInSync(adjRib);
+  ASSERT_EQ(adjRibOutGroup_->getNumInSyncPeers(), 1);
+
+  folly::coro::blockingWait(
+      adjRibOutGroup_->buildAndSendGroupBgpMessages(false));
+
+  // With a SYNC peer present, the guard reschedules the consume timer.
+  EXPECT_TRUE(adjRibOutGroup_->changeListConsumeTimer_->isScheduled());
 }
 
 /*

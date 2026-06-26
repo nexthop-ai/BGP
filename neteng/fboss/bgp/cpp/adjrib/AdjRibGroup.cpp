@@ -480,7 +480,10 @@ void AdjRibOutGroup::createChangeListConsumeTimer() noexcept {
         previousRibVersion,
         lastSeenRibVersion_);
 
-    scheduleChangeListConsumeTimer();
+    /* Keep the group frozen while it has no SYNC peers. */
+    if (numInSyncPeers_ > 0) {
+      scheduleChangeListConsumeTimer();
+    }
     /* Trigger message building if packing list has entries */
     if (!attrToPrefixMap_.empty() &&
         (state_ == UpdateGroupState::READY ||
@@ -743,7 +746,10 @@ AdjRibOutGroup::buildAndScheduleSendInitialDumpFromShadowRib() {
   }
 
   registerGroupConsumer();
-  scheduleChangeListConsumeTimer();
+  /* Keep the group frozen while it has no SYNC peers. */
+  if (numInSyncPeers_ > 0) {
+    scheduleChangeListConsumeTimer();
+  }
 }
 
 /*
@@ -1830,7 +1836,6 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
    */
   auto guard = folly::makeGuard([this]() {
     packingInProgress_ = false;
-    scheduleChangeListConsumeTimer();
 
     /*
      * Transition to IDLE if packing list is now empty.
@@ -1846,6 +1851,15 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
 
       // Check for peers ready to rejoin after PL drain or PL empty.
       checkAndAcceptReadyToJoinPeers();
+    }
+
+    /*
+     * checkAndAcceptReadyToJoinPeers may promote a detached peer, taking
+     * numInSyncPeers_ from 0 to >0. The earlier reschedule above was skipped
+     * while frozen, so reschedule here to unfreeze the group.
+     */
+    if (numInSyncPeers_ > 0) {
+      scheduleChangeListConsumeTimer();
     }
   });
 
@@ -3021,6 +3035,8 @@ void AdjRibOutGroup::maybeAcceptDSPPeer(
       bit);
   if (tryAcceptPeerToGroup(adjRib)) {
     markPeerInSync(adjRib);
+    // Resume the group: it may have been frozen while it had no sync peers.
+    scheduleChangeListConsumeTimer();
   }
 }
 
@@ -3228,9 +3244,9 @@ void AdjRibOutGroup::handleNoSyncPeers() noexcept {
       detachedPeers_.size());
 
   /*
-   * Without any sync peers, we should stop update processing and distribution.
-   * TODO(Juliette): buildAndSendGroupBgpUpdates also needs to be
-   * cancellation aware; need to adjust the guard in that method.
+   * Without any sync peers, we stop update processing and distribution. The
+   * cleanup guard in buildAndSendGroupBgpMessages keeps the freeze by skipping
+   * the consume-timer reschedule while numInSyncPeers_ == 0.
    */
   clearPackingList();
 
