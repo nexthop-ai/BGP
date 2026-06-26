@@ -1031,6 +1031,16 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
    */
   void removePeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
+  void movePeerPathTreeEntries(
+      const std::shared_ptr<AdjRib>& adjRib,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup,
+      const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept;
+
+  void movePeerLiteTreeEntries(
+      const std::shared_ptr<AdjRib>& adjRib,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup,
+      const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept;
+
   /*
    * Clone decision algorithm: determines if a group entry must be cloned
    * to a detached peer before the group mutates it.

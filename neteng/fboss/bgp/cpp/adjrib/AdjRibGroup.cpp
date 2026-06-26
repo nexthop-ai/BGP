@@ -2618,6 +2618,120 @@ void AdjRibOutGroup::removePeer(
   }
 }
 
+void AdjRibOutGroup::movePeerPathTreeEntries(
+    const std::shared_ptr<AdjRib>& adjRib,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup,
+    const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept {
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = getGroupOwnerKey();
+  auto detachedRibVersion = adjRib->getDetachedRibVersion();
+  size_t movedCount = 0;
+  size_t copiedCount = 0;
+  std::vector<AdjRibPathTree::Iterator> emptyNodes;
+
+  for (auto itr = PathTree_.begin(); itr != PathTree_.end(); ++itr) {
+    auto& ownerMap = itr->value();
+    auto prefix = folly::CIDRNetwork{itr.ipAddress(), itr.masklen()};
+
+    // Copy per-peer entries to new group, then delete from old group
+    auto entryItr = ownerMap.find(peerOwnerKey);
+    if (entryItr != ownerMap.end()) {
+      for (auto& [pathId, entry] : entryItr->second) {
+        newGroup->copyEntryForOwner(
+            prefix, pathId, effectiveOwnerKey, entry.get());
+        movedCount++;
+      }
+      ownerMap.erase(entryItr);
+    }
+
+    // Copy shared group entries the peer was using before detachment
+    auto groupItr = ownerMap.find(groupOwnerKey);
+    if (groupItr != ownerMap.end()) {
+      for (auto& [pathId, entry] : groupItr->second) {
+        if (!isEntryNotShared(detachedRibVersion, entry->getRibVersion())) {
+          newGroup->copyEntryForOwner(
+              prefix, pathId, effectiveOwnerKey, entry.get());
+          copiedCount++;
+        }
+      }
+    }
+
+    // Clean up empty ownerMaps to not leave any empty radix node
+    if (ownerMap.empty()) {
+      emptyNodes.push_back(itr);
+    }
+  }
+
+  for (auto& itr : emptyNodes) {
+    PathTree_.erase(itr);
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Moved {} per-peer PathTree entries, copied {} shared entries "
+      "for peer {} to group {}",
+      groupDescriptor_,
+      movedCount,
+      copiedCount,
+      adjRib->getPeerName(),
+      newGroup->getAdjRibGroupName());
+}
+
+void AdjRibOutGroup::movePeerLiteTreeEntries(
+    const std::shared_ptr<AdjRib>& adjRib,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup,
+    const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept {
+  auto peerOwnerKey = adjRib->getPeerOwnerKey();
+  auto groupOwnerKey = getGroupOwnerKey();
+  auto detachedRibVersion = adjRib->getDetachedRibVersion();
+  size_t movedCount = 0;
+  size_t copiedCount = 0;
+  std::vector<AdjRibLiteTree::Iterator> emptyNodes;
+
+  for (auto itr = LiteTree_.begin(); itr != LiteTree_.end(); ++itr) {
+    auto& ownerMap = itr->value();
+    auto prefix = folly::CIDRNetwork{itr.ipAddress(), itr.masklen()};
+
+    // Copy per-peer entries to new group, then delete from old group
+    auto entryItr = ownerMap.find(peerOwnerKey);
+    if (entryItr != ownerMap.end()) {
+      newGroup->copyEntryForOwner(
+          prefix, kDefaultPathID, effectiveOwnerKey, entryItr->second.get());
+      ownerMap.erase(entryItr);
+      movedCount++;
+      // Clean up empty ownerMaps to not leave any empty radix node
+      if (ownerMap.empty()) {
+        emptyNodes.push_back(itr);
+      }
+      continue;
+    }
+
+    // Copy shared group entries the peer was using before detachment
+    auto groupItr = ownerMap.find(groupOwnerKey);
+    if (groupItr != ownerMap.end()) {
+      auto groupEntry = groupItr->second.get();
+      if (!isEntryNotShared(detachedRibVersion, groupEntry->getRibVersion())) {
+        newGroup->copyEntryForOwner(
+            prefix, kDefaultPathID, effectiveOwnerKey, groupEntry);
+        copiedCount++;
+      }
+    }
+  }
+
+  for (auto& itr : emptyNodes) {
+    LiteTree_.erase(itr);
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Moved {} per-peer LiteTree entries, copied {} shared entries "
+      "for peer {} to group {}",
+      groupDescriptor_,
+      movedCount,
+      copiedCount,
+      adjRib->getPeerName(),
+      newGroup->getAdjRibGroupName());
+}
 /*
  * Mark a peer as blocked due to TCP backpressure.
  * Sets bitmap bit, checks frequency threshold, schedules duration timer.
