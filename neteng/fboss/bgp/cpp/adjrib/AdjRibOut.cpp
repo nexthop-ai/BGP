@@ -435,7 +435,7 @@ folly::coro::Task<void> AdjRib::sendBgpUpdates(
       bgpMessageCnt,
       backpressured);
   if (enableUpdateGroup_) {
-    maybeTransitionDetachedReadyToJoin();
+    transitionPeerUpdateState();
   } else {
     reschedulePackingTimers();
   }
@@ -1710,7 +1710,7 @@ bool AdjRib::isDetachedPeer() const {
  *      DSP can initiate rejoin if the group is ready/IDLE.
  * Neither: reschedule packing timers to continue processing.
  */
-void AdjRib::maybeTransitionDetachedReadyToJoin() noexcept {
+void AdjRib::transitionPeerUpdateState() noexcept {
   // DETACHED_INIT_DUMP peers were never in sync with the group, so they
   // can never be DFP — they must always go through the DSP rejoin path
   // with collapse verification.

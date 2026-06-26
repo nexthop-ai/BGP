@@ -4919,7 +4919,7 @@ TEST_F(UpdateGroupDetachLifecycleTest, DetachPeerSetsAllExpectedState) {
 
 /*
  * A detached peer with lastSeenRibVersion > group's transitions to
- * DETACHED_READY_TO_JOIN after PL drain via maybeTransitionDetachedReadyToJoin.
+ * DETACHED_READY_TO_JOIN after PL drain via transitionPeerUpdateState.
  */
 TEST_F(
     UpdateGroupDetachLifecycleTest,
@@ -4936,7 +4936,7 @@ TEST_F(
 
   EXPECT_TRUE(adjRib0->attrToPrefixMap_.empty());
 
-  adjRib0->maybeTransitionDetachedReadyToJoin();
+  adjRib0->transitionPeerUpdateState();
 
   EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
   EXPECT_FALSE(adjRib0->isAdjRibFlagSet(AdjRib::IS_DETACHED_FAST_PEER));
@@ -4972,7 +4972,7 @@ TEST_F(
 
 /*
  * DSP defer path: when a peer reaches the DSP rejoin point via
- * maybeTransitionDetachedReadyToJoin while the group's packing list still has
+ * transitionPeerUpdateState while the group's packing list still has
  * undistributed entries, maybeAcceptDSPPeer defers acceptance. The peer
  * stays DETACHED_READY_TO_JOIN (not in sync) until the group drains its packing
  * list, at which point checkAndAcceptReadyToJoinPeers accepts it.
@@ -4986,7 +4986,7 @@ TEST_F(
 
   /*
    * Peer 0 has caught up to the group's CL marker (ready to rejoin). Use
-   * DETACHED_INIT_DUMP so maybeTransitionDetachedReadyToJoin deterministically
+   * DETACHED_INIT_DUMP so transitionPeerUpdateState deterministically
    * takes the DSP rejoin path (the DFP fast-path is skipped for init-dump
    * peers) and calls maybeAcceptDSPPeer.
    */
@@ -5002,7 +5002,7 @@ TEST_F(
   ASSERT_FALSE(group_->getAttrToPrefixMap().empty());
 
   // DSP rejoin attempt: acceptance is deferred because the group PL is dirty.
-  adjRib0->maybeTransitionDetachedReadyToJoin();
+  adjRib0->transitionPeerUpdateState();
 
   EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_READY_TO_JOIN);
   EXPECT_FALSE(group_->isPeerInSync(0));

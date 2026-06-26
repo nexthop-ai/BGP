@@ -1353,7 +1353,7 @@ class AdjRib : boost::noncopyable,
    * DETACHED_INIT_DUMP peers are never DFP since they were never in sync).
    * Called at end of sendBgpUpdates() when update groups are enabled.
    */
-  void maybeTransitionDetachedReadyToJoin() noexcept;
+  void transitionPeerUpdateState() noexcept;
 
   // Called when BGP session is terminated
   folly::coro::Task<void> sessionTerminated(
