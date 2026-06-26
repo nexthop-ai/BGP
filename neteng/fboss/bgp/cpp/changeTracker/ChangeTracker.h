@@ -346,6 +346,31 @@ class ChangeTracker {
       const std::shared_ptr<Consumer<T>>& newConsumer);
 
   /**
+   * Fast-forward currentConsumer up to targetConsumer's position by acking
+   * (marking processed) every item in between, WITHOUT invoking
+   * currentConsumer's process callback.
+   *
+   * Normally targetConsumer is at or ahead of currentConsumer on the change
+   * list. When it is ahead, the boundary is EXCLUSIVE - the item at
+   * targetConsumer's marker is not acked; currentConsumer ends pended there,
+   * aligned with targetConsumer.
+   *
+   * If targetConsumer's marker is null, or is behind currentConsumer (so
+   * walking forward never reaches it), currentConsumer simply acks through to
+   * the end of the change list and becomes a ready consumer (null marker).
+   *
+   * Unlike joinConsumer(), this operates on an already-active consumer that is
+   * BEHIND: it only clears currentConsumer's bit on the skipped prefix and
+   * leaves the already-set bits on [targetMarker, end] untouched.
+   *
+   * @param currentConsumer The behind consumer to advance.
+   * @param targetConsumer The consumer whose marker is the exclusive boundary.
+   */
+  void skipUntilMarker(
+      const std::shared_ptr<Consumer<T>>& currentConsumer,
+      const std::shared_ptr<Consumer<T>>& targetConsumer);
+
+  /**
    * Get the full consumer bitmap (all bits set for registered consumers).
    * @return Bitmap with bits set for all registered consumers.
    */
@@ -860,6 +885,112 @@ void ChangeTracker<T>::joinConsumer(
       itemsUpdated,
       newConsumer->getDisplayString(),
       getItemDisplayString(pendedItem));
+}
+
+template <typename T>
+void ChangeTracker<T>::skipUntilMarker(
+    const std::shared_ptr<Consumer<T>>& currentConsumer,
+    const std::shared_ptr<Consumer<T>>& targetConsumer) {
+  if (!currentConsumer || !targetConsumer) {
+    CT_DEBUG_LOG(
+        DBG4,
+        "skipUntilMarker called with null consumer (current={}, target={}) - returning early",
+        currentConsumer ? currentConsumer->getDisplayString() : "null",
+        targetConsumer ? targetConsumer->getDisplayString() : "null");
+    return;
+  }
+
+  if (currentConsumer->getBitPosition() == static_cast<size_t>(-1)) {
+    CT_DEBUG_LOG(
+        DBG4,
+        "skipUntilMarker: current consumer {} is not registered - returning early",
+        currentConsumer->getDisplayString());
+    return;
+  }
+
+  ChangeItem<T>* targetMarker = targetConsumer->getMarker();
+  ChangeItem<T>* startItem = currentConsumer->getMarker();
+
+  /*
+   * currentConsumer is already at the end of the change list (null marker):
+   * there is nothing ahead to skip. Ensure it is a ready consumer and return.
+   * This trivially covers the case where targetMarker is also null or behind.
+   */
+  if (startItem == nullptr) {
+    addToReadyConsumers(currentConsumer);
+    CT_DEBUG_LOG(
+        DBG3,
+        "skipUntilMarker: consumer {} already at end of list, now a ready consumer",
+        currentConsumer->getDisplayString());
+    return;
+  }
+
+  // Already pended at the same item as target: nothing to skip.
+  if (startItem == targetMarker) {
+    CT_DEBUG_LOG(
+        DBG3,
+        "skipUntilMarker: consumer {} already aligned with target {} at {}",
+        currentConsumer->getDisplayString(),
+        targetConsumer->getDisplayString(),
+        getItemDisplayString(targetMarker));
+    return;
+  }
+
+  CT_DEBUG_LOG(
+      DBG3,
+      "skipUntilMarker: advancing consumer {} from {} up to target {} marker {}",
+      currentConsumer->getDisplayString(),
+      getItemDisplayString(startItem),
+      targetConsumer->getDisplayString(),
+      getItemDisplayString(targetMarker));
+
+  /*
+   * Walk the raw change list forward from startItem, stopping at targetMarker
+   * by pointer identity (exclusive). get_next() visits every item -- owned or
+   * not -- so the walk stops at targetMarker even when currentConsumer does not
+   * own it (e.g. an item published selectively to targetConsumer only). That is
+   * what lets currentConsumer align with targetConsumer instead of skipping
+   * past an unowned boundary the way the bit-following iterator would.
+   *
+   * Ack only the items currentConsumer owns: clear its bit and notify the
+   * producer if the item thereby becomes fully processed. Capture the next
+   * pointer BEFORE acking, because notifying the producer may free a
+   * fully-processed item (avoids use-after-free).
+   *
+   * currentConsumer is pended at startItem; detach it before acking so the
+   * pending-consumer migration that runs when an owned item is freed does not
+   * drag its marker forward. It is re-pended at its final position below.
+   *
+   * If targetMarker is null (targetConsumer is ready) or behind currentConsumer
+   * the forward walk never meets it and runs off the end, leaving
+   * currentConsumer a ready consumer.
+   */
+  const size_t bitPosition = currentConsumer->getBitPosition();
+  startItem->removePendingConsumer(currentConsumer);
+
+  ChangeItem<T>* item = startItem;
+  while (item != nullptr && item != targetMarker) {
+    ChangeItem<T>* nextItem = get_next(item, changeList_);
+    if (BitmapUtils::isBitSet(item->consumerBitmap, bitPosition)) {
+      item->markConsumerProcessed(bitPosition);
+      checkAndNotifyProducer(item);
+    }
+    item = nextItem;
+  }
+
+  currentConsumer->setMarker(item);
+  currentConsumer->recordMarkerAdvance();
+  if (item == nullptr) {
+    addToReadyConsumers(currentConsumer);
+  } else {
+    currentConsumer->end();
+  }
+
+  CT_DEBUG_LOG(
+      DBG3,
+      "skipUntilMarker: consumer {} advanced; marker now {}",
+      currentConsumer->getDisplayString(),
+      getItemDisplayString(currentConsumer->getMarker()));
 }
 
 template <typename T>

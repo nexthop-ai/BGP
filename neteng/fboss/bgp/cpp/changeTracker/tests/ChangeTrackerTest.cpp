@@ -5052,6 +5052,359 @@ TEST(ChangeTrackerTest, ConsumeWithIteratorUntil_YieldBeforeBoundary) {
   consumer->deregisterFromTracker();
 }
 
+// ============================================================
+// skipUntilMarker Tests
+// ============================================================
+
+namespace {
+
+/*
+ * Advance `consumer` forward `steps` items using the iterator API, acking each
+ * via markProcessed() WITHOUT invoking the process callback, then pend it at
+ * the resulting marker. Used to deterministically set up "ahead"/"behind"
+ * consumer positions for skipUntilMarker tests without polluting
+ * getProcessedItems().
+ */
+void advanceConsumerBySteps(
+    const std::shared_ptr<TestConsumer>& consumer,
+    int steps) {
+  auto* item = consumer->begin();
+  for (int i = 0; i < steps && item != nullptr; ++i) {
+    consumer->markProcessed(item);
+    item = consumer->next();
+  }
+  consumer->end();
+}
+
+} // namespace
+
+/*
+ * Target ahead: currentConsumer fast-forwards to target's marker, acking (not
+ * processing) every item in between. With both consumers having acked the
+ * skipped prefix, those items become fully processed and are freed (producer
+ * notified, in order). currentConsumer ends aligned with target and never runs
+ * its process callback. This also exercises the get-next-before-ack ordering:
+ * items are freed mid-walk, so the wrong order would use-after-free.
+ */
+TEST(ChangeTrackerTest, SkipUntilMarker_TargetAhead_Aligns) {
+  std::vector<int> freed;
+  ChangeTracker<TestObject> tracker("SkipTargetAheadTracker");
+  TestProducer producer(tracker);
+
+  auto current = std::make_shared<TestConsumer>(tracker, "Current");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  current->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  auto* object4 = producer.createObject(4);
+  auto* object5 = producer.createObject(5);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+  producer.publishChange(object4);
+  producer.publishChange(object5);
+
+  // Move target ahead to item 3; current stays behind at item 1.
+  advanceConsumerBySteps(target, 2);
+  ASSERT_NE(target->getMarker(), nullptr);
+  ASSERT_EQ(target->getMarker()->getTypedObject().getValue(), 3);
+
+  tracker.setGlobalOnChangeProcessedCallback(
+      [&freed](TrackableObject<TestObject>* obj) {
+        if (obj) {
+          freed.push_back(obj->get().getValue());
+        }
+      });
+
+  tracker.skipUntilMarker(current, target);
+
+  // current is now aligned at target's marker (item 3).
+  ASSERT_NE(current->getMarker(), nullptr);
+  EXPECT_EQ(current->getMarker(), target->getMarker());
+  EXPECT_EQ(current->getMarker()->getTypedObject().getValue(), 3);
+
+  // skip acks, never processes: current's callback was not invoked.
+  EXPECT_TRUE(current->getProcessedItems().empty());
+
+  // items 1 and 2 were acked by both consumers -> fully processed -> freed.
+  const std::vector<int> expectedFreed{1, 2};
+  EXPECT_EQ(freed, expectedFreed);
+  EXPECT_EQ(tracker.getChangeList().size(), 3u);
+
+  // current still owns the remaining items; the freed item is gone.
+  EXPECT_TRUE(tracker.isConsumerSetOnTrackableObject(object3, current));
+  EXPECT_FALSE(tracker.isConsumerSetOnTrackableObject(object1, current));
+
+  current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * Target at end of list (null marker): currentConsumer acks every remaining
+ * item through to the end and becomes a ready consumer (null marker, in ready
+ * list). With both consumers acking, all items are freed.
+ */
+TEST(ChangeTrackerTest, SkipUntilMarker_TargetReady_CurrentBecomesReady) {
+  std::vector<int> freed;
+  ChangeTracker<TestObject> tracker("SkipTargetReadyTracker");
+  TestProducer producer(tracker);
+
+  auto current = std::make_shared<TestConsumer>(tracker, "Current");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  current->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+
+  // Advance target off the end: it becomes ready with a null marker.
+  advanceConsumerBySteps(target, 3);
+  ASSERT_TRUE(target->isReady());
+
+  tracker.setGlobalOnChangeProcessedCallback(
+      [&freed](TrackableObject<TestObject>* obj) {
+        if (obj) {
+          freed.push_back(obj->get().getValue());
+        }
+      });
+
+  tracker.skipUntilMarker(current, target);
+
+  // current walked to the end and is now ready.
+  EXPECT_TRUE(current->isReady());
+  EXPECT_EQ(current->getMarker(), nullptr);
+  EXPECT_TRUE(current->isInReadyList());
+  EXPECT_TRUE(current->getProcessedItems().empty());
+
+  // all three items were acked by both consumers -> freed.
+  const std::vector<int> expectedFreed{1, 2, 3};
+  EXPECT_EQ(freed, expectedFreed);
+  EXPECT_TRUE(tracker.getChangeList().empty());
+
+  current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * current and target already at the same marker: skipUntilMarker is a no-op.
+ * Nothing is acked or freed and current's position is unchanged.
+ */
+TEST(ChangeTrackerTest, SkipUntilMarker_AlreadyAligned_NoOp) {
+  std::vector<int> freed;
+  ChangeTracker<TestObject> tracker("SkipAlignedTracker");
+  TestProducer producer(tracker);
+
+  auto current = std::make_shared<TestConsumer>(tracker, "Current");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  current->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+
+  // Both consumers are pended at item 1 (same marker).
+  ASSERT_EQ(current->getMarker(), target->getMarker());
+
+  tracker.setGlobalOnChangeProcessedCallback(
+      [&freed](TrackableObject<TestObject>* obj) {
+        if (obj) {
+          freed.push_back(obj->get().getValue());
+        }
+      });
+
+  tracker.skipUntilMarker(current, target);
+
+  // No-op: current still at item 1, nothing freed, callback never ran.
+  ASSERT_NE(current->getMarker(), nullptr);
+  EXPECT_EQ(current->getMarker()->getTypedObject().getValue(), 1);
+  EXPECT_TRUE(freed.empty());
+  EXPECT_EQ(tracker.getChangeList().size(), 3u);
+  EXPECT_TRUE(current->getProcessedItems().empty());
+
+  current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * Target BEHIND current (target's marker is not reachable by walking forward):
+ * current acks through to the end and becomes ready. Nothing is freed here
+ * because target still owns every item (its bit stays set).
+ */
+TEST(ChangeTrackerTest, SkipUntilMarker_TargetBehind_CurrentBecomesReady) {
+  ChangeTracker<TestObject> tracker("SkipTargetBehindTracker");
+  TestProducer producer(tracker);
+
+  auto current = std::make_shared<TestConsumer>(tracker, "Current");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  current->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  auto* object3 = producer.createObject(3);
+  auto* object4 = producer.createObject(4);
+  auto* object5 = producer.createObject(5);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+  producer.publishChange(object3);
+  producer.publishChange(object4);
+  producer.publishChange(object5);
+
+  // Move current ahead to item 3; target stays behind at item 1.
+  advanceConsumerBySteps(current, 2);
+  ASSERT_EQ(current->getMarker()->getTypedObject().getValue(), 3);
+  ASSERT_EQ(target->getMarker()->getTypedObject().getValue(), 1);
+
+  tracker.skipUntilMarker(current, target);
+
+  // current walked off the end (never found the behind target) -> ready.
+  EXPECT_TRUE(current->isReady());
+  EXPECT_EQ(current->getMarker(), nullptr);
+  EXPECT_TRUE(current->isInReadyList());
+  EXPECT_TRUE(current->getProcessedItems().empty());
+
+  // Nothing freed: target still owns every item.
+  EXPECT_EQ(tracker.getChangeList().size(), 5u);
+
+  current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * skipUntilMarker is a safe no-op on invalid arguments: null current, null
+ * target, or an unregistered current consumer.
+ */
+TEST(ChangeTrackerTest, SkipUntilMarker_InvalidArgs_NoOp) {
+  ChangeTracker<TestObject> tracker("SkipInvalidArgsTracker");
+  TestProducer producer(tracker);
+
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  target->registerWithTracker();
+  auto* object1 = producer.createObject(1);
+  producer.publishChange(object1);
+  auto* markerBefore = target->getMarker();
+  ASSERT_NE(markerBefore, nullptr);
+
+  // Unregistered consumer: no registerWithTracker, so bitPosition == -1.
+  auto unregistered = std::make_shared<TestConsumer>(tracker, "Unregistered");
+
+  tracker.skipUntilMarker(nullptr, target);
+  tracker.skipUntilMarker(target, nullptr);
+  tracker.skipUntilMarker(unregistered, target);
+
+  // target and the unregistered consumer are both untouched.
+  EXPECT_EQ(target->getMarker(), markerBefore);
+  EXPECT_EQ(unregistered->getMarker(), nullptr);
+
+  target->deregisterFromTracker();
+}
+
+/*
+ * current already at the end of the list (ready, null marker) when called:
+ * skipUntilMarker is a no-op and current remains a ready consumer.
+ */
+TEST(ChangeTrackerTest, SkipUntilMarker_CurrentAlreadyReady_NoOp) {
+  ChangeTracker<TestObject> tracker("SkipCurrentReadyTracker");
+  TestProducer producer(tracker);
+
+  auto current = std::make_shared<TestConsumer>(tracker, "Current");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  current->registerWithTracker();
+  target->registerWithTracker();
+
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  producer.publishChange(object1);
+  producer.publishChange(object2);
+
+  // Drive current to the end so it is ready with a null marker; target stays
+  // behind at item 1.
+  advanceConsumerBySteps(current, 2);
+  ASSERT_TRUE(current->isReady());
+  ASSERT_EQ(current->getMarker(), nullptr);
+  ASSERT_NE(target->getMarker(), nullptr);
+
+  tracker.skipUntilMarker(current, target);
+
+  // current is unchanged: still ready with a null marker.
+  EXPECT_TRUE(current->isReady());
+  EXPECT_EQ(current->getMarker(), nullptr);
+  EXPECT_TRUE(current->isInReadyList());
+
+  current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
+/*
+ * Target marker present but NOT owned by currentConsumer: object2 is published
+ * selectively to target only, so target pends ahead at an item current's bit is
+ * not on. The skip walks the raw change list and stops at target's marker by
+ * pointer identity regardless of ownership, so current acks the prefix it does
+ * own and parks at target's marker, aligned with target -- it does NOT overrun
+ * to the ready list.
+ */
+TEST(
+    ChangeTrackerTest,
+    SkipUntilMarker_TargetMarkerNotOwnedByCurrent_ParksAtTarget) {
+  ChangeTracker<TestObject> tracker("SkipTargetNotOwnedTracker");
+  TestProducer producer(tracker);
+
+  auto current = std::make_shared<TestConsumer>(tracker, "Current");
+  auto target = std::make_shared<TestConsumer>(tracker, "Target");
+  current->registerWithTracker();
+  target->registerWithTracker();
+
+  // object1 goes to both consumers; object2 is published to target only, so it
+  // carries target's bit but not current's.
+  auto* object1 = producer.createObject(1);
+  auto* object2 = producer.createObject(2);
+  producer.publishChange(object1);
+
+  ConsumerBitmap targetOnly;
+  BitmapUtils::setBit(targetOnly, target->getBitPosition());
+  tracker.publishChange(object2, targetOnly);
+
+  // Move target ahead to object2 (the item current's bit is not on); current
+  // stays pended at object1.
+  advanceConsumerBySteps(target, 1);
+  ASSERT_NE(target->getMarker(), nullptr);
+  ASSERT_EQ(target->getMarker()->getTypedObject().getValue(), 2);
+  ASSERT_NE(current->getMarker(), nullptr);
+  ASSERT_EQ(current->getMarker()->getTypedObject().getValue(), 1);
+
+  tracker.skipUntilMarker(current, target);
+
+  // The raw walk stops at target's marker by pointer identity even though
+  // current does not own object2, so current acks object1 and parks at object2,
+  // aligned with target -- without running its process callback.
+  EXPECT_FALSE(current->isReady());
+  ASSERT_NE(current->getMarker(), nullptr);
+  EXPECT_EQ(current->getMarker()->getTypedObject().getValue(), 2);
+  EXPECT_EQ(current->getMarker(), target->getMarker());
+  EXPECT_FALSE(current->isInReadyList());
+  EXPECT_TRUE(current->getProcessedItems().empty());
+
+  // object1 was acked by both consumers -> fully processed -> freed; object2
+  // remains, owned by target and now also current's parked marker.
+  EXPECT_EQ(tracker.getChangeList().size(), 1u);
+  ASSERT_NE(target->getMarker(), nullptr);
+  EXPECT_EQ(target->getMarker()->getTypedObject().getValue(), 2);
+
+  current->deregisterFromTracker();
+  target->deregisterFromTracker();
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
