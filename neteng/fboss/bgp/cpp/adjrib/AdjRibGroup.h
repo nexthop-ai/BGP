@@ -234,14 +234,15 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
 
   /**
    * When a peer detaches from the group at rib version N, any group entries
-   * with a rib version greater than N were created or re-announced after the
-   * peer detached, meaning they were never seen by the peer. This implies
-   * the entry is not shared by the peer.
+   * with a rib version less than or equal to N existed when the peer was still
+   * attached, meaning the peer saw them. This implies the entry is shared by
+   * the peer. Entries with a rib version greater than N were created or
+   * re-announced after the peer detached and are not shared.
    */
-  static bool isEntryNotShared(
+  static bool isEntryShared(
       uint64_t peerDetachedRibVersion,
       uint64_t groupEntryRibVersion) noexcept {
-    return peerDetachedRibVersion < groupEntryRibVersion;
+    return peerDetachedRibVersion >= groupEntryRibVersion;
   }
 
   /*
@@ -299,7 +300,7 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
     }
     auto groupItr = ownerMap.find(getGroupOwnerKey());
     if (groupItr != ownerMap.end() &&
-        !isEntryNotShared(sharingVersion, groupItr->second->getRibVersion())) {
+        isEntryShared(sharingVersion, groupItr->second->getRibVersion())) {
       return groupItr->second.get();
     }
     return nullptr;
@@ -338,7 +339,7 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
           peerItr->second.find(pathId) != peerItr->second.end()) {
         continue;
       }
-      if (!isEntryNotShared(sharingVersion, entry->getRibVersion())) {
+      if (isEntryShared(sharingVersion, entry->getRibVersion())) {
         cb(pathId, *entry);
       }
     }

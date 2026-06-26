@@ -351,7 +351,7 @@ AdjRibOutGroup::getRibEntrySharedOrPeer(
   if (isPerPeerEntry) {
     return {entry, true /* isPerPeerEntry */};
   }
-  if (entry && isEntryNotShared(detachedRibVersion, entry->getRibVersion())) {
+  if (entry && !isEntryShared(detachedRibVersion, entry->getRibVersion())) {
     return {nullptr, false /* isPerPeerEntry */};
   }
   return {entry, false /* isPerPeerEntry */};
@@ -2519,7 +2519,7 @@ void AdjRibOutGroup::cleanUpDetachedRibEntries(
         auto groupIt = ownerMap.find(groupOwnerKey);
         if (groupIt != ownerMap.end()) {
           for (const auto& [_, entry] : groupIt->second) {
-            if (!isEntryNotShared(detachedRibVersion, entry->getRibVersion())) {
+            if (isEntryShared(detachedRibVersion, entry->getRibVersion())) {
               sharedCount++;
             }
           }
@@ -2552,7 +2552,7 @@ void AdjRibOutGroup::cleanUpDetachedRibEntries(
       } else {
         auto groupIt = ownerMap.find(groupOwnerKey);
         if (groupIt != ownerMap.end() &&
-            !isEntryNotShared(
+            isEntryShared(
                 detachedRibVersion, groupIt->second->getRibVersion())) {
           sharedCount++;
         }
@@ -2648,7 +2648,7 @@ void AdjRibOutGroup::movePeerPathTreeEntries(
     auto groupItr = ownerMap.find(groupOwnerKey);
     if (groupItr != ownerMap.end()) {
       for (auto& [pathId, entry] : groupItr->second) {
-        if (!isEntryNotShared(detachedRibVersion, entry->getRibVersion())) {
+        if (isEntryShared(detachedRibVersion, entry->getRibVersion())) {
           newGroup->copyEntryForOwner(
               prefix, pathId, effectiveOwnerKey, entry.get());
           copiedCount++;
@@ -2710,7 +2710,7 @@ void AdjRibOutGroup::movePeerLiteTreeEntries(
     auto groupItr = ownerMap.find(groupOwnerKey);
     if (groupItr != ownerMap.end()) {
       auto groupEntry = groupItr->second.get();
-      if (!isEntryNotShared(detachedRibVersion, groupEntry->getRibVersion())) {
+      if (isEntryShared(detachedRibVersion, groupEntry->getRibVersion())) {
         newGroup->copyEntryForOwner(
             prefix, kDefaultPathID, effectiveOwnerKey, groupEntry);
         copiedCount++;
@@ -3318,7 +3318,7 @@ bool AdjRibOutGroup::shouldClonePathForPeer(
   }
 
   // Case 2: entry was announced/re-announced after peer detached — no clone
-  if (isEntryNotShared(peer->getDetachedRibVersion(), groupEntryRibVersion)) {
+  if (!isEntryShared(peer->getDetachedRibVersion(), groupEntryRibVersion)) {
     return false;
   }
 
@@ -3338,7 +3338,7 @@ bool AdjRibOutGroup::shouldCloneLiteForPeer(
   }
 
   // Case 2: entry was announced/re-announced after peer detached — no clone
-  if (isEntryNotShared(peer->getDetachedRibVersion(), groupEntryRibVersion)) {
+  if (!isEntryShared(peer->getDetachedRibVersion(), groupEntryRibVersion)) {
     return false;
   }
 
