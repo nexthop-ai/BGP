@@ -197,7 +197,7 @@ RibBase::RibBase(
       conditionalLocalRoutes_[nexthop].push_back(prefix);
     }
   }
-  RibStats::setOriginatedRoutesSize(localRoutes_.size());
+  ribCounters_.setOriginatedRoutes(localRoutes_.size());
 
   // initialize fibBatchTimer_ for batch processing of fib programming requests
   fibBatchTimer_ = folly::AsyncTimeout::make(
@@ -302,6 +302,7 @@ void RibBase::cleanupCommon() noexcept {
   XLOGF(
       INFO, "[Exit] Clearing ribEntries_ ({} entries)...", ribEntries_.size());
   ribEntries_.clear();
+  ribCounters_.reset();
   XLOG(INFO, "[Exit] ribEntries_ cleared");
 
   // kNexthopInfoCount counter does not need to be reset here;
@@ -631,7 +632,7 @@ void RibBase::checkWithdrawalBeforeRouteProgrammed(
         "The case of new prefix {} announcement followed by withdrawal during Fib-programming timer.",
         folly::IPAddress::networkToString(prefix));
     ribEntries_.erase(prefix);
-    RibStats::decrRibPrefixCount();
+    ribCounters_.onPrefixRemoved();
   }
 }
 
@@ -697,7 +698,7 @@ RibBase::processSingleRibInUpdate(
     }
     // add prefix to ribEntries_
     kv = ribEntries_.emplace(std::make_pair(prefix, RibEntry(prefix))).first;
-    RibStats::incrRibPrefixCount();
+    ribCounters_.onPrefixAdded();
   }
   auto& entry = kv->second;
   // oldAllPathCnt is used in aggregate route logic to indentify
@@ -1061,10 +1062,10 @@ void RibBase::processRibInNexthopUpdate(
       if (reachabilityChanged) {
         auto pathCount = it->second.getRouteInfoListSize();
         if (isReachable) {
-          RibStats::decrUnresolvableNexthopsCount();
+          ribCounters_.onUnresolvableNexthopRemoved();
           RibStats::decrInactivePathCount(pathCount);
         } else {
-          RibStats::incrUnresolvableNexthopsCount();
+          ribCounters_.onUnresolvableNexthopAdded();
           RibStats::incrInactivePathCount(pathCount);
         }
       }
@@ -1132,7 +1133,7 @@ void RibBase::processRibInNexthopUpdate(
         RibStats::incrNexthopInfoCount();
       }
       if (!isReachable) {
-        RibStats::incrUnresolvableNexthopsCount();
+        ribCounters_.onUnresolvableNexthopAdded();
       }
     }
   }
@@ -1858,7 +1859,7 @@ void RibBase::handleFibProgrammedMessage(
                 "All paths withdrawn for {}, deleting RibEntry.",
                 folly::IPAddress::networkToString(prefix));
             ribEntries_.erase(prefix);
-            RibStats::decrRibPrefixCount();
+            ribCounters_.onPrefixRemoved();
           } else {
             XLOGF(
                 DBG1,
@@ -3044,7 +3045,7 @@ NexthopInfo* FOLLY_NULLABLE RibBase::getNexthopInfo(
       RibStats::incrNexthopInfoCount();
     }
     if (!isReachable) {
-      RibStats::incrUnresolvableNexthopsCount();
+      ribCounters_.onUnresolvableNexthopAdded();
     }
 
     XLOGF(
@@ -3147,7 +3148,7 @@ bool RibBase::checkAndDeleteNexthopInfo(const folly::IPAddress& nexthop) {
 
   // Update unresolvable nexthop counter before deletion
   if (!nexthopInfo.isReachable()) {
-    RibStats::decrUnresolvableNexthopsCount();
+    ribCounters_.onUnresolvableNexthopRemoved();
   }
 
   // Delete from nexthopInfoMap_

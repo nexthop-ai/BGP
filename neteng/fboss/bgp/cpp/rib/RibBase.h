@@ -41,6 +41,7 @@
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
 #include "neteng/fboss/bgp/cpp/rib/Fib.h"
 #include "neteng/fboss/bgp/cpp/rib/LocalRoute.h"
+#include "neteng/fboss/bgp/cpp/rib/RibCounters.h"
 #include "neteng/fboss/bgp/cpp/rib/RibEntry.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
@@ -573,6 +574,10 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
 
   // prefix -> RibEntry map
   folly::F14NodeMap<folly::CIDRNetwork, RibEntry> ribEntries_;
+
+  // Single authoritative aggregate of RIB-wide counts (mirrors fb303 ODS
+  // counters). Mutated only on this module's EventBase alongside ribEntries_.
+  RibCounters ribCounters_;
 
   /*
    * [Fib -> Rib]
