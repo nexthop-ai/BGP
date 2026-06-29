@@ -981,6 +981,12 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
   }
 
   /*
+   * Increment numPeersDetachedAfterJoin_ when a peer joins the detached set
+   * (detaches at a non-zero detachedRibVersion). Called from detachPeer.
+   */
+  void incrementPeersDetachedAfterJoin() noexcept;
+
+  /*
    * Decrement numPeersDetachedAfterJoin_ when a peer leaves the
    * detached set (goes down or rejoins). Called from
    * AdjRib::deactivateDetachedModeProcessing() — the single point where a

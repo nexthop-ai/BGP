@@ -2573,6 +2573,10 @@ void AdjRibOutGroup::cleanUpDetachedRibEntries(
   }
 }
 
+void AdjRibOutGroup::incrementPeersDetachedAfterJoin() noexcept {
+  ++numPeersDetachedAfterJoin_;
+}
+
 void AdjRibOutGroup::decrementPeersDetachedAfterJoin() noexcept {
   if (numPeersDetachedAfterJoin_ == 0) {
     /*
@@ -2597,6 +2601,17 @@ void AdjRibOutGroup::removePeer(
   BitmapUtils::clearBit(adjRibEstablishedBitmap_, bit);
   clearSyncBit(bit);
   BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
+
+  /*
+   * A detached-after-join member (detachedRibVersion > 0) is leaving this
+   * group, so drop it from numPeersDetachedAfterJoin_ before handleNoSyncPeers
+   * runs below -- otherwise the stale count keeps the group frozen waiting for
+   * a peer that is gone. This is a no-op for peers that already deactivated
+   * detached mode processing (e.g. unregisterPeer), which cleared the version.
+   */
+  if (adjRib->getDetachedRibVersion() > 0) {
+    decrementPeersDetachedAfterJoin();
+  }
   detachedPeers_.erase(adjRib);
 
   bitToAdjRibs_.erase(bit);
@@ -2859,6 +2874,18 @@ void AdjRibOutGroup::detachPeer(
   adjRib->setLastSeenRibVersion(lastSeenRibVersion_);
   adjRib->setDetachedRibVersion(lastSeenRibVersion_);
 
+  /*
+   * Count this peer toward numPeersDetachedAfterJoin_ when it detaches at a
+   * non-zero RIB version (it was in sync at a real version). Callers guard with
+   * !isDetachedPeer(), so detachPeer runs once per detach and counts exactly
+   * once; version > 0 thus means "counted". The count is dropped again only by
+   * deactivateDetachedModeProcessing (rejoin / peer-down) or removePeer (move /
+   * unregister), both guarded on the same non-zero version.
+   */
+  if (adjRib->getDetachedRibVersion() != 0) {
+    incrementPeersDetachedAfterJoin();
+  }
+
   // 5. Clear blocked bitmap (peer is leaving the group's sync set)
   BitmapUtils::clearBit(adjRibBlockedBitmap_, bit);
 
@@ -2955,15 +2982,6 @@ void AdjRibOutGroup::detachSlowPeer(
       bit);
 
   detachPeer(adjRib, DetachReason::Blocking);
-
-  /*
-   * Count this peer toward numPeersDetachedAfterJoin_ (the number of
-   * detached peers with a non-zero detachedRibVersion). detachPeer set the
-   * peer's detachedRibVersion to the group's lastSeenRibVersion_.
-   */
-  if (adjRib->getDetachedRibVersion() != 0) {
-    ++numPeersDetachedAfterJoin_;
-  }
 
   /*
    * EoR pending state needs no slow-peer-specific handling: the peer was marked
