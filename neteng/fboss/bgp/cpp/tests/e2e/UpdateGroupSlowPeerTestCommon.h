@@ -95,9 +95,9 @@ class SlowPeerTestBase : public UpdateGroupDistributionTestBase {
    * Get peer update state. Returns DOWN if peer not found.
    *
    * Hops to the PeerManager event base before reading adjRib state so
-   * the read is serialized with evb writers (e.g. SCHEDULED_PUSH_TO_PEER
-   * flag set/clear in deferredPushToPeer SCOPE_EXIT). Without this hop,
-   * a test-thread read races those writes under TSan.
+   * the read is serialized with evb writers (e.g. markPeerUnblocked in the
+   * deferredPushToPeer SCOPE_EXIT). Without this hop, a test-thread read
+   * races those writes under TSan.
    */
   PeerUpdateState getPeerState(const folly::IPAddress& peerAddr) {
     if (!peerManager_) {

@@ -900,9 +900,9 @@ void E2ETestFixture::TearDown() {
   /*
    * Flush the PeerManager event base before inspecting any peer/queue
    * state from the test thread. Without this, in-flight evb writes
-   * (e.g. SCHEDULED_PUSH_TO_PEER flag clears in deferredPushToPeer
-   * SCOPE_EXIT) can race the test-thread reads of queue size / isBlocked
-   * a few lines below, causing TSan reports that mark the test as flaky.
+   * (e.g. markPeerUnblocked in the deferredPushToPeer SCOPE_EXIT) can race
+   * the test-thread reads of queue size / isBlocked a few lines below,
+   * causing TSan reports that mark the test as flaky.
    */
   if (peerManager_) {
     peerManager_->getEventBase().runInEventBaseThreadAndWait([] {});

@@ -1466,7 +1466,6 @@ CO_TEST_F(
     EXPECT_EQ(adjRib_->getPeerState(), PeerUpdateState::JOINED_BLOCKED);
     EXPECT_TRUE(
         BitmapUtils::isBitSet(sourceGroup_->getBlockedBitmap(), originalBit));
-    EXPECT_TRUE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
   });
 
   // Phase 2: Detach, move peer, register new peer at same bit, block new peer
@@ -1525,8 +1524,6 @@ CO_TEST_F(
         BitmapUtils::isBitSet(sourceGroup_->getBlockedBitmap(), originalBit));
     // The new peer should still be JOINED_BLOCKED
     EXPECT_EQ(adjRib2->getPeerState(), PeerUpdateState::JOINED_BLOCKED);
-    // The moved peer's SCHEDULED_PUSH_TO_PEER flag should be cleared
-    EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
   }());
 
   // Clean up

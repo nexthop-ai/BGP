@@ -1107,18 +1107,6 @@ class AdjRib : boost::noncopyable,
    *        dump (DETACHED_INIT_DUMP), not via detachSlowPeer. During collapse,
    *        all group-only entries must be announced since the peer has no
    *        meaningful detachedRibVersion.
-   * SCHEDULED_PUSH_TO_PEER — a sendBgpUpdates or
-   *        deferredPushToPeer coroutine is pending for this peer.
-   *        Set when scheduled, cleared when the coroutine completes.
-   *        While set, processRibDumpReq skips activateChangeListConsumer
-   *        to avoid racing with the pending push.
-   *        These two coroutines are mutually exclusive by peer state:
-   *        sendBgpUpdates runs only for detached peers (draining their
-   *        independent PL), while deferredPushToPeer runs only for
-   *        IN_SYNC peers (pushed by the group via tryPushToPeer).
-   *        A peer cannot be both detached and in-sync simultaneously,
-   *        so only one coroutine can be pending at a time — no counter
-   *        is needed.
    * EGRESS_EOR_PENDING_V4 — the peer still owes an IPv4 egress EoR
    *        marker. Set at RIB-dump intake (or copied from the group on detach);
    *        cleared by clearEgressEoRPendingV4() in sendPendingEoRs once the
@@ -1130,7 +1118,6 @@ class AdjRib : boost::noncopyable,
     RIB_OUT_DISCREPANCY = 0,
     IS_DETACHED_FAST_PEER,
     DETACHED_INIT_DUMP_PEER,
-    SCHEDULED_PUSH_TO_PEER,
     EGRESS_EOR_PENDING_V4,
     EGRESS_EOR_PENDING_V6,
   };

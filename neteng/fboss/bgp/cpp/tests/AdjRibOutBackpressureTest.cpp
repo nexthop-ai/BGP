@@ -255,7 +255,6 @@ TEST_F(SendBgpMessagesFixture, SessionEstablishedCleanUp) {
   adjRib_->setEgressEoRsPending(true, true);
   adjRib_->egressEoRsSent_ = true;
   adjRib_->sendCoroScheduled_ = true;
-  adjRib_->setAdjRibFlag(AdjRib::SCHEDULED_PUSH_TO_PEER);
 
   adjRib_->sessionEstablished(
       std::nullopt /* remoteGrRestartTime */,
@@ -267,13 +266,10 @@ TEST_F(SendBgpMessagesFixture, SessionEstablishedCleanUp) {
   EXPECT_FALSE(adjRib_->egressEoRsPending());
   EXPECT_FALSE(adjRib_->egressEoRsSent_);
   EXPECT_FALSE(adjRib_->sendCoroScheduled_);
-  EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
 }
 
 TEST_F(SendBgpMessagesFixture, SessionTerminatedCleanUp) {
   setupAdjRibForOutUnitTest();
-  /* Set SCHEDULED_PUSH_TO_PEER flag to verify it's cleared. */
-  adjRib_->setAdjRibFlag(AdjRib::SCHEDULED_PUSH_TO_PEER);
   /* Set pending state in attrToPrefixMap. */
   UpdateAttrToPrefixMap(nullptr, {kV4Prefix1});
 
@@ -359,32 +355,27 @@ TEST_F(SendBgpMessagesFixture, SessionTerminatedCleanUp) {
   EXPECT_EQ(0, adjRib_->stats_.transientRouteUpdatesSuppressed);
 
   EXPECT_TRUE(adjRib_->attrToPrefixMap_.empty());
-  EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
 }
 
 TEST_F(SendBgpMessagesFixture, ScheduleSendBgpMessagesTest) {
   SetUpAdjRibStateForUnit(false /* eorPending */, false /* eorSent */);
 
   EXPECT_FALSE(adjRib_->sendCoroScheduled_);
-  EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
   EXPECT_EQ(0, adjRib_->asyncScope_->remaining());
 
   // Case 1: Coro hasn't been scheduled yet.
   adjRib_->scheduleSendBgpUpdates(true /* tryPullNewChangeItems */);
   EXPECT_EQ(1, adjRib_->asyncScope_->remaining());
   EXPECT_TRUE(adjRib_->sendCoroScheduled_);
-  EXPECT_TRUE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
 
   // Case 2: Coro has already been scheduled and isn't scheduled again.
   adjRib_->scheduleSendBgpUpdates(true /* tryPullNewChangeItems */);
   EXPECT_EQ(1, adjRib_->asyncScope_->remaining());
   EXPECT_TRUE(adjRib_->sendCoroScheduled_);
-  EXPECT_TRUE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
 
   // Let the scheduled coro run for test cleanup.
   adjRib_->evb_.loopOnce();
   EXPECT_FALSE(adjRib_->sendCoroScheduled_);
-  EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
 }
 
 CO_TEST_F(SendBgpMessagesFixture, WaitForQueueSpaceTest) {

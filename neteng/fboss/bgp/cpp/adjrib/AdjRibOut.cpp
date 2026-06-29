@@ -188,7 +188,6 @@ void AdjRib::scheduleSendBgpUpdates(bool tryPullNewChangeItems) noexcept {
     asyncScope_->add(
         co_withExecutor(&evb_, sendBgpUpdates(tryPullNewChangeItems)));
     sendCoroScheduled_ = true;
-    setAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
   }
 }
 
@@ -224,7 +223,6 @@ bool AdjRib::scheduleDeferredPushToPeer(
       &evb_,
       deferredPushToPeer(
           std::move(message), shared_from_this(), std::move(onResolved))));
-  setAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
   return true;
 }
 
@@ -247,7 +245,6 @@ folly::coro::Task<void> AdjRib::deferredPushToPeer(
           getPeerName(),
           pushed);
     }
-    clearAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
   });
 
   co_await folly::coro::co_safe_point;
@@ -352,7 +349,6 @@ folly::coro::Task<void> AdjRib::sendBgpUpdates(
     bool tryPullNewChangeItems) noexcept {
   SCOPE_EXIT {
     sendCoroScheduled_ = false;
-    clearAdjRibFlag(SCHEDULED_PUSH_TO_PEER);
   };
 
   uint64_t bgpMessageCnt = 0;
