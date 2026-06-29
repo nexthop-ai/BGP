@@ -242,17 +242,53 @@ inline const BgpPeerSpec kDefaultPeerSpec5_AddPath = {
  * E2ETestFixture
  * Base fixture for RIB + PeerManager E2E tests.
  * Manages component lifecycle and provides helpers for BGP operations.
+ *
+ * ============================ Where does my test go? ======================
+ * RibBB and RibDC cannot coexist in one binary (their PlatformConstant.h
+ * headers define conflicting kBgpPlatformType inline constexprs — ODR). So
+ * the platform is chosen per Buck TARGET by which fixture library it links:
+ *   - link ":e2e_test_fixture_bb"  -> RibBB  (EBB/border platform; default)
+ *   - link ":e2e_test_fixture_dc"  -> RibDC  (data-center platform)
+ * createRib() builds the RIB via makeTestRib(), whose definition is supplied
+ * by the linked library (E2ETestRibBB.cpp / E2ETestRibDC.cpp).
+ *
+ * Decide where a new E2E test belongs:
+ *   - Behavior shared by both platforms (routing, path selection, CRF, FIB,
+ *     GR, sessions): write a normal TEST_F(E2ETestFixture, ...) and give it a
+ *     BB target AND a "<name>_dc" sibling target so it runs on both bases.
+ *   - DC-only behavior (partial drain, MNH-drain, CPS, CTE, FSDB): link
+ *     ":e2e_test_fixture_dc" and reach RibDC APIs via
+ *     static_cast<RibDC*>(rib_.get()).
+ *   - BB-only behavior (rejecting DC policy messages, EBB FIB): link
+ *     ":e2e_test_fixture_bb" (BB) and use sendUnsupportedDcPolicyMsgs().
+ * ==========================================================================
  */
 class E2ETestFixture : public ::testing::Test {
  protected:
   // Clean up all components
   void TearDown() override;
 
-  // Create and start RIB with TestFib
+  /*
+   * Create and start RIB with TestFib. The RIB base (RibBB or RibDC) is
+   * selected at link time via makeTestRib() — see "Where does my test go?".
+   */
   void createRib(
       bool enableNexthopTracking = false,
       const std::unordered_map<folly::CIDRNetwork, thrift::BgpNetwork>&
           localRoutes = {});
+
+  // Access the injected TestFib regardless of which RIB base is linked.
+  TestFib* getTestFib();
+
+  /*
+   * Push the DC-only policy messages (CPS/CTE) onto the RIB policy queue so a
+   * BB-linked test can verify RibBB rejects them (increments the
+   * numUnsupportedPolicyMsg counter without mutating RIB state). Defined on
+   * this fixture because friendship with RibBase is not inherited by derived
+   * fixtures. Pushes 3 messages: PathSelectionPolicyClear,
+   * RouteAttributePolicyClear, RouteAttributePolicyTimer.
+   */
+  void sendUnsupportedDcPolicyMsgs();
 
   // ==================== PEER MANAGEMENT ====================
 
@@ -414,6 +450,19 @@ class E2ETestFixture : public ::testing::Test {
   void addCommunitySetLocalPrefPolicy(
       const std::string& matchCommunity,
       uint32_t localPref);
+
+  /*
+   * Add a permit-all EGRESS policy that does NOT match or set communities.
+   * Such a policy leaves PolicyAttributesMask::communities unset, so the
+   * egress policy cache key excludes communities. This is the configuration
+   * that exposes the partial-drain cache-collision regression. Unlike the
+   * ingress helpers above, this only registers the policy in policyConfig_;
+   * the caller must set egressPolicyName on the receiver peer spec before
+   * addPeer(). Call before createRib().
+   *
+   * @param name Name to register the egress policy under
+   */
+  void addAcceptAllEgressPolicy(const std::string& name);
 
   /*
    * Wait for a route to appear in PeerManager's shadowRIB
@@ -1119,8 +1168,12 @@ class E2ETestFixture : public ::testing::Test {
   // Policy statement name to be set on peers (auto-set by policy helpers)
   std::optional<std::string> ingressPolicyName_;
 
-  // Component instances
-  std::unique_ptr<TestRib> rib_;
+  /*
+   * Component instances. Typed as the platform-neutral RibBase; the concrete
+   * RIB (TestRibT<RibBB> or TestRibT<RibDC>) is built by makeTestRib() and
+   * selected at link time — see the "Where does my test go?" note above.
+   */
+  std::unique_ptr<RibBase> rib_;
   std::thread ribThread_;
 
   std::unique_ptr<PeerManager> peerManager_;

@@ -47,7 +47,7 @@ TEST_F(E2EFibSyncTest, RouteProgrammedToFib) {
   ASSERT_TRUE(waitForRouteInShadowRib(prefix));
   EXPECT_TRUE(verifyRouteAdd("v4", "10.0.0.0", 8, kPeerAddr5, "127.5.0.4"));
 
-  auto* testFib = static_cast<TestRib*>(rib_.get())->getTestFib();
+  auto* testFib = getTestFib();
   ASSERT_NE(testFib, nullptr);
 
   EXPECT_TRUE(testFib->getProgrammedRoutes().count(prefix) > 0);
@@ -80,7 +80,7 @@ TEST_F(E2EFibSyncTest, FibRoutesWithdrawnOnPeerDown) {
   ASSERT_TRUE(waitForRouteInShadowRib(prefix));
   EXPECT_TRUE(verifyRouteAdd("v4", "10.0.0.0", 8, kPeerAddr5, "127.5.0.4"));
 
-  auto* testFib = static_cast<TestRib*>(rib_.get())->getTestFib();
+  auto* testFib = getTestFib();
   ASSERT_NE(testFib, nullptr);
   EXPECT_TRUE(testFib->getProgrammedRoutes().count(prefix) > 0);
 
@@ -94,7 +94,7 @@ TEST_F(E2EFibSyncTest, FibRoutesWithdrawnOnPeerDown) {
  * FIB connection state control — verify setConnected works.
  */
 TEST_F(E2EFibSyncTest, FibConnectionStateControl) {
-  auto* testFib = static_cast<TestRib*>(rib_.get())->getTestFib();
+  auto* testFib = getTestFib();
   ASSERT_NE(testFib, nullptr);
 
   EXPECT_TRUE(testFib->isConnected());

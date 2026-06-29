@@ -32,6 +32,7 @@
 #include "neteng/fboss/bgp/cpp/tests/AdjRibInUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/AdjRibOutUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
+#include "neteng/fboss/bgp/cpp/tests/e2e/E2ETestRibFactory.h"
 
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
 
@@ -588,6 +589,26 @@ void E2ETestFixture::addCommunitySetLocalPrefPolicy(
   ingressPolicyName_ = "community-setlp-policy";
 }
 
+void E2ETestFixture::addAcceptAllEgressPolicy(const std::string& name) {
+  /*
+   * Permit-all policy with no community match or community action, so
+   * PolicyAttributesMask::communities stays false and the egress policy
+   * cache key ignores communities. Egress-only: the caller sets
+   * egressPolicyName on the receiver peer spec; we do not touch
+   * ingressPolicyName_.
+   */
+  auto acceptAction =
+      createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT);
+  auto acceptTerm = createBgpPolicyTerm(
+      "accept-all",
+      "Accept all routes",
+      {},
+      {std::move(acceptAction)},
+      bgp_policy::FlowControlAction::NEXT_TERM);
+
+  policyConfig_ = createBgpPolicies(name, {std::move(acceptTerm)});
+}
+
 bool E2ETestFixture::waitForRouteInShadowRib(
     const folly::CIDRNetwork& prefix,
     std::optional<folly::IPAddress> fromPeer,
@@ -1075,14 +1096,15 @@ void E2ETestFixture::createRib(
         std::const_pointer_cast<BgpGlobalConfig>(globalConfig);
   }
 
-  /* Create TestRib */
-  rib_ = std::make_unique<TestRib>(
+  /* Build the platform-specific TestRib. makeTestRib() is defined by the
+   * linked fixture library (E2ETestRibBB.cpp for RibBB, E2ETestRibDC.cpp for
+   * RibDC), which selects the platform — see E2ETestRibFactory.h. */
+  rib_ = makeTestRib(
       routesToUse,
       *modifiedGlobalConfig,
       policyConfig_,
       ribInQ_,
       ribOutQ_,
-      kDevPlatform,
       nexthopCache);
 
   rib_->createFib();
@@ -1092,6 +1114,25 @@ void E2ETestFixture::createRib(
 
   rib_->getEventBase().waitUntilRunning();
   XLOG(INFO, "RIB running");
+}
+
+TestFib* E2ETestFixture::getTestFib() {
+  auto* testRib = dynamic_cast<TestRibIf*>(rib_.get());
+  return testRib ? testRib->getTestFib() : nullptr;
+}
+
+void E2ETestFixture::sendUnsupportedDcPolicyMsgs() {
+  /*
+   * Push DC-only policy messages directly onto the RIB policy queue (friend
+   * access to RibBase internals). On a BB-linked binary,
+   * RibBB::processRibPolicyMsgLoop rejects each one with an error log and a
+   * numUnsupportedPolicyMsg increment, without mutating RIB state.
+   */
+  rib_->getEventBase().runInEventBaseThreadAndWait([this]() {
+    rib_->ribPolicyMsgQ_.push(RibBase::PathSelectionPolicyClearMsg{});
+    rib_->ribPolicyMsgQ_.push(RibBase::RouteAttributePolicyClearMsg{});
+    rib_->ribPolicyMsgQ_.push(RibBase::RouteAttributePolicyTimerMsg{});
+  });
 }
 
 namespace {
@@ -3045,7 +3086,7 @@ E2ETestFixture::getFibWeightedNexthops(const std::string& prefixStr) {
     return nullptr;
   }
 
-  auto testFib = rib_->getTestFib();
+  auto testFib = getTestFib();
   if (!testFib) {
     XLOG(ERR, "getFibWeightedNexthops: TestFib is not initialized");
     return nullptr;

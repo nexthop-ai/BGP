@@ -73,15 +73,6 @@ folly::coro::Task<void> TestFib::program(bool isSync) {
 
 void TestFib::stop() {}
 
-// TestRib Implementation
-void TestRib::createFib() {
-  if (!fib_) {
-    auto testFib = std::make_unique<TestFib>(fromFibMessageQ_);
-    testFib_ = testFib.get();
-    fib_ = std::move(testFib);
-  }
-}
-
 // Helper Functions
 std::shared_ptr<BgpPath> buildBgpPath(const folly::IPAddress& nexthop) {
   auto attrs = std::make_shared<BgpPath>(

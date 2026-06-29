@@ -28,9 +28,19 @@
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/config/Config.h"
 #include "neteng/fboss/bgp/cpp/rib/Fib.h"
-#include "neteng/fboss/bgp/cpp/rib/RibBB.h"
+#include "neteng/fboss/bgp/cpp/rib/RibBase.h"
+#include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 #include "neteng/fboss/bgp/cpp/watchdog/MonitoredQueue.h"
+
+/*
+ * NOTE: This header is platform-NEUTRAL and MUST NOT include RibBB.h or
+ * RibDC.h. Those headers each pull in a per-platform PlatformConstant.h that
+ * defines kBgpPlatformType (and the FIB-agent port/timeout) as conflicting
+ * `inline constexpr` values, so they cannot coexist in one translation unit
+ * or one linked binary (ODR). The concrete RIB base is selected at link time
+ * via the makeTestRib() factory — see E2ETestRibFactory.h.
+ */
 
 namespace facebook {
 namespace bgp {
@@ -143,14 +153,42 @@ class TestFib : public Fib {
   size_t programCallCount_{0};
 };
 
-// RIB subclass that injects TestFib
-class TestRib : public RibBB {
+/*
+ * Base-agnostic accessor for the injected TestFib. Lets E2ETestFixture reach
+ * the TestFib through a RibBase* without knowing which RIB base (RibBB or
+ * RibDC) the test is running against.
+ */
+class TestRibIf {
  public:
-  using RibBB::RibBB;
+  virtual ~TestRibIf() = default;
+  virtual TestFib* getTestFib() = 0;
+};
 
-  void createFib() override;
+/*
+ * RIB subclass that injects TestFib, parameterized over the RIB base so the
+ * E2E suite can run against BOTH platforms:
+ *   - TestRibBB (RibBB) — the EBB/border platform. CRF-only policy handling;
+ *     RibBB drops PathSelectionPolicySetMsg and other DC-only policy messages
+ *     as error-logging lambdas in processRibPolicyMsgLoop.
+ *   - TestRibDC (RibDC) — the data-center platform. Exercises partial-drain,
+ *     MNH-drain, CPS and CTE code paths that only exist on RibDC.
+ *
+ * See E2ETestFixture.h ("Where does my test go?") for how to pick a base.
+ */
+template <class Base>
+class TestRibT : public Base, public TestRibIf {
+ public:
+  using Base::Base;
 
-  TestFib* getTestFib() {
+  void createFib() override {
+    if (!this->fib_) {
+      auto testFib = std::make_unique<TestFib>(this->fromFibMessageQ_);
+      testFib_ = testFib.get();
+      this->fib_ = std::move(testFib);
+    }
+  }
+
+  TestFib* getTestFib() override {
     return testFib_;
   }
 
