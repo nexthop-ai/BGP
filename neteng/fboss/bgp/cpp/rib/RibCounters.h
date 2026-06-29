@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
@@ -26,26 +27,40 @@ namespace facebook::bgp {
  * Single authoritative in-memory aggregate of RIB-wide counts.
  *
  * Owned by RibBase and mutated only on the RIB EventBase, so it needs no
- * locking. Each mutator updates the in-memory field AND mirrors the matching
- * fb303 ODS counter (via RibStats) in one place, so callers no longer sprinkle
- * RibStats increment/decrement calls across the RIB and existing dashboards /
- * HealthValidator keep observing identical fb303 values.
+ * locking. Each prefix/nexthop mutator updates the in-memory field(s) AND
+ * mirrors the matching fb303 ODS counter (via RibStats) in one place, so
+ * callers no longer sprinkle RibStats increment/decrement calls across the RIB
+ * and existing dashboards / HealthValidator keep observing identical fb303
+ * values.
  *
- * This is the single home for RIB count maintenance: future summary dimensions
- * (per-AFI totals, per-prefix-length histogram, best-path source breakdown,
- * ...) are added here rather than as parallel ad-hoc counters.
+ * Counts that the fb303 layer does not (and cannot cheaply) provide -- the
+ * per-AFI prefix split and the per-prefix-length counts -- are maintained
+ * here as in-memory state for the `getRibSummary` thrift RPC. This is the
+ * single home for RIB count maintenance: future summary dimensions (best-path
+ * source breakdown, paths/ECMP, ...) are added here rather than as parallel
+ * ad-hoc counters.
  */
 class RibCounters {
  public:
-  /** A prefix was inserted into the Loc-RIB. */
-  void onPrefixAdded() {
-    ++totalPrefixes_;
+  /**
+   * IPv6 carries the longest prefixes; IPv4 lengths (0..32) index the same
+   * table. Counts are indexed directly by prefix length [0, kMaxPrefixLen].
+   */
+  static constexpr uint8_t kMaxPrefixLen = 128;
+
+  /** A prefix of the given family/length was inserted into the Loc-RIB. */
+  void onPrefixAdded(bool isV4, uint8_t prefixLen) {
+    auto& a = afiOf(isV4);
+    ++a.totalPrefixes;
+    ++a.prefixLenCounts[bucket(prefixLen)];
     RibStats::incrRibPrefixCount();
   }
 
-  /** A prefix was removed from the Loc-RIB. */
-  void onPrefixRemoved() {
-    --totalPrefixes_;
+  /** A prefix of the given family/length was removed from the Loc-RIB. */
+  void onPrefixRemoved(bool isV4, uint8_t prefixLen) {
+    auto& a = afiOf(isV4);
+    --a.totalPrefixes;
+    --a.prefixLenCounts[bucket(prefixLen)];
     RibStats::decrRibPrefixCount();
   }
 
@@ -75,13 +90,28 @@ class RibCounters {
    * counters that are not adjusted on the bulk-clear path.
    */
   void reset() {
-    totalPrefixes_ = 0;
+    afis_ = {};
     originatedRoutes_ = 0;
     unresolvableNexthops_ = 0;
   }
 
+  /** Prefix count for one address family (true = IPv4, false = IPv6). */
+  uint64_t totalPrefixes(bool isV4) const {
+    return afiOf(isV4).totalPrefixes;
+  }
+
+  /**
+   * Per-prefix-length counts for one address family, indexed by prefix
+   * length. Index i holds the number of /i prefixes in that family.
+   */
+  const std::array<int64_t, kMaxPrefixLen + 1>& prefixLenCounts(
+      bool isV4) const {
+    return afiOf(isV4).prefixLenCounts;
+  }
+
+  /** Prefix count across both address families. */
   uint64_t totalPrefixes() const {
-    return totalPrefixes_;
+    return afis_[0].totalPrefixes + afis_[1].totalPrefixes;
   }
   uint64_t originatedRoutes() const {
     return originatedRoutes_;
@@ -91,7 +121,24 @@ class RibCounters {
   }
 
  private:
-  uint64_t totalPrefixes_{0};
+  struct AfiCounters {
+    uint64_t totalPrefixes{0};
+    std::array<int64_t, kMaxPrefixLen + 1> prefixLenCounts{};
+  };
+
+  // Clamp defensively; RIB prefix lengths are already within range.
+  static uint8_t bucket(uint8_t prefixLen) {
+    return prefixLen > kMaxPrefixLen ? kMaxPrefixLen : prefixLen;
+  }
+  AfiCounters& afiOf(bool isV4) {
+    return afis_[isV4 ? 0 : 1];
+  }
+  const AfiCounters& afiOf(bool isV4) const {
+    return afis_[isV4 ? 0 : 1];
+  }
+
+  // [0] = IPv4, [1] = IPv6.
+  std::array<AfiCounters, 2> afis_{};
   uint64_t originatedRoutes_{0};
   uint64_t unresolvableNexthops_{0};
 };

@@ -155,6 +155,10 @@ class BgpServiceBase
       std::vector<facebook::neteng::fboss::bgp::thrift::TRibEntry>>>
   co_getRibEntries(facebook::neteng::fboss::bgp_attr::TBgpAfi afi) override;
 
+  folly::coro::Task<
+      std::unique_ptr<facebook::neteng::fboss::bgp::thrift::TRibSummary>>
+  co_getRibSummary(facebook::neteng::fboss::bgp_attr::TBgpAfi afi) override;
+
   folly::coro::Task<std::unique_ptr<
       std::vector<facebook::neteng::fboss::bgp::thrift::TRibEntry>>>
   co_getRibEntriesForCommunity(

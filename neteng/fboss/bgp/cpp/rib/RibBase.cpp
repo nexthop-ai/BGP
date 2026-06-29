@@ -632,7 +632,7 @@ void RibBase::checkWithdrawalBeforeRouteProgrammed(
         "The case of new prefix {} announcement followed by withdrawal during Fib-programming timer.",
         folly::IPAddress::networkToString(prefix));
     ribEntries_.erase(prefix);
-    ribCounters_.onPrefixRemoved();
+    ribCounters_.onPrefixRemoved(prefix.first.isV4(), prefix.second);
   }
 }
 
@@ -698,7 +698,7 @@ RibBase::processSingleRibInUpdate(
     }
     // add prefix to ribEntries_
     kv = ribEntries_.emplace(std::make_pair(prefix, RibEntry(prefix))).first;
-    ribCounters_.onPrefixAdded();
+    ribCounters_.onPrefixAdded(prefix.first.isV4(), prefix.second);
   }
   auto& entry = kv->second;
   // oldAllPathCnt is used in aggregate route logic to indentify
@@ -1859,7 +1859,7 @@ void RibBase::handleFibProgrammedMessage(
                 "All paths withdrawn for {}, deleting RibEntry.",
                 folly::IPAddress::networkToString(prefix));
             ribEntries_.erase(prefix);
-            ribCounters_.onPrefixRemoved();
+            ribCounters_.onPrefixRemoved(prefix.first.isV4(), prefix.second);
           } else {
             XLOGF(
                 DBG1,
@@ -2172,6 +2172,27 @@ std::vector<TRibEntry> RibBase::getRibEntries(TBgpAfi afi) {
     }
   });
   return tRibEntries;
+}
+
+TRibSummary RibBase::getRibSummary(TBgpAfi afi) {
+  TRibSummary summary;
+  summary.afi() = afi;
+
+  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
+    return summary;
+  }
+
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    const bool isV4 = afi == TBgpAfi::AFI_IPV4;
+    summary.total_prefixes() = ribCounters_.totalPrefixes(isV4);
+    const auto& counts = ribCounters_.prefixLenCounts(isV4);
+    for (size_t len = 0; len < counts.size(); ++len) {
+      if (counts[len] != 0) {
+        summary.prefix_length_counts()[static_cast<int16_t>(len)] = counts[len];
+      }
+    }
+  });
+  return summary;
 }
 
 std::vector<TRibEntry> RibBase::getRibEntriesForCommunities(

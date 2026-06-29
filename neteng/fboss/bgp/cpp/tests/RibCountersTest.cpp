@@ -42,14 +42,40 @@ TEST(RibCountersTest, PrefixCountTracksFieldAndFb303) {
   EXPECT_EQ(0, c.totalPrefixes());
   EXPECT_EQ(0, counter(RibStats::kRibPrefixCount));
 
-  c.onPrefixAdded();
-  c.onPrefixAdded();
+  c.onPrefixAdded(/*isV4=*/true, 24);
+  c.onPrefixAdded(/*isV4=*/false, 64);
   EXPECT_EQ(2, c.totalPrefixes());
   EXPECT_EQ(2, counter(RibStats::kRibPrefixCount));
 
-  c.onPrefixRemoved();
+  c.onPrefixRemoved(/*isV4=*/true, 24);
   EXPECT_EQ(1, c.totalPrefixes());
   EXPECT_EQ(1, counter(RibStats::kRibPrefixCount));
+}
+
+// Total and per-prefix-length counts are split per address family.
+TEST(RibCountersTest, PerAfiPrefixAndPerLengthCounts) {
+  RibStats::initCounters();
+  RibCounters c;
+
+  c.onPrefixAdded(/*isV4=*/true, 24);
+  c.onPrefixAdded(/*isV4=*/true, 24);
+  c.onPrefixAdded(/*isV4=*/true, 32);
+  c.onPrefixAdded(/*isV4=*/false, 64);
+
+  EXPECT_EQ(3, c.totalPrefixes(/*isV4=*/true));
+  EXPECT_EQ(1, c.totalPrefixes(/*isV4=*/false));
+  EXPECT_EQ(4, c.totalPrefixes());
+
+  EXPECT_EQ(2, c.prefixLenCounts(/*isV4=*/true)[24]);
+  EXPECT_EQ(1, c.prefixLenCounts(/*isV4=*/true)[32]);
+  EXPECT_EQ(0, c.prefixLenCounts(/*isV4=*/true)[64]);
+  EXPECT_EQ(1, c.prefixLenCounts(/*isV4=*/false)[64]);
+  // v4 /24 must not leak into the v6 counts.
+  EXPECT_EQ(0, c.prefixLenCounts(/*isV4=*/false)[24]);
+
+  c.onPrefixRemoved(/*isV4=*/true, 24);
+  EXPECT_EQ(1, c.prefixLenCounts(/*isV4=*/true)[24]);
+  EXPECT_EQ(2, c.totalPrefixes(/*isV4=*/true));
 }
 
 TEST(RibCountersTest, OriginatedRoutesTracksFieldAndFb303) {
@@ -84,12 +110,15 @@ TEST(RibCountersTest, UnresolvableNexthopsTracksFieldAndFb303) {
 TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   RibStats::initCounters();
   RibCounters c;
-  c.onPrefixAdded();
+  c.onPrefixAdded(/*isV4=*/true, 24);
+  c.onPrefixAdded(/*isV4=*/false, 64);
   c.setOriginatedRoutes(5);
   c.onUnresolvableNexthopAdded();
 
   c.reset();
   EXPECT_EQ(0, c.totalPrefixes());
+  EXPECT_EQ(0, c.totalPrefixes(/*isV4=*/true));
+  EXPECT_EQ(0, c.prefixLenCounts(/*isV4=*/false)[64]);
   EXPECT_EQ(0, c.originatedRoutes());
   EXPECT_EQ(0, c.unresolvableNexthops());
 }

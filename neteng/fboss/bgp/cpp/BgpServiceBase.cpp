@@ -2315,6 +2315,52 @@ BgpServiceBase::co_getRibEntries(TBgpAfi afi) {
   co_return std::make_unique<std::vector<TRibEntry>>();
 }
 
+folly::coro::Task<std::unique_ptr<TRibSummary>>
+BgpServiceBase::co_getRibSummary(TBgpAfi afi) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  // Always echo back the requested afi so the client can attribute an
+  // empty/error response to the right address family.
+  auto emptySummary = [afi]() {
+    auto summary = std::make_unique<TRibSummary>();
+    summary->afi() = afi;
+    return summary;
+  };
+
+  if (exitInitiated_) {
+    co_return emptySummary();
+  }
+
+  if (!continueExecution(true)) {
+    co_return emptySummary();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      rib_.getEventBase(),
+      [this, afi]() { return rib_.getRibSummary(afi); },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TRibSummary>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(
+        ERR,
+        "getRibSummary timed out — Rib evb unresponsive, afi={}",
+        magic_enum::enum_name(afi));
+  } else {
+    XLOGF(
+        ERR,
+        "getRibSummary failed: {}, afi={}",
+        result.exception().what(),
+        magic_enum::enum_name(afi));
+  }
+  co_return emptySummary();
+}
+
 folly::coro::Task<std::unique_ptr<std::vector<TRibEntry>>>
 BgpServiceBase::co_getRibPrefix(std::unique_ptr<std::string> prefix) {
   auto log = LOG_THRIFT_CALL(DBG2);

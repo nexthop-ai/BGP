@@ -247,6 +247,11 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   std::vector<neteng::fboss::bgp::thrift::TRibEntry> getRibEntries(
       neteng::fboss::bgp_attr::TBgpAfi afi);
 
+  // Get a compact summary (total prefixes + per-prefix-length histogram) of the
+  // RIB for one address family, read from ribCounters_ on this module's evb.
+  neteng::fboss::bgp::thrift::TRibSummary getRibSummary(
+      neteng::fboss::bgp_attr::TBgpAfi afi);
+
   // Get ribEntries by prefixes:
   // prefix: prefix to match from the ribEntries.
   std::vector<neteng::fboss::bgp::thrift::TRibEntry> getRibEntryForPrefix(

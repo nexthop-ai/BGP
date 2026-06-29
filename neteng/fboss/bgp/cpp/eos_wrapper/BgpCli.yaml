@@ -21,7 +21,7 @@ commands:
       | (stream summary)
       | (stream subscriber <peerID> [(pre-policy | post-policy) [{<ipPrefix>}]])
       | (stats (attrs | entries | policy))
-      | (table [detail | (prefix {<ipPrefix>}) | (more-specifics {<ipPrefix>}) | (community {<community>})])
+      | (table [detail | summary | (prefix {<ipPrefix>}) | (more-specifics {<ipPrefix>}) | (community {<community>})])
       | techsupport
       | (update-group [{<groupId>}])
       | (rib-policy [(criteria {<ipPrefix>}) | crf])
