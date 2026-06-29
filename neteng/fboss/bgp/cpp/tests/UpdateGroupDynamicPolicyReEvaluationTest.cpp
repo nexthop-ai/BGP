@@ -44,6 +44,9 @@
   FRIEND_TEST(                                                             \
       UpdateGroupDynamicPolicyReEvaluationTest,                            \
       ProcessRibDumpReq_DetachedPeerAheadOfGroupAfterRibWalk);             \
+  FRIEND_TEST(                                                             \
+      SinglePeerPolicyReEvaluation,                                        \
+      DeferredPushDoesNotCorruptBitmapAfterMovePeer);                      \
   FRIEND_TEST(SinglePeerPolicyReEvaluation, MovePeerPathTreeMixedEntries); \
   FRIEND_TEST(                                                             \
       SinglePeerPolicyReEvaluation,                                        \
@@ -663,17 +666,36 @@ class SinglePeerPolicyReEvaluation : public ::testing::Test {
   }
 
   void TearDown() override {
-    sourceGroup_->unregisterPeer(adjRib_);
+    if (adjRib_->getGroupBitPosition() != static_cast<uint64_t>(-1)) {
+      adjRib_->getUpdateGroup()->unregisterPeer(adjRib_);
+    }
     adjRib_.reset();
     sourceGroup_.reset();
     targetGroup_.reset();
     evb_.reset();
   }
 
+  std::shared_ptr<AdjRibOutConsumer> setupChangeListConsumer(
+      const std::shared_ptr<AdjRib>& adjRib) {
+    static ConsumerBitmap dummyAddPathBitmap;
+    static ConsumerBitmap dummyNonAddPathBitmap;
+    auto consumer = std::make_shared<AdjRibOutConsumer>(
+        changeListTracker_,
+        nullptr /* adjRib */,
+        "Test ChangeList Consumer",
+        *evb_,
+        dummyAddPathBitmap,
+        dummyNonAddPathBitmap);
+    adjRib->setChangeListConsumer(consumer);
+    return consumer;
+  }
+
   std::unique_ptr<folly::EventBase> evb_;
   std::shared_ptr<AdjRibOutGroup> sourceGroup_;
   std::shared_ptr<AdjRibOutGroup> targetGroup_;
   std::shared_ptr<AdjRib> adjRib_;
+  std::shared_ptr<ChangeTracker<ShadowRibEntry>> changeListTracker_ =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("Test ChangeTracker");
   nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ_{
       nettools::bgplib::kMaxIngressQueueSize};
   MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ_;
@@ -978,6 +1000,541 @@ TEST_F(
       sourceGroup_->getFromLiteTree(
           sourceGroup_->LiteTree_, prefixPeer, peerOwnerKey),
       nullptr);
+}
+
+TEST_F(SinglePeerPolicyReEvaluation, MovePeerTransfersPerPeerEntries) {
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  adjRib_->setDetachedRibVersion(10);
+
+  // The moved peer keeps its change list consumer: it runs in detached mode
+  // in the new group and still needs the consumer to drain the change list.
+  auto clConsumer = setupChangeListConsumer(adjRib_);
+
+  folly::CIDRNetwork prefix1{folly::IPAddress("10.0.0.0"), 24};
+  folly::CIDRNetwork prefix2{folly::IPAddress("10.0.1.0"), 24};
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  auto entry1 = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix1, peerOwnerKey, 0);
+  auto entry2 = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix2, peerOwnerKey, 0);
+  ASSERT_NE(entry1, nullptr);
+  ASSERT_NE(entry2, nullptr);
+
+  // Target should start empty
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(
+      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+
+  // Per-peer entries should be deleted from source
+  EXPECT_EQ(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix1, peerOwnerKey),
+      nullptr);
+  EXPECT_EQ(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix2, peerOwnerKey),
+      nullptr);
+
+  // Entries should exist in target. When the target group is empty,
+  // copyEntryForPeer stores them as group-owned entries.
+  auto targetOwnerKey = targetGroup_->getGroupOwnerKey();
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix1, targetOwnerKey),
+      nullptr);
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix2, targetOwnerKey),
+      nullptr);
+
+  // detachedRibVersion should be reset after movePeer
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+
+  // movePeer must not reset the change list consumer.
+  EXPECT_EQ(adjRib_->getChangeListConsumer(), clConsumer);
+}
+
+TEST_F(SinglePeerPolicyReEvaluation, MovePeerCopiesSharedGroupEntries) {
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+
+  // Add a shared group entry with ribVersion the peer has seen
+  adjRib_->setDetachedRibVersion(10);
+  auto groupEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0);
+  ASSERT_NE(groupEntry, nullptr);
+  groupEntry->setRibVersion(5); // < detachedRibVersion, so peer shares it
+
+  // Target should start empty
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(
+      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+
+  // Shared entry should remain in source (not moved, only copied)
+  EXPECT_NE(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+      nullptr);
+
+  // A copy should exist in target. When the target group is empty,
+  // copyEntryForPeer stores it as a group-owned entry.
+  auto targetOwnerKey = targetGroup_->getGroupOwnerKey();
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix, targetOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+}
+
+TEST_F(SinglePeerPolicyReEvaluation, MovePeerSkipsUnseenGroupEntries) {
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  // Add a group entry with ribVersion the peer has NOT seen
+  adjRib_->setDetachedRibVersion(5);
+  auto groupEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0);
+  ASSERT_NE(groupEntry, nullptr);
+  groupEntry->setRibVersion(10); // > detachedRibVersion, peer never saw it
+
+  // Target should start empty
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(
+      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+
+  // Unseen entry should remain in source
+  EXPECT_NE(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+      nullptr);
+
+  // Nothing should be in target for this peer
+  EXPECT_EQ(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix, peerOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+}
+
+TEST_F(SinglePeerPolicyReEvaluation, MovePeerPrefersPerPeerOverShared) {
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  adjRib_->setDetachedRibVersion(10);
+
+  // Add both a shared group entry and a per-peer entry for the same prefix
+  auto groupEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0);
+  groupEntry->setRibVersion(5);
+
+  auto peerEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, peerOwnerKey, 0);
+  ASSERT_NE(peerEntry, nullptr);
+
+  // Target should start empty
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(
+      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+
+  // Per-peer entry should be deleted from source
+  EXPECT_EQ(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, peerOwnerKey),
+      nullptr);
+
+  // Shared entry should remain in source
+  EXPECT_NE(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+      nullptr);
+
+  // Target should have one entry (from per-peer, not from shared).
+  // When target is empty, copyEntryForPeer stores as group-owned.
+  auto targetOwnerKey = targetGroup_->getGroupOwnerKey();
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix, targetOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+}
+
+TEST_F(SinglePeerPolicyReEvaluation, MovePeerCleansUpGroupState) {
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  adjRib_->setDetachedRibVersion(10);
+
+  sourceGroup_->movePeer(
+      adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+
+  // Peer should be fully removed from source group
+  EXPECT_EQ(sourceGroup_->getMemberCount(), 0);
+
+  // Peer should be registered in target group with a valid bit position
+  EXPECT_EQ(targetGroup_->getMemberCount(), 1);
+  EXPECT_NE(adjRib_->getGroupBitPosition(), static_cast<uint64_t>(-1));
+
+  // detachedRibVersion should be reset after movePeer
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+}
+
+TEST_F(
+    SinglePeerPolicyReEvaluation,
+    MovePeerTransfersPerPeerEntriesToNonEmptyGroup) {
+  // Register an existing peer in the target so bitToAdjRibs_ is non-empty
+  // and copyEntryForPeer stores entries as peer-owned.
+  auto existingPeerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.2"),
+      folly::IPAddressV4("255.0.0.2").toLongHBO());
+  auto existingAdjRib = std::make_shared<AdjRib>(
+      existingPeerId,
+      PeeringParams(),
+      *evb_,
+      ribInQ_,
+      observerQ_,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+  targetGroup_->registerPeer(existingAdjRib);
+
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  adjRib_->setDetachedRibVersion(10);
+
+  folly::CIDRNetwork prefix1{folly::IPAddress("10.0.0.0"), 24};
+  folly::CIDRNetwork prefix2{folly::IPAddress("10.0.1.0"), 24};
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  auto entry1 = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix1, peerOwnerKey, 0);
+  auto entry2 = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix2, peerOwnerKey, 0);
+  ASSERT_NE(entry1, nullptr);
+  ASSERT_NE(entry2, nullptr);
+
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+
+  // Per-peer entries should be deleted from source
+  EXPECT_EQ(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix1, peerOwnerKey),
+      nullptr);
+  EXPECT_EQ(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix2, peerOwnerKey),
+      nullptr);
+
+  // Entries should exist in target under the peer's owner key
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix1, peerOwnerKey),
+      nullptr);
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix2, peerOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+
+  // Clean up the extra peer we registered in targetGroup_
+  targetGroup_->unregisterPeer(existingAdjRib);
+}
+
+TEST_F(
+    SinglePeerPolicyReEvaluation,
+    MovePeerCopiesSharedGroupEntriesToNonEmptyGroup) {
+  auto existingPeerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.2"),
+      folly::IPAddressV4("255.0.0.2").toLongHBO());
+  auto existingAdjRib = std::make_shared<AdjRib>(
+      existingPeerId,
+      PeeringParams(),
+      *evb_,
+      ribInQ_,
+      observerQ_,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+  targetGroup_->registerPeer(existingAdjRib);
+
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  adjRib_->setDetachedRibVersion(10);
+  auto groupEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0);
+  ASSERT_NE(groupEntry, nullptr);
+  groupEntry->setRibVersion(5);
+
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+
+  // Shared entry should remain in source
+  EXPECT_NE(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+      nullptr);
+
+  // Copy should exist in target under the peer's owner key
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix, peerOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+
+  // Clean up the extra peer we registered in targetGroup_
+  targetGroup_->unregisterPeer(existingAdjRib);
+}
+
+TEST_F(
+    SinglePeerPolicyReEvaluation,
+    MovePeerSkipsUnseenGroupEntriesToNonEmptyGroup) {
+  auto existingPeerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.2"),
+      folly::IPAddressV4("255.0.0.2").toLongHBO());
+  auto existingAdjRib = std::make_shared<AdjRib>(
+      existingPeerId,
+      PeeringParams(),
+      *evb_,
+      ribInQ_,
+      observerQ_,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+  targetGroup_->registerPeer(existingAdjRib);
+
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  adjRib_->setDetachedRibVersion(5);
+  auto groupEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0);
+  ASSERT_NE(groupEntry, nullptr);
+  groupEntry->setRibVersion(10);
+
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+
+  // Unseen entry should remain in source
+  EXPECT_NE(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+      nullptr);
+
+  // Nothing should be in target for this peer
+  EXPECT_EQ(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix, peerOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+
+  // Clean up the extra peer we registered in targetGroup_
+  targetGroup_->unregisterPeer(existingAdjRib);
+}
+
+TEST_F(
+    SinglePeerPolicyReEvaluation,
+    MovePeerPrefersPerPeerOverSharedToNonEmptyGroup) {
+  auto existingPeerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.2"),
+      folly::IPAddressV4("255.0.0.2").toLongHBO());
+  auto existingAdjRib = std::make_shared<AdjRib>(
+      existingPeerId,
+      PeeringParams(),
+      *evb_,
+      ribInQ_,
+      observerQ_,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+  targetGroup_->registerPeer(existingAdjRib);
+
+  adjRib_->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
+  auto groupOwnerKey = sourceGroup_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib_->getPeerOwnerKey();
+
+  adjRib_->setDetachedRibVersion(10);
+
+  auto groupEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, groupOwnerKey, 0);
+  groupEntry->setRibVersion(5);
+
+  auto peerEntry = sourceGroup_->addToLiteTree(
+      sourceGroup_->LiteTree_, prefix, peerOwnerKey, 0);
+  ASSERT_NE(peerEntry, nullptr);
+
+  EXPECT_EQ(targetGroup_->LiteTree_.begin(), targetGroup_->LiteTree_.end());
+
+  sourceGroup_->movePeer(adjRib_, targetGroup_, adjRib_->getPeerOwnerKey());
+
+  // Per-peer entry should be deleted from source
+  EXPECT_EQ(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, peerOwnerKey),
+      nullptr);
+
+  // Shared entry should remain in source
+  EXPECT_NE(
+      sourceGroup_->getFromLiteTree(
+          sourceGroup_->LiteTree_, prefix, groupOwnerKey),
+      nullptr);
+
+  // Target should have entry under the peer's owner key
+  EXPECT_NE(
+      targetGroup_->getFromLiteTree(
+          targetGroup_->LiteTree_, prefix, peerOwnerKey),
+      nullptr);
+
+  EXPECT_EQ(adjRib_->getDetachedRibVersion(), 0);
+
+  // Clean up the extra peer we registered in targetGroup_
+  targetGroup_->unregisterPeer(existingAdjRib);
+}
+
+/*
+ * Verify that deferredPushToPeer's RAII guard (markPeerUnblocked) on the old
+ * group does not corrupt the blocked bitmap after the peer has moved to a new
+ * group and a different peer has taken the same bit position.
+ *
+ * Flow:
+ *   1. Register peer with a small bounded queue, fill it to trigger blocking
+ *   2. tryPushToPeer launches deferredPushToPeer coroutine, peer becomes
+ *      JOINED_BLOCKED
+ *   3. While coroutine is suspended: detach peer, move to targetGroup,
+ *      register a new peer at the same bit, block the new peer
+ *   4. Drain the queue so the coroutine can complete
+ *   5. RAII guard calls markPeerUnblocked on sourceGroup — isPeerInGroup
+ *      prevents it from clearing the new peer's blocked bit
+ */
+CO_TEST_F(
+    SinglePeerPolicyReEvaluation,
+    DeferredPushDoesNotCorruptBitmapAfterMovePeer) {
+  // deferredPushToPeer runs on evb_ via asyncScope_, so we need it looping.
+  std::thread evbThread([this]() { evb_->loopForever(); });
+
+  auto boundedQueue = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(3, 2, 1);
+  uint64_t originalBit = 0;
+  std::shared_ptr<AdjRib> adjRib2;
+
+  // Phase 1: Set up bounded queue, fill it, trigger blocking via tryPushToPeer
+  evb_->runInEventBaseThreadAndWait([&]() {
+    adjRib_->boundedAdjRibOutQueue_ = boundedQueue;
+    adjRib_->setPeerState(PeerUpdateState::JOINED_RUNNING);
+
+    // Fill queue to high watermark to trigger blocking
+    nettools::bgplib::FiberBgpPeer::InputMessageT dummyMsg =
+        nettools::bgplib::BgpEndOfRib();
+    for (int i = 0; i < 2; ++i) {
+      boundedQueue->push(
+          std::optional<nettools::bgplib::FiberBgpPeer::InputMessageT>(
+              dummyMsg));
+    }
+    EXPECT_TRUE(boundedQueue->isBlocked());
+
+    // tryPushToPeer sees blocked queue, marks peer blocked, launches
+    // deferredPushToPeer coroutine on asyncScope_
+    originalBit = adjRib_->getGroupBitPosition();
+    auto result = sourceGroup_->tryPushToPeer(dummyMsg, adjRib_, originalBit);
+    EXPECT_EQ(result, AdjRibOutGroup::PushResult::PUSH_PENDING);
+    EXPECT_EQ(adjRib_->getPeerState(), PeerUpdateState::JOINED_BLOCKED);
+    EXPECT_TRUE(
+        BitmapUtils::isBitSet(sourceGroup_->getBlockedBitmap(), originalBit));
+    EXPECT_TRUE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
+  });
+
+  // Phase 2: Detach, move peer, register new peer at same bit, block new peer
+  evb_->runInEventBaseThreadAndWait([&]() {
+    sourceGroup_->detachPeer(adjRib_, AdjRibOutGroup::DetachReason::Blocking);
+
+    sourceGroup_->movePeer(
+        adjRib_, targetGroup_, targetGroup_->getGroupOwnerKey());
+
+    // Register a new peer in sourceGroup — it should get the same bit
+    auto peerId2 = nettools::bgplib::BgpPeerId(
+        folly::IPAddress("10.0.0.2"),
+        folly::IPAddressV4("255.0.0.2").toLongHBO());
+    adjRib2 = std::make_shared<AdjRib>(
+        peerId2,
+        PeeringParams(),
+        *evb_,
+        ribInQ_,
+        observerQ_,
+        std::make_shared<folly::coro::Baton>(),
+        nullptr,
+        std::make_shared<std::atomic<bool>>(false));
+    adjRib2->setUpdateGroup(sourceGroup_);
+    sourceGroup_->registerPeer(adjRib2);
+    EXPECT_EQ(adjRib2->getGroupBitPosition(), originalBit);
+
+    // Block the new peer so its bit is set
+    adjRib2->setPeerState(PeerUpdateState::JOINED_RUNNING);
+    sourceGroup_->markPeerBlocked(adjRib2);
+    EXPECT_TRUE(
+        BitmapUtils::isBitSet(sourceGroup_->getBlockedBitmap(), originalBit));
+    EXPECT_EQ(adjRib2->getPeerState(), PeerUpdateState::JOINED_BLOCKED);
+  });
+
+  // Phase 3: Pop all messages including the deferred push, then verify state.
+  // Queue has 2 initial messages + 1 from deferredPushToPeer.
+  // Popping unblocks waitToPush(), which lets deferredPushToPeer push
+  // its message and run its RAII guard (markPeerUnblocked).
+  co_await co_withExecutor(evb_.get(), [&]() -> folly::coro::Task<void> {
+    co_await boundedQueue->pop(); // initial msg 1
+    co_await boundedQueue->pop(); // initial msg 2
+    // Verify deferredPushToPeer pushed its update
+    auto deferredMsg = co_await boundedQueue->pop();
+    EXPECT_TRUE(deferredMsg.has_value());
+    EXPECT_TRUE(
+        std::holds_alternative<nettools::bgplib::BgpEndOfRib>(*deferredMsg));
+    // Yield to let deferredPushToPeer's RAII guard (markPeerUnblocked) run
+    co_await folly::coro::co_reschedule_on_current_executor;
+    // The moved peer was registered as JOINED_BLOCKED but the deferred push
+    // coroutine's RAII guard called markPeerUnblocked, transitioning to
+    // JOINED_RUNNING.
+    EXPECT_EQ(adjRib_->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
+    // The new peer's blocked bit must still be set — isPeerInGroup prevented
+    // the moved peer's markPeerUnblocked from clearing it.
+    EXPECT_TRUE(
+        BitmapUtils::isBitSet(sourceGroup_->getBlockedBitmap(), originalBit));
+    // The new peer should still be JOINED_BLOCKED
+    EXPECT_EQ(adjRib2->getPeerState(), PeerUpdateState::JOINED_BLOCKED);
+    // The moved peer's SCHEDULED_PUSH_TO_PEER flag should be cleared
+    EXPECT_FALSE(adjRib_->isAdjRibFlagSet(AdjRib::SCHEDULED_PUSH_TO_PEER));
+  }());
+
+  // Clean up
+  evb_->runInEventBaseThreadAndWait(
+      [&]() { sourceGroup_->unregisterPeer(adjRib2); });
+
+  evb_->terminateLoopSoon();
+  evbThread.join();
 }
 
 } // namespace facebook::bgp

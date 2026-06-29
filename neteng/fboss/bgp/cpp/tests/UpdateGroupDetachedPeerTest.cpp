@@ -733,6 +733,86 @@ TEST_F(UpdateGroupDetachedPeerTest, RejoinDecrementsDetachedAfterJoin) {
 }
 
 /*
+ * Full lifecycle: a peer that detaches as a slow peer (counted), rejoins
+ * (decremented), then becomes slow again and is moved to another group must
+ * also be decremented on the move. Regression: movePeer cleared
+ * detachedRibVersion directly without decrementing, leaking the count and
+ * leaving handleNoSyncPeers frozen waiting for a peer that had moved out.
+ */
+TEST_F(UpdateGroupDetachedPeerTest, MovePeerDecrementsDetachedAfterJoin) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  // Two in-sync members so detachSlowPeer does not skip (last-synced guard).
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  // Detach as a slow peer -> counted.
+  group_->detachSlowPeer(adjRib0);
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+
+  // Rejoin cleanly -> acceptance deactivates detached processing ->
+  // decremented.
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  ASSERT_EQ(group_->tryAcceptPeersToGroup({adjRib0}).size(), 1);
+  ASSERT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  // Detach as a slow peer again -> counted again.
+  group_->detachSlowPeer(adjRib0);
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+
+  // Move the detached peer to another group -> must decrement the source
+  // group's count (adjRib1 stays in sync, so the group is not frozen).
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
+  group_->movePeer(adjRib0, targetGroup, targetGroup->getGroupOwnerKey());
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+  EXPECT_EQ(adjRib0->getUpdateGroup(), targetGroup);
+
+  // The moved peer now lives in targetGroup; drop it from this fixture's
+  // tracking and break the peer<->targetGroup ownership cycle so TearDown
+  // (which unregisters tracked peers from group_) does not touch it.
+  targetGroup->unregisterPeer(adjRib0);
+  adjRib0->setUpdateGroup(nullptr);
+  peers_.erase(peers_.begin());
+}
+
+/*
+ * Detaching a joined peer directly via detachPeer (e.g. policy re-evaluation)
+ * counts it as detached-after-join just like the slow-peer path -- detachPeer
+ * is the single increment point. Moving it out then cleanly decrements, so the
+ * count returns to 0 (no other counted peer's slot is consumed).
+ */
+TEST_F(
+    UpdateGroupDetachedPeerTest,
+    DetachPeerIncrementsThenMoveDecrementsDetachedAfterJoin) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  group_->markPeerInSync(adjRib0);
+  group_->markPeerInSync(adjRib1);
+  group_->setLastSeenRibVersion(42);
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  // Directly detach the joined peer -> counted (detachPeer is the increment).
+  group_->detachPeer(adjRib0, AdjRibOutGroup::DetachReason::Policy);
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
+  EXPECT_NE(adjRib0->getDetachedRibVersion(), 0);
+
+  // Moving it out decrements back to 0; adjRib1 stays in sync so the group is
+  // not frozen.
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
+  group_->movePeer(adjRib0, targetGroup, targetGroup->getGroupOwnerKey());
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+  EXPECT_EQ(adjRib0->getUpdateGroup(), targetGroup);
+
+  // Cleanup: see MovePeerDecrementsDetachedAfterJoin.
+  targetGroup->unregisterPeer(adjRib0);
+  adjRib0->setUpdateGroup(nullptr);
+  peers_.erase(peers_.begin());
+}
+
+/*
  * Cumulative per-reason detachment counters (AdjRibStats)
  */
 
@@ -3234,6 +3314,257 @@ TEST_F(
   EXPECT_EQ(group_->getNumInSyncPeers(), 0);
   EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
   EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib1));
+}
+
+/*
+ * movePeer <-> handleNoSyncPeers integration: moving the last SYNC peer out of
+ * the group (movePeer -> removePeer) triggers the same no-sync-peers recovery
+ * sweep as unregisterPeer. These mirror the unregisterPeer recovery tests but
+ * drive the sweep through movePeer, additionally checking the moved peer lands
+ * in the target group as a detached peer.
+ */
+
+/*
+ * Moving out the last SYNC peer runs the recovery sweep, immediately promoting
+ * every ready detached peer: 3 DFPs (RIB-OUT identical to the group), 1 DSP
+ * needing a full entry collapse, and 2 DSPs needing a partial collapse. All 6
+ * end up SYNC with their RIB-OUT shared with the group.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    MoveLastSyncPeerPromotesDfpsAndCollapsesDsps) {
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
+  const std::array<folly::CIDRNetwork, 3> prefixes = {
+      kV4Prefix1, kV4Prefix2, kV4Prefix3};
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+
+  /*
+   * Group RIB-OUT: 3 prefixes (ribVersion 10). The cached version is bumped
+   * past them so a sync peer shares all of them.
+   */
+  for (const auto& prefix : prefixes) {
+    auto* g = group_->addToLiteTree(
+        group_->LiteTree_, prefix, groupOwnerKey, kPlaceholderPathID);
+    g->setPostAttr(attrs);
+    g->setRibVersion(10);
+  }
+  group_->setLastSeenRibVersion(100);
+
+  // The lone SYNC peer; moving it out drives the no-sync-peers sweep.
+  auto syncPeer = createAndRegisterPeer(0);
+  setUpJoinedRunningPeer(syncPeer, 0);
+
+  std::vector<std::shared_ptr<AdjRib>> promoted;
+
+  // 3 DFPs: RIB-OUT identical to the group (no per-peer entries).
+  for (uint64_t bit : {1, 2, 3}) {
+    auto dfp = createAndRegisterPeer(bit);
+    dfp->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    dfp->setAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
+    group_->markPeerDetached(dfp);
+    promoted.push_back(dfp);
+  }
+
+  /*
+   * 1 DSP needing a FULL collapse: per-peer copies of all 3 prefixes (matching
+   * the group), all erased on collapse.
+   */
+  auto dspFull = createAndRegisterPeer(4);
+  dspFull->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  dspFull->setDetachedRibVersion(42);
+  group_->markPeerDetached(dspFull);
+  setUpReadyPeerConsumer(dspFull);
+  for (const auto& prefix : prefixes) {
+    group_
+        ->addToLiteTree(
+            group_->LiteTree_,
+            prefix,
+            dspFull->getPeerOwnerKey(),
+            kPlaceholderPathID)
+        ->setPostAttr(attrs);
+  }
+  promoted.push_back(dspFull);
+
+  /*
+   * 2 DSPs needing a PARTIAL collapse: one per-peer copy (kV4Prefix1) plus two
+   * already-shared group entries (ribVersion 10 <= detachedRibVersion 42).
+   */
+  for (uint64_t bit : {5, 6}) {
+    auto dsp = createAndRegisterPeer(bit);
+    dsp->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+    dsp->setDetachedRibVersion(42);
+    group_->markPeerDetached(dsp);
+    setUpReadyPeerConsumer(dsp);
+    group_
+        ->addToLiteTree(
+            group_->LiteTree_,
+            kV4Prefix1,
+            dsp->getPeerOwnerKey(),
+            kPlaceholderPathID)
+        ->setPostAttr(attrs);
+    promoted.push_back(dsp);
+  }
+
+  setGroupConsumerReady();
+
+  // Move out the last SYNC peer -> immediate promotion sweep runs.
+  group_->movePeer(syncPeer, targetGroup, targetGroup->getGroupOwnerKey());
+
+  // All 6 detached peers became SYNC.
+  EXPECT_EQ(group_->getNumInSyncPeers(), 6);
+  for (const auto& peer : promoted) {
+    EXPECT_EQ(peer->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+    EXPECT_TRUE(group_->isPeerInSync(peer->getGroupBitPosition()));
+    EXPECT_FALSE(group_->getDetachedPeers().contains(peer));
+  }
+
+  // Every promoted peer now resolves each prefix to the shared group entry.
+  for (const auto& peer : promoted) {
+    for (const auto& prefix : prefixes) {
+      auto [entry, isPerPeerEntry] = group_->getRibEntrySharedOrPeer(
+          prefix,
+          peer->getPeerOwnerKey(),
+          kPlaceholderPathID,
+          group_->getLastSeenRibVersion());
+      EXPECT_NE(entry, nullptr);
+      EXPECT_FALSE(isPerPeerEntry); // shared with the group
+    }
+  }
+
+  // The moved peer landed in the target group as a detached peer.
+  EXPECT_EQ(syncPeer->getUpdateGroup(), targetGroup);
+  EXPECT_EQ(syncPeer->getPeerState(), PeerUpdateState::DETACHED_INIT_DUMP);
+  EXPECT_TRUE(targetGroup->getDetachedPeers().contains(syncPeer));
+}
+
+/*
+ * Moving out the last SYNC peer with no promotable detached peer leaves the
+ * group frozen: nothing is promoted and it stays sync-less.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    MoveLastSyncPeerWithNoPromotablePeerStaysFrozen) {
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+
+  setUpJoinedRunningPeer(adjRib0, 0);
+  ASSERT_EQ(group_->getNumInSyncPeers(), 1);
+
+  /*
+   * adjRib1 is detached but still draining (not DETACHED_READY_TO_JOIN), so
+   * nothing is promotable.
+   */
+  group_->markPeerDetached(adjRib1);
+  adjRib1->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+
+  group_->movePeer(adjRib0, targetGroup, targetGroup->getGroupOwnerKey());
+
+  /*
+   * No promotable peer -> group stays frozen with no SYNC peers, adjRib1
+   * untouched.
+   */
+  EXPECT_EQ(group_->getNumInSyncPeers(), 0);
+  EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
+  EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib1));
+
+  // The moved peer landed in the target group as a detached peer.
+  EXPECT_EQ(adjRib0->getUpdateGroup(), targetGroup);
+  EXPECT_TRUE(targetGroup->getDetachedPeers().contains(adjRib0));
+}
+
+/*
+ * Moving out the last SYNC peer when only a detached peer ahead of the group
+ * (DEP-A) remains promotes it via promoteDetachedPeerToSync and adopts the
+ * group RIB-OUT, while the moved peer lands in the target group as a detached
+ * peer.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    MoveLastSyncPeerPromotesAheadDepAAndAdoptsRibOut) {
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(*evb_, "target_group");
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+
+  /*
+   * "Random" existing group RIB-OUT: kV4Prefix1 (also owned by the peer) and
+   * kV4Prefix4 (group-only, the peer never had it).
+   */
+  auto groupAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix4}) {
+    group_
+        ->addToLiteTree(
+            group_->LiteTree_, prefix, groupOwnerKey, kPlaceholderPathID)
+        ->setPostAttr(groupAttrs);
+  }
+  group_->setLastSeenRibVersion(50);
+
+  auto syncPeer = createAndRegisterPeer(0);
+  setUpJoinedRunningPeer(syncPeer, 0);
+
+  /*
+   * DEP-A: detached ahead of the group (detachedRibVersion 0), with its own
+   * diverged RIB-OUT for 3 prefixes.
+   */
+  auto depA = createAndRegisterPeer(1);
+  depA->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  depA->setLastSeenRibVersion(100); // ahead of the group (50)
+  group_->markPeerDetached(depA);
+  setUpReadyPeerConsumer(depA);
+  /*
+   * Group consumer not at end of CL -> peer is "ahead", not
+   * collapse-rejoinable, forcing the promoteDetachedPeerToSync path.
+   */
+  publishChangeItem(folly::CIDRNetwork{folly::IPAddress("10.1.0.0"), 24});
+
+  auto peerOwnerKey = depA->getPeerOwnerKey();
+  auto peerAttrs = std::make_shared<BgpPath>(*buildBgpPathFields(2, 0, 0, 0));
+  std::vector<std::pair<folly::CIDRNetwork, AdjRibEntry*>> peerEntries;
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix2, kV4Prefix3}) {
+    auto* e = group_->addToLiteTree(
+        group_->LiteTree_, prefix, peerOwnerKey, kPlaceholderPathID);
+    e->setPostAttr(peerAttrs);
+    peerEntries.emplace_back(prefix, e);
+  }
+
+  // Move the last SYNC peer out -> removePeer drives the no-sync-peers sweep.
+  group_->movePeer(syncPeer, targetGroup, targetGroup->getGroupOwnerKey());
+
+  // DEP-A promoted to SYNC; group adopted its RIB version.
+  EXPECT_EQ(depA->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_TRUE(group_->isPeerInSync(1));
+  EXPECT_FALSE(group_->getDetachedPeers().contains(depA));
+  EXPECT_EQ(group_->getNumInSyncPeers(), 1);
+  EXPECT_EQ(group_->getLastSeenRibVersion(), 100);
+
+  /*
+   * The group RIB-OUT is now exactly the peer's old RIB-OUT: each peer entry
+   * was re-keyed under the group owner key (same object) and the peer key is
+   * gone.
+   */
+  for (const auto& [prefix, entry] : peerEntries) {
+    EXPECT_EQ(
+        group_->getFromLiteTree(group_->LiteTree_, prefix, groupOwnerKey),
+        entry);
+    EXPECT_EQ(
+        group_->getFromLiteTree(group_->LiteTree_, prefix, peerOwnerKey),
+        nullptr);
+  }
+  // The group-only entry the peer never had was deleted.
+  EXPECT_EQ(
+      group_->getFromLiteTree(group_->LiteTree_, kV4Prefix4, groupOwnerKey),
+      nullptr);
+
+  // The moved peer landed in the target group as a detached peer.
+  EXPECT_EQ(syncPeer->getUpdateGroup(), targetGroup);
+  EXPECT_EQ(syncPeer->getPeerState(), PeerUpdateState::DETACHED_INIT_DUMP);
+  EXPECT_TRUE(targetGroup->getDetachedPeers().contains(syncPeer));
+
+  /*
+   * promoteDetachedPeerToSync rebuilt the group consumer; point the fixture at
+   * the live one so TearDown tears down the right consumer.
+   */
+  groupConsumer_ = group_->getChangeListConsumer();
 }
 
 /*

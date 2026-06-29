@@ -753,6 +753,18 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       const std::shared_ptr<AdjRib>& adjRib) noexcept;
 
   /*
+   * High-level method that transfers per-peer RIB-OUT entries to the new
+   * group, cleans up this group's bitmaps and tracking state, and registers
+   * the peer with the new group.
+   * Change list consumer deactivation/activation is handled outside of
+   * movePeer by the caller.
+   */
+  void movePeer(
+      const std::shared_ptr<AdjRib>& adjRib,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup,
+      const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept;
+
+  /*
    * Mark a peer as blocked due to TCP backpressure.
    * Sets bitmap bit, checks frequency threshold, schedules duration timer.
    * @param adjRib - The peer that just became blocked

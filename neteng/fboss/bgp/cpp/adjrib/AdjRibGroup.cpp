@@ -2747,6 +2747,76 @@ void AdjRibOutGroup::movePeerLiteTreeEntries(
       adjRib->getPeerName(),
       newGroup->getAdjRibGroupName());
 }
+
+void AdjRibOutGroup::movePeer(
+    const std::shared_ptr<AdjRib>& adjRib,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup,
+    const AdjRibOutOwnerKey& effectiveOwnerKey) noexcept {
+  XLOGF(
+      INFO,
+      "Group {}: Moving peer entries {} at bit {} to group {}",
+      groupDescriptor_,
+      adjRib->getPeerName(),
+      adjRib->getGroupBitPosition(),
+      newGroup->getAdjRibGroupName());
+
+  if (adjRib->sendAddPath()) {
+    movePeerPathTreeEntries(adjRib, newGroup, effectiveOwnerKey);
+  } else {
+    movePeerLiteTreeEntries(adjRib, newGroup, effectiveOwnerKey);
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Removing peer {} due to group move",
+      groupDescriptor_,
+      adjRib->getPeerName());
+
+  removePeer(adjRib);
+  adjRib->setUpdateGroup(newGroup);
+
+  /*
+   * Register the moved peer into the new group as a detached peer. Its RIB-OUT
+   * entries were already copied above, so it needs no initial dump: it drains
+   * its packing list and rejoins via the detached (DEP-A) recovery path. We do
+   * not special-case an empty target group -- a sole moved peer becomes SYNC
+   * through promoteDetachedPeerToSync once it is ready.
+   */
+  uint64_t bit = newGroup->bitManager_.getConsumerBit();
+  XLOGF(
+      INFO,
+      "Group {}: Registering moved peer {} into group {} at bit {}",
+      groupDescriptor_,
+      adjRib->getPeerName(),
+      newGroup->getAdjRibGroupName(),
+      bit);
+  newGroup->bitToAdjRibs_[bit] = adjRib;
+  adjRib->setGroupBitPosition(bit);
+  if (!newGroup->peeringParams_.has_value()) {
+    newGroup->peeringParams_ = adjRib->getPeeringParams();
+  }
+  BitmapUtils::setBit(newGroup->adjRibEstablishedBitmap_, bit);
+
+  /* Clear state that pertained to the old group. */
+  adjRib->setDetachedRibVersion(0);
+  adjRib->clearAdjRibFlag(AdjRib::RIB_OUT_DISCREPANCY);
+  adjRib->clearAdjRibFlag(AdjRib::IS_DETACHED_FAST_PEER);
+
+  /*
+   * Join as a detached peer (a blocked peer stays blocked); it catches up
+   * independently and rejoins the new group.
+   */
+  auto peerState = adjRib->getPeerState();
+  auto targetState = (peerState == PeerUpdateState::DETACHED_BLOCKED ||
+                      peerState == PeerUpdateState::JOINED_BLOCKED)
+      ? PeerUpdateState::DETACHED_BLOCKED
+      : PeerUpdateState::DETACHED_INIT_DUMP;
+  adjRib->setPeerState(targetState);
+  adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
+
+  newGroup->detachedPeers_.insert(adjRib);
+}
+
 /*
  * Mark a peer as blocked due to TCP backpressure.
  * Sets bitmap bit, checks frequency threshold, schedules duration timer.
