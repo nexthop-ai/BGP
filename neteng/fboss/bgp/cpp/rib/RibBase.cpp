@@ -1029,11 +1029,6 @@ void RibBase::mayResumeBestPathAndFibProgramming(
 
 void RibBase::processRibInNexthopUpdate(
     const RibInNexthopUpdate& nexthopUpdate) noexcept {
-  XLOGF(
-      INFO,
-      "Processing RibInNexthopUpdate with {} nexthops",
-      nexthopUpdate.nexthopStatuses.size());
-
   if (!enableNexthopTracking_ || !nexthopCache_) {
     XLOG(
         WARNING,
@@ -1041,6 +1036,8 @@ void RibBase::processRibInNexthopUpdate(
     return;
   }
   bool needPathSelection = false;
+  // Changed nexthop(s) recorded for the trigger log at the end of this method.
+  std::vector<std::string> triggeringNexthops;
 
   // Process each NexthopStatus in the update
   for (const auto& nexthopStatus : nexthopUpdate.nexthopStatuses) {
@@ -1072,7 +1069,7 @@ void RibBase::processRibInNexthopUpdate(
 
       if (reachabilityChanged || costChanged) {
         XLOGF(
-            DBG2,
+            DBG1,
             "Updating nexthop {} status: reachable={} -> {}, igpCost={} -> {}",
             nexthopIp.str(),
             it->second.isReachable(),
@@ -1081,6 +1078,12 @@ void RibBase::processRibInNexthopUpdate(
                 ? std::to_string(it->second.getIgpCost().value())
                 : "unset",
             igpCost.has_value() ? std::to_string(igpCost.value()) : "unset");
+
+        /*
+         * Record this changed nexthop so the trigger log below names which
+         * nexthop(s) moved. See T274256815.
+         */
+        triggeringNexthops.push_back(nexthopIp.str());
 
         // Update the existing nexthopInfo with the status
         it->second.updateStatus(nexthopStatus);
@@ -1141,9 +1144,10 @@ void RibBase::processRibInNexthopUpdate(
   if (needPathSelection) {
     // Schedule FIB programming timer which on expiry performs best-path
     // computation and Fib programming
-    XLOG(
-        INFO,
-        "Nexthop update is triggering best-path computation and FIB programming");
+    XLOGF(
+        DBG1,
+        "Nexthop update for [{}] is triggering best-path computation and FIB programming",
+        folly::join(", ", triggeringNexthops));
     schedulePrepareFibProgrammingTimer();
   }
 }
