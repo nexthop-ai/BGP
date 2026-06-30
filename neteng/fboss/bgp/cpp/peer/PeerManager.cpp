@@ -3948,6 +3948,7 @@ void PeerManager::sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope) {
   XLOGF(
       INFO, "sendRibDumpReqForEgressPolicyUpdate called with scope {}", scope);
   if (enableUpdateGroup_) {
+    egressPolicyUpdateForUpdateGroupsScheduled_ = true;
     if (scope == PolicyChangeScope::PEER_GROUP) {
       schedulePolicyReEvalForPendingGroups();
     } else if (scope == PolicyChangeScope::PEER) {
