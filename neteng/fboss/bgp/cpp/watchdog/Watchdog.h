@@ -80,6 +80,15 @@ class Watchdog : public BgpModuleBase {
   QueueSizeMapT getQueueSizes(
       const std::unique_ptr<MonitoredPathT>& paths) noexcept;
 
+  /**
+   * Get the BGP++ process uptime in seconds, i.e. the elapsed time since this
+   * Watchdog (created once at process startup) recorded startTime_. startTime_
+   * is set once in the constructor and never mutated, so this is safe to call
+   * from any thread. Also used to publish the bgpd.process.uptime.seconds ODS
+   * counter.
+   */
+  int64_t getUptimeSeconds() const;
+
  private:
   folly::coro::Task<void> monitorQueueSizeLoop();
   folly::coro::Task<void> monitorSystemMetricsLoop();

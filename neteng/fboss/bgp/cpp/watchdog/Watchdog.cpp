@@ -458,13 +458,17 @@ folly::coro::Task<void> Watchdog::monitorSystemMetricsLoop() {
   XLOG(INFO, "[Exit] Successfully stopped system metrics monitoring task");
 }
 
+int64_t Watchdog::getUptimeSeconds() const {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::steady_clock::now() - startTime_)
+      .count();
+}
+
 void Watchdog::updateSystemMetrics() {
   // Update uptime counter
   const std::chrono::steady_clock::time_point now =
       std::chrono::steady_clock::now();
-  const int64_t uptimeSeconds =
-      std::chrono::duration_cast<std::chrono::seconds>(now - startTime_)
-          .count();
+  const int64_t uptimeSeconds = getUptimeSeconds();
 
   fb303::ThreadCachedServiceData::get()->setCounter(
       "bgpd.process.uptime.seconds", uptimeSeconds);

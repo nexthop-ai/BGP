@@ -2199,6 +2199,13 @@ TRibSummary RibBase::getRibSummary(TBgpAfi afi) {
   return summary;
 }
 
+uint64_t RibBase::getNumPrefixes() {
+  uint64_t count = 0;
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
+      [&]() { count = ribCounters_.totalPrefixes(); });
+  return count;
+}
+
 std::vector<TRibEntry> RibBase::getRibEntriesForCommunities(
     TBgpAfi afi,
     const std::vector<nettools::bgplib::BgpAttrCommunityC>& communities) {

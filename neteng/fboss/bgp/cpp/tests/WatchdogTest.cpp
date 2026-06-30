@@ -652,6 +652,21 @@ TEST_F(WatchdogTestFixture, SystemMetricsUpdateBasicTest) {
   EXPECT_GE(cpuPercent, 0);
 }
 
+// Verify getUptimeSeconds() reflects the configured start time and is
+// monotonically non-decreasing across samples.
+TEST_F(WatchdogTestFixture, GetUptimeSecondsTest) {
+  // Pin the start time 5 seconds in the past so uptime is deterministically >
+  // 0.
+  setStartTime(5);
+
+  const int64_t uptime1 = getWatchdog().getUptimeSeconds();
+  EXPECT_GE(uptime1, 5);
+
+  // A second sample (taken later in wall-clock time) must not go backwards.
+  const int64_t uptime2 = getWatchdog().getUptimeSeconds();
+  EXPECT_GE(uptime2, uptime1);
+}
+
 // Test to make sure system metrics coroutine task runs periodically
 TEST_F(WatchdogTestFixture, SystemMetricsLoopTest) {
   // Reset the uptime counter

@@ -254,4 +254,39 @@ TEST_F(BgpServiceBaseTestFixture, StartSessionNullPtrTest) {
       Contains(ContainsRegex(kExitNullPtrLogPrefix)));
 }
 
+// --- Global summary getter handler tests ---
+
+// The getRibVersion thrift handler reflects the RIB's monotonic version.
+TEST_F(BgpServiceBaseTestFixture, GetRibVersionTest) {
+  EXPECT_EQ(0, service_->getRibVersion());
+
+  rib_->incrementRibVersion();
+  rib_->incrementRibVersion();
+
+  EXPECT_EQ(2, service_->getRibVersion());
+  // Handler delegates to the RIB getter.
+  EXPECT_EQ(
+      static_cast<int64_t>(rib_->getRibVersion()), service_->getRibVersion());
+}
+
+// An empty RIB reports zero prefixes, and the handler delegates to the RIB's
+// atomic prefix counter. (Count-increases-on-route-injection is covered by the
+// RibStats E2E test, which exercises the real RIB update path.)
+TEST_F(BgpServiceBaseTestFixture, GetNumPrefixesEmptyTest) {
+  EXPECT_EQ(0, service_->getNumPrefixes());
+  EXPECT_EQ(
+      static_cast<int64_t>(rib_->getNumPrefixes()), service_->getNumPrefixes());
+}
+
+// The getProcessUptimeSeconds handler returns a non-negative value that does
+// not go backwards across samples. (A deterministic positive value with a
+// controlled start time is verified in WatchdogTest.GetUptimeSecondsTest.)
+TEST_F(BgpServiceBaseTestFixture, GetProcessUptimeSecondsTest) {
+  const int64_t uptime1 = service_->getProcessUptimeSeconds();
+  EXPECT_GE(uptime1, 0);
+
+  const int64_t uptime2 = service_->getProcessUptimeSeconds();
+  EXPECT_GE(uptime2, uptime1);
+}
+
 } // namespace facebook::bgp

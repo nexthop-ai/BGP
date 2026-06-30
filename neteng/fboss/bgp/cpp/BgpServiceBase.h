@@ -120,6 +120,20 @@ class BgpServiceBase
    */
   int64_t getRibVersion() override;
 
+  /*
+   * Get the total number of prefixes currently installed in the loc-RIB
+   * (number of RibBase::ribEntries_), read from the RIB's ribCounters_. For
+   * the per-family (IPv4 / IPv6) split, use getRibSummary (surfaced via
+   * "show bgp table summary").
+   */
+  int64_t getNumPrefixes() override;
+
+  /*
+   * Get the BGP++ process uptime in seconds, sourced from the Watchdog
+   * process start time.
+   */
+  int64_t getProcessUptimeSeconds() override;
+
   // bgp originated-routes
   folly::coro::Task<std::unique_ptr<
       std::vector<neteng::fboss::bgp::thrift::TOriginatedRoute>>>

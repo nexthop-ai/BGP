@@ -1955,6 +1955,21 @@ int64_t BgpServiceBase::getRibVersion() {
   return static_cast<int64_t>(rib_.getRibVersion());
 }
 
+int64_t BgpServiceBase::getNumPrefixes() {
+  auto log = LOG_THRIFT_CALL(INFO);
+
+  /*
+   * rib_.getNumPrefixes() reads the RIB-evb-confined ribCounters_ via an evb
+   * hop, so it is safe to call from the thrift handler thread.
+   */
+  return static_cast<int64_t>(rib_.getNumPrefixes());
+}
+
+int64_t BgpServiceBase::getProcessUptimeSeconds() {
+  auto log = LOG_THRIFT_CALL(INFO);
+  return watchdog_.getUptimeSeconds();
+}
+
 /**
  * [Route Filter Policy]
  */

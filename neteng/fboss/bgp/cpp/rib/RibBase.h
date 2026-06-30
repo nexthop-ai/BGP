@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <vector>
 
@@ -354,7 +355,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    * or multipath changes).
    */
   uint64_t getRibVersion() const {
-    return ribVersion_;
+    return ribVersion_.load(std::memory_order_relaxed);
   }
 
   /**
@@ -363,8 +364,17 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    */
   uint64_t incrementRibVersion() {
     RibStats::incrementRibTableVersion();
-    return ++ribVersion_;
+    return ribVersion_.fetch_add(1, std::memory_order_relaxed) + 1;
   }
+
+  /**
+   * Get the total number of prefixes in the loc-RIB across all address
+   * families. Backed by ribCounters_, which is mutated only on the RIB event
+   * base; this reads it via an evb hop (like getRibSummary), so it is safe to
+   * call from the thrift handler thread. For the per-family (IPv4 / IPv6)
+   * split, use getRibSummary (surfaced via "show bgp table summary").
+   */
+  uint64_t getNumPrefixes();
 
   virtual void clearRibPolicy();
 
@@ -1081,8 +1091,11 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    * RIB version counter - monotonically increasing value that increments
    * whenever a material change occurs (best path or multipath changes).
    * Used for tracking how caught up each peer is with RIB state.
+   * Written only on the RIB event base (incrementRibVersion); read
+   * cross-thread by the thrift handler (getRibVersion). Atomic so the read is
+   * race-free without dispatching onto the RIB evb.
    */
-  uint64_t ribVersion_{0};
+  std::atomic<uint64_t> ribVersion_{0};
 
 // per class placeholder for test code injection
 // only need to be setup once here
