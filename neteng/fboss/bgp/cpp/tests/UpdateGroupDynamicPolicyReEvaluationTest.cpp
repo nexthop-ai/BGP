@@ -1716,4 +1716,265 @@ TEST_F(SinglePeerPolicyReEvaluation, MovePeersMultiPeerPathTree) {
   peer3->setUpdateGroup(nullptr);
 }
 
+/*
+ * movePeersSharedRibOutLiteEntries: split a subset of peers out of a group into
+ * a new (copy) group. The group's shared RIB-OUT is COPIED to the new group
+ * under the NEW group's group owner key (and kept in the old group), while each
+ * moved peer's per-peer entries are MOVED (erased from the old group, added to
+ * the new group under the peer's own owner key). Unlike the materialized
+ * variant, group entries are copied unconditionally (no rib-version gating).
+ *
+ * Three moved peers cover the sharing spectrum:
+ *   peer1 "all shared"  - no per-peer entries (relies entirely on group
+ * entries), peer2 "some shared" - per-peer entries for the first half of
+ * prefixes, peer3 "non shared"  - per-peer entries for every prefix. peer4
+ * stays in the old group; its per-peer entries must be left untouched.
+ */
+TEST_F(SinglePeerPolicyReEvaluation, MovePeersSharedRibOutLiteTree) {
+  auto sourceGroup =
+      std::make_shared<AdjRibOutGroup>(*evb_, "source_group", /*groupId=*/0);
+  auto targetGroup =
+      std::make_shared<AdjRibOutGroup>(*evb_, "target_group", /*groupId=*/1);
+
+  auto makePeer = [&](const std::string& ip) {
+    auto pid = nettools::bgplib::BgpPeerId(
+        folly::IPAddress(ip), folly::IPAddressV4("255.0.0.1").toLongHBO());
+    auto p = std::make_shared<AdjRib>(
+        pid,
+        PeeringParams(),
+        *evb_,
+        ribInQ_,
+        observerQ_,
+        std::make_shared<folly::coro::Baton>(),
+        nullptr,
+        std::make_shared<std::atomic<bool>>(false));
+    p->setUpdateGroup(sourceGroup);
+    sourceGroup->registerPeer(p);
+    return p;
+  };
+  auto peer1 = makePeer("10.0.0.1"); // all shared
+  auto peer2 = makePeer("10.0.0.2"); // some shared
+  auto peer3 = makePeer("10.0.0.3"); // non shared
+  auto peer4 = makePeer("10.0.0.4"); // stays in the old group
+
+  auto sourceGroupOwnerKey = sourceGroup->getGroupOwnerKey();
+  auto targetGroupOwnerKey = targetGroup->getGroupOwnerKey();
+  auto key1 = peer1->getPeerOwnerKey();
+  auto key2 = peer2->getPeerOwnerKey();
+  auto key3 = peer3->getPeerOwnerKey();
+  auto key4 = peer4->getPeerOwnerKey();
+
+  constexpr int kNumPrefixes = 6;
+  std::vector<folly::CIDRNetwork> prefixes;
+  for (int i = 0; i < kNumPrefixes; i++) {
+    folly::CIDRNetwork prefix{
+        folly::IPAddress("10.1." + std::to_string(i) + ".0"), 24};
+    prefixes.push_back(prefix);
+    // Group-owned (shared) entry for every prefix.
+    sourceGroup->addToLiteTree(
+        sourceGroup->LiteTree_, prefix, sourceGroupOwnerKey, 0);
+  }
+  // peer3 (non shared): per-peer entry for every prefix.
+  for (const auto& prefix : prefixes) {
+    sourceGroup->addToLiteTree(sourceGroup->LiteTree_, prefix, key3, 0);
+  }
+  // peer2 (some shared): per-peer entry for the first half only.
+  for (int i = 0; i < kNumPrefixes / 2; i++) {
+    sourceGroup->addToLiteTree(sourceGroup->LiteTree_, prefixes[i], key2, 0);
+  }
+  // peer4 (staying): per-peer entry for every prefix; must be left untouched.
+  for (const auto& prefix : prefixes) {
+    sourceGroup->addToLiteTree(sourceGroup->LiteTree_, prefix, key4, 0);
+  }
+  // peer1 (all shared): no per-peer entries.
+
+  sourceGroup->movePeersSharedRibOutLiteEntries(
+      {peer1, peer2, peer3}, targetGroup);
+
+  for (int i = 0; i < kNumPrefixes; i++) {
+    const auto& prefix = prefixes[i];
+
+    // Old group: shared entry copied (kept), staying peer4 untouched, moved
+    // peer3's per-peer entry erased.
+    EXPECT_NE(
+        sourceGroup->getFromLiteTree(
+            sourceGroup->LiteTree_, prefix, sourceGroupOwnerKey),
+        nullptr);
+    EXPECT_NE(
+        sourceGroup->getFromLiteTree(sourceGroup->LiteTree_, prefix, key4),
+        nullptr);
+    EXPECT_EQ(
+        sourceGroup->getFromLiteTree(sourceGroup->LiteTree_, prefix, key3),
+        nullptr);
+
+    // New group: shared entry copied under the NEW group's owner key (not the
+    // old group's key, not a peer key). peer1 (all shared) has nothing of its
+    // own and relies on the copied group entry.
+    EXPECT_NE(
+        targetGroup->getFromLiteTree(
+            targetGroup->LiteTree_, prefix, targetGroupOwnerKey),
+        nullptr);
+    EXPECT_EQ(
+        targetGroup->getFromLiteTree(
+            targetGroup->LiteTree_, prefix, sourceGroupOwnerKey),
+        nullptr);
+    EXPECT_EQ(
+        targetGroup->getFromLiteTree(targetGroup->LiteTree_, prefix, key1),
+        nullptr);
+    // Moved peer3 (non shared) lands under its own owner key.
+    EXPECT_NE(
+        targetGroup->getFromLiteTree(targetGroup->LiteTree_, prefix, key3),
+        nullptr);
+    // Staying peer4's entries are not moved into the new group.
+    EXPECT_EQ(
+        targetGroup->getFromLiteTree(targetGroup->LiteTree_, prefix, key4),
+        nullptr);
+
+    // peer2 (some shared) only diverged on the first half: moved there, absent
+    // (and shared via the group) on the second half.
+    if (i < kNumPrefixes / 2) {
+      EXPECT_EQ(
+          sourceGroup->getFromLiteTree(sourceGroup->LiteTree_, prefix, key2),
+          nullptr);
+      EXPECT_NE(
+          targetGroup->getFromLiteTree(targetGroup->LiteTree_, prefix, key2),
+          nullptr);
+    }
+  }
+
+  // Break peer<->group cycles for the locally created peers.
+  for (const auto& p : {peer1, peer2, peer3, peer4}) {
+    p->setUpdateGroup(nullptr);
+  }
+}
+
+/*
+ * movePeersSharedRibOutPathEntries: PathTree / add-path analogue of
+ * MovePeersSharedRibOutLiteTree. Same sharing scenarios and a fourth staying
+ * peer; uses a local add-path source/target group so entries live in the
+ * PathTree.
+ */
+TEST_F(SinglePeerPolicyReEvaluation, MovePeersSharedRibOutPathTree) {
+  UpdateGroupKey addPathKey;
+  addPathKey.sendAddPath = true;
+  auto sourceGroup = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "source_addpath",
+      /*groupId=*/0,
+      /*enableUpdateGroup=*/false,
+      addPathKey);
+  auto targetGroup = std::make_shared<AdjRibOutGroup>(
+      *evb_,
+      "target_addpath",
+      /*groupId=*/1,
+      /*enableUpdateGroup=*/false,
+      addPathKey);
+
+  auto makePeer = [&](const std::string& ip) {
+    auto pid = nettools::bgplib::BgpPeerId(
+        folly::IPAddress(ip), folly::IPAddressV4("255.0.0.1").toLongHBO());
+    auto p = std::make_shared<AdjRib>(
+        pid,
+        PeeringParams(),
+        *evb_,
+        ribInQ_,
+        observerQ_,
+        std::make_shared<folly::coro::Baton>(),
+        nullptr,
+        std::make_shared<std::atomic<bool>>(false));
+    p->setUpdateGroup(sourceGroup);
+    sourceGroup->registerPeer(p);
+    return p;
+  };
+  auto peer1 = makePeer("10.0.0.1"); // all shared
+  auto peer2 = makePeer("10.0.0.2"); // some shared
+  auto peer3 = makePeer("10.0.0.3"); // non shared
+  auto peer4 = makePeer("10.0.0.4"); // stays in the old group
+
+  auto sourceGroupOwnerKey = sourceGroup->getGroupOwnerKey();
+  auto targetGroupOwnerKey = targetGroup->getGroupOwnerKey();
+  auto key1 = peer1->getPeerOwnerKey();
+  auto key2 = peer2->getPeerOwnerKey();
+  auto key3 = peer3->getPeerOwnerKey();
+  auto key4 = peer4->getPeerOwnerKey();
+
+  constexpr int kNumPrefixes = 6;
+  std::vector<folly::CIDRNetwork> prefixes;
+  for (int i = 0; i < kNumPrefixes; i++) {
+    folly::CIDRNetwork prefix{
+        folly::IPAddress("10.1." + std::to_string(i) + ".0"), 24};
+    prefixes.push_back(prefix);
+    sourceGroup->addToPathTree(
+        sourceGroup->PathTree_, prefix, sourceGroupOwnerKey, 0);
+  }
+  for (const auto& prefix : prefixes) {
+    sourceGroup->addToPathTree(sourceGroup->PathTree_, prefix, key3, 0);
+  }
+  for (int i = 0; i < kNumPrefixes / 2; i++) {
+    sourceGroup->addToPathTree(sourceGroup->PathTree_, prefixes[i], key2, 0);
+  }
+  for (const auto& prefix : prefixes) {
+    sourceGroup->addToPathTree(sourceGroup->PathTree_, prefix, key4, 0);
+  }
+
+  sourceGroup->movePeersSharedRibOutPathEntries(
+      {peer1, peer2, peer3}, targetGroup);
+
+  for (int i = 0; i < kNumPrefixes; i++) {
+    const auto& prefix = prefixes[i];
+
+    // Old group: shared entry copied (kept), staying peer4 untouched, moved
+    // peer3's per-peer entry erased.
+    EXPECT_NE(
+        sourceGroup->getFromPathTree(
+            sourceGroup->PathTree_, prefix, sourceGroupOwnerKey, 0),
+        nullptr);
+    EXPECT_NE(
+        sourceGroup->getFromPathTree(sourceGroup->PathTree_, prefix, key4, 0),
+        nullptr);
+    EXPECT_EQ(
+        sourceGroup->getFromPathTree(sourceGroup->PathTree_, prefix, key3, 0),
+        nullptr);
+
+    // New group: shared entry copied under the NEW group's owner key (not the
+    // old group's key, not a peer key). peer1 (all shared) has nothing of its
+    // own and relies on the copied group entry.
+    EXPECT_NE(
+        targetGroup->getFromPathTree(
+            targetGroup->PathTree_, prefix, targetGroupOwnerKey, 0),
+        nullptr);
+    EXPECT_EQ(
+        targetGroup->getFromPathTree(
+            targetGroup->PathTree_, prefix, sourceGroupOwnerKey, 0),
+        nullptr);
+    EXPECT_EQ(
+        targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key1, 0),
+        nullptr);
+    // Moved peer3 (non shared) lands under its own owner key.
+    EXPECT_NE(
+        targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key3, 0),
+        nullptr);
+    // Staying peer4's entries are not moved into the new group.
+    EXPECT_EQ(
+        targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key4, 0),
+        nullptr);
+
+    // peer2 (some shared) only diverged on the first half: moved there, absent
+    // (and shared via the group) on the second half.
+    if (i < kNumPrefixes / 2) {
+      EXPECT_EQ(
+          sourceGroup->getFromPathTree(sourceGroup->PathTree_, prefix, key2, 0),
+          nullptr);
+      EXPECT_NE(
+          targetGroup->getFromPathTree(targetGroup->PathTree_, prefix, key2, 0),
+          nullptr);
+    }
+  }
+
+  // Break peer<->group cycles for the locally created peers.
+  for (const auto& p : {peer1, peer2, peer3, peer4}) {
+    p->setUpdateGroup(nullptr);
+  }
+}
+
 } // namespace facebook::bgp

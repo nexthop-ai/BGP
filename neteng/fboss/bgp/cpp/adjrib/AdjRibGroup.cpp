@@ -2820,6 +2820,116 @@ void AdjRibOutGroup::movePeers(
   }
 }
 
+void AdjRibOutGroup::movePeersSharedRibOutPathEntries(
+    const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
+  const auto groupOwnerKey = getGroupOwnerKey();
+  const auto newGroupOwnerKey = newGroup->getGroupOwnerKey();
+  size_t copiedCount = 0;
+  size_t movedCount = 0;
+  std::vector<AdjRibPathTree::Iterator> emptyNodes;
+
+  for (auto itr = PathTree_.begin(); itr != PathTree_.end(); ++itr) {
+    auto& ownerMap = itr->value();
+    auto prefix = folly::CIDRNetwork{itr.ipAddress(), itr.masklen()};
+
+    // Copy this group's group-owned entries to the new group (kept here).
+    auto groupItr = ownerMap.find(groupOwnerKey);
+    if (groupItr != ownerMap.end()) {
+      for (auto& [pathId, entry] : groupItr->second) {
+        newGroup->copyEntryForOwner(
+            prefix, pathId, newGroupOwnerKey, entry.get());
+        copiedCount++;
+      }
+    }
+
+    // Move the per-peer entries of the given peers (erased from this group).
+    for (const auto& peer : peersToMove) {
+      auto peerOwnerKey = peer->getPeerOwnerKey();
+      auto peerItr = ownerMap.find(peerOwnerKey);
+      if (peerItr != ownerMap.end()) {
+        for (auto& [pathId, entry] : peerItr->second) {
+          newGroup->copyEntryForOwner(
+              prefix, pathId, peerOwnerKey, entry.get());
+          movedCount++;
+        }
+        ownerMap.erase(peerItr);
+      }
+    }
+
+    // Clean up empty ownerMaps to not leave any empty radix node
+    if (ownerMap.empty()) {
+      emptyNodes.push_back(itr);
+    }
+  }
+  for (auto& itr : emptyNodes) {
+    PathTree_.erase(itr);
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Copied {} group-owned PathTree entries, moved {} per-peer "
+      "entries for {} peer(s) to group {}",
+      groupDescriptor_,
+      copiedCount,
+      movedCount,
+      peersToMove.size(),
+      newGroup->getAdjRibGroupName());
+}
+
+void AdjRibOutGroup::movePeersSharedRibOutLiteEntries(
+    const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
+  const auto groupOwnerKey = getGroupOwnerKey();
+  const auto newGroupOwnerKey = newGroup->getGroupOwnerKey();
+  size_t copiedCount = 0;
+  size_t movedCount = 0;
+  std::vector<AdjRibLiteTree::Iterator> emptyNodes;
+
+  for (auto itr = LiteTree_.begin(); itr != LiteTree_.end(); ++itr) {
+    auto& ownerMap = itr->value();
+    auto prefix = folly::CIDRNetwork{itr.ipAddress(), itr.masklen()};
+
+    // Copy this group's group-owned entry to the new group (kept here).
+    auto groupItr = ownerMap.find(groupOwnerKey);
+    if (groupItr != ownerMap.end()) {
+      newGroup->copyEntryForOwner(
+          prefix, kDefaultPathID, newGroupOwnerKey, groupItr->second.get());
+      copiedCount++;
+    }
+
+    // Move the per-peer entries of the given peers (erased from this group).
+    for (const auto& peer : peersToMove) {
+      auto peerOwnerKey = peer->getPeerOwnerKey();
+      auto peerItr = ownerMap.find(peerOwnerKey);
+      if (peerItr != ownerMap.end()) {
+        newGroup->copyEntryForOwner(
+            prefix, kDefaultPathID, peerOwnerKey, peerItr->second.get());
+        ownerMap.erase(peerItr);
+        movedCount++;
+      }
+    }
+
+    // Clean up empty ownerMaps to not leave any empty radix node
+    if (ownerMap.empty()) {
+      emptyNodes.push_back(itr);
+    }
+  }
+  for (auto& itr : emptyNodes) {
+    LiteTree_.erase(itr);
+  }
+
+  XLOGF(
+      INFO,
+      "Group {}: Copied {} group-owned LiteTree entries, moved {} per-peer "
+      "entries for {} peer(s) to group {}",
+      groupDescriptor_,
+      copiedCount,
+      movedCount,
+      peersToMove.size(),
+      newGroup->getAdjRibGroupName());
+}
+
 /*
  * Mark a peer as blocked due to TCP backpressure.
  * Sets bitmap bit, checks frequency threshold, schedules duration timer.

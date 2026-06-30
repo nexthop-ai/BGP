@@ -764,6 +764,25 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
 
   /*
+   * COPY this group's group-owned entries to newGroup's group owner key (they
+   * remain in this group, still serving its other members) and MOVE the
+   * per-peer entries of peersToMove to newGroup under each peer's own owner key
+   * (erased from this group). Group-owned entries stay group-owned in the new
+   * group; only the listed peers' per-peer entries are transferred. Path/Lite
+   * variants for the add-path and non-add-path trees.
+   *
+   * peersToMove is never empty: the only reason to call this API is to move
+   * peers, so callers always pass at least one peer.
+   */
+  void movePeersSharedRibOutPathEntries(
+      const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
+
+  void movePeersSharedRibOutLiteEntries(
+      const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
+
+  /*
    * Mark a peer as blocked due to TCP backpressure.
    * Sets bitmap bit, checks frequency threshold, schedules duration timer.
    * @param adjRib - The peer that just became blocked
