@@ -4041,9 +4041,15 @@ folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
       "Group {}: Starting group egress policy re-evaluation",
       group->getAdjRibGroupName());
 
-  // Step 1: Rekey the group — rebuilds UpdateGroupKey on all peers
-  // and updates UpdateGroupManager before re-evaluation.
-  updateGroupManager_->rekeyGroup(group);
+  // Step 1: Rebuild every member's UpdateGroupKey, then move the group's map
+  // entry to the rebuilt key before re-evaluation.
+  for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
+    adjRib->buildAndSetUpdateGroupKey();
+  }
+  if (!group->getBitToAdjRibs().empty()) {
+    updateGroupManager_->rekeyGroup(
+        group, group->getBitToAdjRibs().begin()->second->getUpdateGroupKey());
+  }
 
   // Step 2: Group-level re-evaluation (serves all IN_SYNC members)
   group->reEvaluateSyncPeersEgressPolicy();

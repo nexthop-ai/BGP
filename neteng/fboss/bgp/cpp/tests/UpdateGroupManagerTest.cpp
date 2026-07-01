@@ -419,8 +419,9 @@ TEST_F(UpdateGroupManagerTest, RekeyGroupUpdatesMapKey) {
   newPolicy[bgp_policy::DIRECTION::OUT] = "NEW_POLICY";
   adjRib->updateIngressEgressPolicyNames(newPolicy);
 
-  // Rekey — should rebuild key on all peers internally
-  manager.rekeyGroup(group);
+  // Rekey — caller rebuilds the member key, then passes the new key
+  adjRib->buildAndSetUpdateGroupKey();
+  manager.rekeyGroup(group, adjRib->getUpdateGroupKey());
 
   // Old key should be gone, new key should exist
   EXPECT_FALSE(manager.hasGroup(oldKey));
@@ -462,7 +463,7 @@ TEST_F(UpdateGroupManagerTest, RekeyGroupNoOpWhenKeyUnchanged) {
   group->registerPeer(adjRib);
 
   // Rekey without changing the policy — should be a no-op
-  manager.rekeyGroup(group);
+  manager.rekeyGroup(group, key);
 
   EXPECT_TRUE(manager.hasGroup(key));
   EXPECT_EQ(manager.getGroupCount(), 1);
@@ -514,7 +515,10 @@ TEST_F(UpdateGroupManagerTest, RekeyGroupUpdatesAllPeerKeys) {
   adjRib1->updateIngressEgressPolicyNames(newPolicy);
   adjRib2->updateIngressEgressPolicyNames(newPolicy);
 
-  manager.rekeyGroup(group);
+  // Caller rebuilds both members' keys, then passes the new key.
+  adjRib1->buildAndSetUpdateGroupKey();
+  adjRib2->buildAndSetUpdateGroupKey();
+  manager.rekeyGroup(group, adjRib1->getUpdateGroupKey());
 
   // Both peers should have their keys rebuilt
   EXPECT_EQ(adjRib1->getUpdateGroupKey().egressPolicyName, "MULTI_PEER_POLICY");

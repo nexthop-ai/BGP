@@ -105,24 +105,9 @@ folly::coro::Task<void> UpdateGroupManager::maybeDestroyUpdateGroup(
 }
 
 void UpdateGroupManager::rekeyGroup(
-    const std::shared_ptr<AdjRibOutGroup>& group) {
+    const std::shared_ptr<AdjRibOutGroup>& group,
+    const UpdateGroupKey& newKey) {
   auto oldKey = group->getGroupKey();
-
-  // Rebuild UpdateGroupKey on all peers in the group
-  auto& bitToAdjRibs = group->getBitToAdjRibs();
-  if (bitToAdjRibs.empty()) {
-    XLOGF(
-        ERR,
-        "Group {}: unexpected empty group while updating group key",
-        group->getGroupDescriptor());
-    return;
-  }
-
-  for (const auto& [_, adjRib] : bitToAdjRibs) {
-    adjRib->buildAndSetUpdateGroupKey();
-  }
-
-  auto& newKey = bitToAdjRibs.begin()->second->getUpdateGroupKey();
 
   if (oldKey == newKey) {
     XLOGF(
