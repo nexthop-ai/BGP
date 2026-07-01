@@ -2593,7 +2593,8 @@ void AdjRibOutGroup::decrementPeersDetachedAfterJoin() noexcept {
 }
 
 void AdjRibOutGroup::removePeer(
-    const std::shared_ptr<AdjRib>& adjRib) noexcept {
+    const std::shared_ptr<AdjRib>& adjRib,
+    bool shouldHandleNoSyncPeers) noexcept {
   uint64_t bit = adjRib->getGroupBitPosition();
 
   adjRib->resetSlowPeerDurationTimer();
@@ -2628,7 +2629,7 @@ void AdjRibOutGroup::removePeer(
    * TODO: optimize -- this runs synchronously per removal. Skip it when nothing
    * is promotable (no DETACHED_READY_TO_JOIN peers).
    */
-  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
+  if (shouldHandleNoSyncPeers && getMemberCount() > 0 && numInSyncPeers_ == 0) {
     handleNoSyncPeers();
   }
 }
@@ -2928,6 +2929,135 @@ void AdjRibOutGroup::movePeersSharedRibOutLiteEntries(
       movedCount,
       peersToMove.size(),
       newGroup->getAdjRibGroupName());
+}
+
+void AdjRibOutGroup::copyGroupFieldsToNewGroup(
+    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
+  newGroup->setChangeListTracker(
+      changeListTracker_, *addPathConsumerBitmap_, *nonAddPathConsumerBitmap_);
+  newGroup->setState(state_);
+  newGroup->setLastSeenRibVersion(lastSeenRibVersion_);
+  newGroup->peeringParams_ = peeringParams_;
+  newGroup->enableRibAllocatedPathId_ = enableRibAllocatedPathId_;
+  newGroup->mraiInterval_ = mraiInterval_;
+  newGroup->egressEoRPendingV4_ = egressEoRPendingV4_;
+  newGroup->egressEoRPendingV6_ = egressEoRPendingV6_;
+  newGroup->updateGroupConfig_ = updateGroupConfig_;
+  newGroup->initialDumpCompletionTimeMs_ = initialDumpCompletionTimeMs_;
+}
+
+void AdjRibOutGroup::splitToNewGroup(
+    const std::shared_ptr<AdjRibOutGroup>& newGroup,
+    const std::vector<std::shared_ptr<AdjRib>>& peersToMove) noexcept {
+  XLOGF(
+      INFO,
+      "Group {}: Splitting {} peer(s) into new group {}",
+      groupDescriptor_,
+      peersToMove.size(),
+      newGroup->getAdjRibGroupName());
+
+  /*
+   * 1. Copy this group's operational state and flags so newGroup is a faithful
+   * copy. Identity (groupId/name/groupKey) is set by the caller at construction
+   * and is intentionally not copied -- newGroup keeps its own key (which may
+   * differ from this group's, e.g. a per-peer-override split).
+   */
+  copyGroupFieldsToNewGroup(newGroup);
+
+  /*
+   * 2. Create newGroup's change list consumer and join it at this group's CL
+   * marker so newGroup resumes consumption from the exact same position.
+   */
+  newGroup->registerGroupConsumer();
+  if (changeListTracker_ && changeListConsumer_ &&
+      newGroup->getChangeListConsumer()) {
+    changeListTracker_->joinConsumer(
+        changeListConsumer_, newGroup->getChangeListConsumer());
+  } else {
+    XLOGF(
+        WARN,
+        "Group {}: no CL consumer to join newGroup {} at; newGroup starts at "
+        "end of change list",
+        groupDescriptor_,
+        newGroup->getAdjRibGroupName());
+  }
+
+  /*
+   * 3. Copy this group's group-owned RIB-OUT entries to newGroup (kept here
+   * too) and move the moved peers' per-peer entries to newGroup.
+   */
+  if (groupKey_.sendAddPath) {
+    movePeersSharedRibOutPathEntries(peersToMove, newGroup);
+  } else {
+    movePeersSharedRibOutLiteEntries(peersToMove, newGroup);
+  }
+
+  /*
+   * 4. Re-home each peer. removePeer() tears down its membership on this group
+   * (bitmaps, detachedPeers_, bit position) without touching its detached CL
+   * consumer or detached RIB version, so its live status can be mirrored into
+   * newGroup at a freshly allocated bit (bit positions are not preserved across
+   * the split). Status is snapshotted from the old bit before removePeer()
+   * clears it.
+   */
+  for (const auto& peer : peersToMove) {
+    uint64_t oldBit = peer->getGroupBitPosition();
+    bool wasInSync = isPeerInSync(oldBit);
+    bool wasBlocked = BitmapUtils::isBitSet(adjRibBlockedBitmap_, oldBit);
+    uint64_t detachedRibVersion = peer->getDetachedRibVersion();
+
+    /*
+     * Suppress the no-sync-peers recovery here: we only want to promote a
+     * remaining peer once, after every peer in peersToMove has been removed.
+     * Running it mid-loop could promote a peer that is still pending its own
+     * move, and could promote repeatedly as each removal drops the in-sync
+     * count. We call handleNoSyncPeers() once at the end instead.
+     */
+    removePeer(peer, /*shouldHandleNoSyncPeers=*/false);
+
+    /* Faithful register into newGroup. */
+    uint64_t newBit = newGroup->bitManager_.getConsumerBit();
+    newGroup->bitToAdjRibs_[newBit] = peer;
+    peer->setGroupBitPosition(newBit);
+    peer->setUpdateGroup(newGroup);
+    BitmapUtils::setBit(newGroup->adjRibEstablishedBitmap_, newBit);
+
+    if (wasInSync) {
+      newGroup->setSyncBit(newBit);
+      /*
+       * Only in-sync peers carry the blocked bit (detachPeer clears it when a
+       * peer leaves the sync set), so a JOINED_BLOCKED peer -- in-sync AND
+       * blocked -- must have its blocked bit restored here.
+       */
+      if (wasBlocked) {
+        BitmapUtils::setBit(newGroup->adjRibBlockedBitmap_, newBit);
+      }
+    } else {
+      newGroup->detachedPeers_.insert(peer);
+      if (detachedRibVersion > 0) {
+        newGroup->incrementPeersDetachedAfterJoin();
+      }
+    }
+
+    XLOGF(
+        INFO,
+        "Group {}: Moved peer {} (bit {} -> {}) to new group {} as {}",
+        groupDescriptor_,
+        peer->getPeerName(),
+        oldBit,
+        newBit,
+        newGroup->getAdjRibGroupName(),
+        peer->getPeerState());
+  }
+
+  /*
+   * Recover this group once, after all moved peers are out. handleNoSyncPeers
+   * is suppressed per-removePeer above so the bulk move never promotes a peer
+   * that is still pending its move.
+   */
+  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
+    handleNoSyncPeers();
+  }
 }
 
 /*

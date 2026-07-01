@@ -34,6 +34,7 @@
 #include <folly/coro/GtestHelpers.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/Timeout.h>
+#include <folly/hash/Hash.h>
 #include <gtest/gtest.h>
 
 #include "fboss/lib/CommonUtils.h"
@@ -955,6 +956,106 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
                  return count;
                })
         .get();
+  }
+
+  /*
+   * Serialize a group's RIB-OUT for a single owner so two snapshots can be
+   * compared for exact equality (e.g. before/after splitToNewGroup). Produces a
+   * deterministic string of comma-separated tokens:
+   *   "Path{G_pfx_h, p_keyhash_pfx_h, ...}, Lite{G_pfx_h, p_keyhash_pfx_h}"
+   * Group-owned (shared) entries are tagged "G"; entries owned by `ownerKey`
+   * are tagged "p_<ownerKeyHash>"; entries belonging to any other owner are
+   * ignored. "h" is a single hash over the AdjRibEntry's content (pathId, rib
+   * version, flags, pre/post attribute hashes, post-policy name).
+   * lastUpdateRcvdUsec is intentionally excluded -- it is not carried by
+   * copyEntryForOwner and is not part of the advertised RIB-OUT. Order is
+   * deterministic: prefixes in radix order, group entries before owner entries,
+   * path ids ascending.
+   *
+   * MUST be called on the group's EventBase thread (it reads the RIB-OUT
+   * trees).
+   */
+  std::string serializeSharedRibOutTreesGroupKeyNormalized(
+      const std::shared_ptr<AdjRibOutGroup>& group,
+      const AdjRibOutOwnerKey& ownerKey) {
+    const auto groupOwnerKey = group->getGroupOwnerKey();
+    const std::string groupTag = "G";
+    const std::string ownerTag = fmt::format("p_{}", ownerKey.hash());
+
+    auto entryHash = [](uint32_t pathId, const AdjRibEntry& e) {
+      return folly::hash::hash_combine(
+          pathId,
+          e.getRibVersion(),
+          e.isStale(),
+          e.isNexthopSetByPolicy(),
+          e.getPreOut() ? e.getPreOut()->hash() : 0,
+          e.getPostAttr() ? e.getPostAttr()->hash() : 0,
+          e.getPostOutPolicy() ? *e.getPostOutPolicy() : std::string{});
+    };
+
+    auto join = [](const std::vector<std::string>& tokens) {
+      std::string out;
+      for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i) {
+          out += ", ";
+        }
+        out += tokens[i];
+      }
+      return out;
+    };
+
+    // Lite tree: at most one entry per (prefix, owner).
+    std::vector<std::string> liteTokens;
+    for (auto it = group->LiteTree_.begin(); it != group->LiteTree_.end();
+         ++it) {
+      const auto& ownerMap = it->value();
+      auto pfx = fmt::format("{}/{}", it.ipAddress().str(), it.masklen());
+      if (auto g = ownerMap.find(groupOwnerKey); g != ownerMap.end()) {
+        liteTokens.push_back(
+            fmt::format(
+                "{}_{}_{}",
+                groupTag,
+                pfx,
+                entryHash(kDefaultPathID, *g->second)));
+      }
+      if (auto p = ownerMap.find(ownerKey); p != ownerMap.end()) {
+        liteTokens.push_back(
+            fmt::format(
+                "{}_{}_{}",
+                ownerTag,
+                pfx,
+                entryHash(kDefaultPathID, *p->second)));
+      }
+    }
+
+    // Path tree: multiple paths per (prefix, owner), keyed by pathId.
+    std::vector<std::string> pathTokens;
+    for (auto it = group->PathTree_.begin(); it != group->PathTree_.end();
+         ++it) {
+      const auto& ownerMap = it->value();
+      auto pfx = fmt::format("{}/{}", it.ipAddress().str(), it.masklen());
+      auto emitOwner = [&](const std::string& tag,
+                           const AdjRibOutOwnerKey& key) {
+        auto oit = ownerMap.find(key);
+        if (oit == ownerMap.end()) {
+          return;
+        }
+        // Order path ids ascending for a stable, comparable string.
+        std::map<uint32_t, const AdjRibEntry*> byPathId;
+        for (const auto& [pathId, entry] : oit->second) {
+          byPathId.emplace(pathId, entry.get());
+        }
+        for (const auto& [pathId, entry] : byPathId) {
+          pathTokens.push_back(
+              fmt::format("{}_{}_{}", tag, pfx, entryHash(pathId, *entry)));
+        }
+      };
+      emitOwner(groupTag, groupOwnerKey);
+      emitOwner(ownerTag, ownerKey);
+    }
+
+    return fmt::format(
+        "Path{{{}}}, Lite{{{}}}", join(pathTokens), join(liteTokens));
   }
 
   /*

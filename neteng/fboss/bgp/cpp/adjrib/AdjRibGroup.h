@@ -783,6 +783,24 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
 
   /*
+   * Split a subset of this group's members into newGroup, which becomes a
+   * faithful copy of this group at this group's current change-list position.
+   * Copies this group's operational state and flags, wires newGroup's change
+   * list consumer joined at this group's CL marker, copies this group's
+   * group-owned RIB-OUT entries and moves the peers' per-peer entries via
+   * movePeersSharedRibOut, then re-homes each peer: its
+   * in-sync/detached/blocked status (and detached RIB version) is mirrored into
+   * newGroup at a freshly allocated bit (bit positions are NOT preserved). On
+   * this (old) group only the peer's bitmap bits and detachedPeers_ membership
+   * are cleared -- the peer's detached CL consumer and detached RIB version are
+   * left untouched. Caller constructs newGroup as a proper update group
+   * (groupId/groupKey/ sendAddPath) before calling.
+   */
+  void splitToNewGroup(
+      const std::shared_ptr<AdjRibOutGroup>& newGroup,
+      const std::vector<std::shared_ptr<AdjRib>>& peersToMove) noexcept;
+
+  /*
    * Mark a peer as blocked due to TCP backpressure.
    * Sets bitmap bit, checks frequency threshold, schedules duration timer.
    * @param adjRib - The peer that just became blocked
@@ -1065,8 +1083,14 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
    * Resets timers, clears bitmaps, frees bit position, and removes
    * from tracking maps. Does NOT handle per-peer RIB-OUT entries or
    * peer state transitions — callers handle those separately.
+   * When shouldHandleNoSyncPeers is true (default), runs handleNoSyncPeers()
+   * if this removal leaves the group with members but no in-sync peers. Pass
+   * false to suppress that recovery (e.g. during a bulk group split, where the
+   * caller is re-homing peers and must not promote a not-yet-moved peer).
    */
-  void removePeer(const std::shared_ptr<AdjRib>& adjRib) noexcept;
+  void removePeer(
+      const std::shared_ptr<AdjRib>& adjRib,
+      bool shouldHandleNoSyncPeers = true) noexcept;
 
   /*
    * Move each peer's RIB-OUT entries to the new group. These methods do NOT
@@ -1082,6 +1106,16 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
 
   void movePeerMaterializedRibOutLiteEntries(
       const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
+      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
+
+  /*
+   * Copy this group's operational state and flags onto newGroup so it is a
+   * faithful copy. Identity (groupId/name/groupKey) is intentionally NOT copied
+   * -- newGroup keeps its own. This is the single place that mirrors group
+   * state across a split, so any new operational field added to AdjRibOutGroup
+   * should be copied here too.
+   */
+  void copyGroupFieldsToNewGroup(
       const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
 
   /*
