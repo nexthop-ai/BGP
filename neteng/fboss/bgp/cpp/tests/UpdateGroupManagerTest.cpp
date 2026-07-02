@@ -210,16 +210,83 @@ TEST_F(UpdateGroupManagerTest, GroupNameGeneration) {
   EXPECT_NE(name1, name2);
 }
 
-TEST_F(UpdateGroupManagerTest, MaybeDestroyUpdateGroup) {
+TEST_F(UpdateGroupManagerTest, MaybeDestroyUpdateGroups) {
   folly::EventBase evb;
   UpdateGroupManager manager(evb, UpdateGroupConfig{});
   auto key = createTestKey();
 
   /*
-   * Calling maybeDestroyUpdateGroup on non-existent group should not crash
+   * An empty group (no members) is destroyed and erased from the manager.
    */
-  folly::coro::blockingWait(manager.maybeDestroyUpdateGroup(key));
+  auto group = manager.findOrCreateGroup(key);
+  EXPECT_EQ(1, manager.getGroupCount());
+  folly::coro::blockingWait(manager.maybeDestroyUpdateGroups({group}));
   EXPECT_EQ(0, manager.getGroupCount());
+
+  /*
+   * Passing an already-destroyed group (and an empty list) is a safe no-op.
+   */
+  folly::coro::blockingWait(manager.maybeDestroyUpdateGroups({group}));
+  folly::coro::blockingWait(manager.maybeDestroyUpdateGroups({}));
+  EXPECT_EQ(0, manager.getGroupCount());
+}
+
+TEST_F(UpdateGroupManagerTest, MaybeDestroyUpdateGroupsDestroysAllEmptyGroups) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+
+  auto group1 = manager.findOrCreateGroup(createTestKey("policy1"));
+  auto group2 = manager.findOrCreateGroup(createTestKey("policy2"));
+  auto group3 = manager.findOrCreateGroup(createTestKey("policy3"));
+  EXPECT_EQ(3, manager.getGroupCount());
+
+  // All three groups are empty, so passing them together destroys every one.
+  folly::coro::blockingWait(
+      manager.maybeDestroyUpdateGroups({group1, group2, group3}));
+  EXPECT_EQ(0, manager.getGroupCount());
+}
+
+TEST_F(UpdateGroupManagerTest, MaybeDestroyUpdateGroupsSkipsNonEmptyGroups) {
+  folly::EventBase evb;
+  UpdateGroupManager manager(evb, UpdateGroupConfig{});
+
+  auto emptyKey1 = createTestKey("policy1");
+  auto nonEmptyKey = createTestKey("policy2");
+  auto emptyKey2 = createTestKey("policy3");
+  auto emptyGroup1 = manager.findOrCreateGroup(emptyKey1);
+  auto nonEmptyGroup = manager.findOrCreateGroup(nonEmptyKey);
+  auto emptyGroup2 = manager.findOrCreateGroup(emptyKey2);
+  EXPECT_EQ(3, manager.getGroupCount());
+
+  /*
+   * Register a peer into the middle group so it has a member; only the two
+   * empty groups should be destroyed when all three are passed together.
+   */
+  nettools::bgplib::MonitoredBackPressuredQueue<RibInMessage> ribInQ{
+      nettools::bgplib::kMaxIngressQueueSize};
+  MonitoredMPMCQueue<AdjRib::ObservableMessageT> observerQ;
+  auto peerId = nettools::bgplib::BgpPeerId(
+      folly::IPAddress("10.0.0.1"),
+      folly::IPAddressV4("255.0.0.1").toLongHBO());
+  auto adjRib = std::make_shared<AdjRib>(
+      peerId,
+      PeeringParams(),
+      evb,
+      ribInQ,
+      observerQ,
+      std::make_shared<folly::coro::Baton>(),
+      nullptr,
+      std::make_shared<std::atomic<bool>>(false));
+  nonEmptyGroup->registerPeer(adjRib);
+
+  folly::coro::blockingWait(manager.maybeDestroyUpdateGroups(
+      {emptyGroup1, nonEmptyGroup, emptyGroup2}));
+
+  // Only the non-empty group survives.
+  EXPECT_EQ(1, manager.getGroupCount());
+  EXPECT_TRUE(manager.hasGroup(nonEmptyKey));
+  EXPECT_FALSE(manager.hasGroup(emptyKey1));
+  EXPECT_FALSE(manager.hasGroup(emptyKey2));
 }
 
 TEST_F(UpdateGroupManagerTest, SetUpdateGroupState) {

@@ -16,8 +16,13 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+#include <vector>
+
 #include <folly/IPAddress.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 #include <folly/coro/Task.h>
 #include <folly/io/async/EventBase.h>
 
@@ -60,14 +65,17 @@ class UpdateGroupManager {
   std::shared_ptr<AdjRibOutGroup> findOrCreateGroup(const UpdateGroupKey& key);
 
   /*
-   * @brief: destroy update group if it has no members.
-   * Cooperatively drains asyncScope_ before destruction to avoid
-   * blocking the EventBase thread.
-   * @param: update group key
-   * @note: this is called during peer termination to cleanup empty groups.
+   * @brief: destroy each given update group that has no members.
+   * Erases the empty groups from the map, then cooperatively drains their
+   * asyncScope_ before destruction to avoid blocking the EventBase thread.
+   * Groups that are not empty (or no longer tracked) are skipped.
+   * @param: the candidate groups to destroy
+   * @note: called during peer termination and group splits/moves to clean up
+   *   groups whose members have all left.
    * @return: Task<void> to be co_awaited by the caller.
    */
-  folly::coro::Task<void> maybeDestroyUpdateGroup(const UpdateGroupKey& key);
+  folly::coro::Task<void> maybeDestroyUpdateGroups(
+      const folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>>& groups);
 
   /*
    * @brief: set the state of an update group using ENUM.

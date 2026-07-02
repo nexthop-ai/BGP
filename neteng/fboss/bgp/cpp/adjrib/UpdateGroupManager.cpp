@@ -75,33 +75,39 @@ std::shared_ptr<AdjRibOutGroup> UpdateGroupManager::getGroup(
   return nullptr;
 }
 
-folly::coro::Task<void> UpdateGroupManager::maybeDestroyUpdateGroup(
-    const UpdateGroupKey& key) {
-  auto it = updateGroups_.find(key);
-  if (it == updateGroups_.end()) {
-    co_return;
+folly::coro::Task<void> UpdateGroupManager::maybeDestroyUpdateGroups(
+    const folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>>& groups) {
+  /*
+   * Erase every empty group from the map; the collected shared_ptrs keep them
+   * alive so their async scopes can be drained afterwards.
+   */
+  std::vector<std::shared_ptr<AdjRibOutGroup>> removedGroups;
+  for (const auto& group : groups) {
+    if (!group || group->getMemberCount() != 0) {
+      continue;
+    }
+    auto it = updateGroups_.find(group->getGroupKey());
+    if (it == updateGroups_.end() || it->second != group) {
+      continue;
+    }
+
+    group->resetChangeListConsumeTimer();
+    group->deactivateChangeListConsumer();
+    group->resetChangeListConsumer();
+    group->clearPackingList();
+
+    updateGroups_.erase(it);
+    BgpStats::decrNumUpdateGroups();
+    removedGroups.push_back(group);
   }
-
-  auto& group = it->second;
-  if (group->getMemberCount() != 0) {
-    co_return;
-  }
-
-  group->resetChangeListConsumeTimer();
-  group->deactivateChangeListConsumer();
-  group->resetChangeListConsumer();
-  group->clearPackingList();
-
-  auto g = std::move(it->second);
-  updateGroups_.erase(it);
-  BgpStats::decrNumUpdateGroups();
 
   /*
-   * Cancel any pending coroutines in asyncScope_ and cooperatively
-   * wait for them to complete. This must happen before the group is
-   * destroyed to avoid blocking the EventBase thread in the destructor.
+   * Drain each removed group before it is destroyed, so pending coroutines
+   * finish off the EventBase rather than blocking the destructor.
    */
-  co_await g->drainAsyncScope();
+  for (const auto& group : removedGroups) {
+    co_await group->drainAsyncScope();
+  }
 }
 
 void UpdateGroupManager::rekeyGroup(

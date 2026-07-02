@@ -588,19 +588,22 @@ void PeerManager::stop() noexcept {
       }
     }
 
-    // Unregister peers from update groups and cleanup
+    /*
+     * Unregister peers from update groups, then destroy any now-empty groups
+     * in one batch after the loop.
+     */
     if (enableUpdateGroup_ && updateGroupManager_) {
+      folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>> groups;
       for (const auto& [_, adjRib] : adjRibs_) {
         if (adjRib) {
           auto updateGroup = adjRib->getUpdateGroup();
           if (updateGroup) {
             updateGroup->unregisterPeer(adjRib);
-            const auto& updateGroupKey = adjRib->getUpdateGroupKey();
-            co_await updateGroupManager_->maybeDestroyUpdateGroup(
-                updateGroupKey);
+            groups.insert(std::move(updateGroup));
           }
         }
       }
+      co_await updateGroupManager_->maybeDestroyUpdateGroups(groups);
     }
 
     // When shutting down BGP instance, in case BGP has not yet finished
@@ -2280,8 +2283,7 @@ folly::coro::Task<void> PeerManager::sessionTerminated(
       updateGroup->unregisterPeer(adjRib);
 
       // Maybe destroy group if no members remain
-      const auto& updateGroupKey = adjRib->getUpdateGroupKey();
-      co_await updateGroupManager_->maybeDestroyUpdateGroup(updateGroupKey);
+      co_await updateGroupManager_->maybeDestroyUpdateGroups({updateGroup});
     }
   }
 
