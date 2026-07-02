@@ -1,0 +1,79 @@
+name: Build BGP
+run-name: Build BGP
+on:
+  # Build on every PR raised against the OSS repo
+  pull_request:
+  # Allow manually triggering the workflow
+  workflow_dispatch:
+  # Periodic daily build to catch breakages from upstream dependency drift
+  # even when no PR is open.
+  # ShipIt syncs hourly around HH:21, so schedule with a ~15 minute offset so
+  # the run picks up the freshest sync.
+  schedule:
+    # Run daily at 7:36AM UTC = 12:36AM PDT
+    - cron: '36 7 * * *'
+
+# Cancel a superseded run when new commits are pushed to the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  BGP-Build:
+    runs-on: 32-core-ubuntu
+    steps:
+      - run: echo "Confirming hardware specifications:"; sudo lscpu
+      - name: Clean workspace
+        run: sudo rm -rf ${{ github.workspace }}/*
+      - name: Check out repository code
+        uses: actions/checkout@v7
+      # getdeps builds BGP and all of its dependencies (boost, folly, fbthrift,
+      # fizz, wangle, fb303, fboss, ...) via CMake. --allow-system-packages lets
+      # it install the required OS packages. --num-jobs is capped below the core
+      # count because the heavy fboss/folly translation units are memory-hungry
+      # and full parallelism can OOM the runner.
+      # BUILD_SAI_FAKE=1 makes the fboss dependency build against fake SAI
+      # (fboss/github/CMakeLists.txt reads it via $ENV{BUILD_SAI_FAKE}); without
+      # it the fboss build fails since no real vendor SAI is available in OSS.
+      # It is passed via `sudo env` because sudo strips the ambient environment.
+      - name: Build BGP (getdeps / CMake)
+        run: >
+          sudo
+          env
+          BUILD_SAI_FAKE=1
+          python3
+          build/fbcode_builder/getdeps.py
+          --allow-system-packages
+          --scratch-path
+          ${{ github.workspace }}/build-output
+          build
+          --src-dir=.
+          --num-jobs
+          18
+          bgp
+          &&
+          sudo
+          chown
+          -R
+          runner:runner
+          ${{ github.workspace }}
+      # Retain the build output only for non-PR runs (daily schedule + manual
+      # dispatch). PRs stay build-only so they finish faster and don't pile up
+      # artifacts.
+      - name: Locate BGP install directory
+        if: github.event_name != 'pull_request'
+        id: instdir
+        run: >
+          echo "dir=$(python3 build/fbcode_builder/getdeps.py
+          --scratch-path ${{ github.workspace }}/build-output
+          show-inst-dir --src-dir=. bgp)" >> "$GITHUB_OUTPUT"
+      - name: Upload BGP build output
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bgp
+          path: ${{ steps.instdir.outputs.dir }}
+          retention-days: 14
