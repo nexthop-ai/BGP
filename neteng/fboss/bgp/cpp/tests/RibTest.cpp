@@ -52,6 +52,7 @@
   FRIEND_TEST(RibFixture, PartialDrainTransitionCountMultiPrefix);             \
   FRIEND_TEST(RibFixture, PartialDrainMnhThresholdUpdatedAcrossDrainCycle);    \
   FRIEND_TEST(RibFixture, PartialDrainUnderflowGuard);                         \
+  FRIEND_TEST(RibFixture, PartialDrainOdsStateOnTransition);                   \
   FRIEND_TEST(RibFixture, BestPathWithAddPathEnabled_OnlyPathIdChange);        \
   FRIEND_TEST(                                                                 \
       RibFixture, IncrementalWithdrawnChunkTestAfterReadOnlyForAddPath);       \
@@ -132,6 +133,7 @@
 #include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
 #include "neteng/fboss/bgp/cpp/rib/facebook/RibPolicyLogger.h"
+#include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/cpp/tests/BoundedWaitUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/MockScubaData.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
@@ -1063,6 +1065,54 @@ TEST_F(RibFixture, PartialDrainUnderflowGuard) {
     auto statusAfter = rib_->getPartialDrainStatus();
     EXPECT_EQ(0, *statusAfter.num_affected_prefixes());
     EXPECT_EQ(0, *statusAfter.partial_drain_transition_count());
+  });
+}
+
+/*
+ * ODS visibility for partial drain: RibDC::recordPartialDrainTransition drives
+ * the fb303 state gauge (kRibIsPartialDrain, 1 when the device is partially
+ * drained, 0 otherwise) on every device-level flip (the 0<->1 boundary of
+ * drainedPrefixCount_). Crossing between one and many drained prefixes must NOT
+ * touch it, since the device-level state is unchanged. Everything runs on
+ * rib_->evb_ because ThreadCachedServiceData caches per thread and
+ * publishStats() only flushes the calling thread's buffer.
+ */
+TEST_F(RibFixture, PartialDrainOdsStateOnTransition) {
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    RibStats::initCounters();
+    auto* tcData = facebook::fb303::ThreadCachedServiceData::get();
+    tcData->publishStats();
+    ASSERT_EQ(0, tcData->getCounter(RibStats::kRibIsPartialDrain));
+
+    // false->true: first prefix drains, device enters partial drain (0->1).
+    EXPECT_TRUE(rib_->recordPartialDrainTransition(
+        /*oldIsPartialDrain=*/false, /*newIsPartialDrain=*/true));
+    tcData->publishStats();
+    EXPECT_EQ(1, tcData->getCounter(RibStats::kRibIsPartialDrain));
+
+    // A second prefix draining stays above the boundary: no device-level flip.
+    EXPECT_TRUE(rib_->recordPartialDrainTransition(false, true));
+    tcData->publishStats();
+    EXPECT_EQ(1, tcData->getCounter(RibStats::kRibIsPartialDrain));
+
+    // One of the two prefixes undrains: still drained, still no flip.
+    EXPECT_TRUE(rib_->recordPartialDrainTransition(true, false));
+    tcData->publishStats();
+    EXPECT_EQ(1, tcData->getCounter(RibStats::kRibIsPartialDrain));
+
+    // true->false: last prefix undrains, device leaves partial drain (1->0).
+    EXPECT_TRUE(rib_->recordPartialDrainTransition(true, false));
+    tcData->publishStats();
+    EXPECT_EQ(0, tcData->getCounter(RibStats::kRibIsPartialDrain));
+
+    /*
+     * false->true again after fully undraining: device re-enters partial drain
+     * (0->1). The gauge must flip back to 1, proving re-drain is observable on
+     * ODS just like the initial drain.
+     */
+    EXPECT_TRUE(rib_->recordPartialDrainTransition(false, true));
+    tcData->publishStats();
+    EXPECT_EQ(1, tcData->getCounter(RibStats::kRibIsPartialDrain));
   });
 }
 

@@ -754,6 +754,8 @@ void initCounters() {
 
   fb303::ThreadCachedServiceData::get()->setCounter(kRibPrefixCount, 0);
 
+  fb303::ThreadCachedServiceData::get()->setCounter(kRibIsPartialDrain, 0);
+
   fb303::ThreadCachedServiceData::get()->setCounter(
       kRibUnresolvableNexthopsCount, 0);
 
@@ -907,6 +909,11 @@ void incrRibPrefixCount() {
 
 void decrRibPrefixCount() {
   fb303::ThreadCachedServiceData::get()->incrementCounter(kRibPrefixCount, -1);
+}
+
+void setIsPartialDrain(bool isPartiallyDrained) {
+  fb303::ThreadCachedServiceData::get()->setCounter(
+      kRibIsPartialDrain, isPartiallyDrained ? 1 : 0);
 }
 
 void incrUnresolvableNexthopsCount() {

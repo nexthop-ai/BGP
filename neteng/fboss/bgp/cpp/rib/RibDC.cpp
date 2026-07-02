@@ -1363,6 +1363,12 @@ bool RibDC::recordPartialDrainTransition(
   /* Edge trigger: count crossed the zero boundary in either direction. */
   if (prevCount == 0 || drainedPrefixCount_ == 0) {
     ++partialDrainTransitionCount_;
+    /*
+     * Surface the flip on ODS: reflect the new device-level drain state in the
+     * gauge, so a true<->false flip is observable and alertable independent of
+     * the FSDB publish path.
+     */
+    RibStats::setIsPartialDrain(newIsPartialDrain);
   }
   return true;
 }
