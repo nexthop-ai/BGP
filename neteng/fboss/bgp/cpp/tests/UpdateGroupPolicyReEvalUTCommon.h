@@ -39,17 +39,16 @@
 
 #include "fboss/lib/CommonUtils.h"
 #include "neteng/fboss/bgp/cpp/BgpServiceBase.h"
+#include "neteng/fboss/bgp/cpp/BgpServiceUtil.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/ChangeTracker.h"
 #include "neteng/fboss/bgp/cpp/changeTracker/TrackableObject.h"
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
-#include "neteng/fboss/bgp/cpp/facebook/BgpServiceBB.h"
+#include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/lib/fibers/FiberBgpPeerManager.h"
 #include "neteng/fboss/bgp/cpp/peer/SessionManager.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
-#include "neteng/fboss/bgp/cpp/rib/RibBase.h"
 #include "neteng/fboss/bgp/cpp/tests/PeerManagerTestUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
-#include "neteng/fboss/bgp/cpp/watchdog/Watchdog.h"
 
 namespace facebook::bgp {
 
@@ -70,6 +69,66 @@ inline constexpr auto kPNamePermitAll = "permit-all-continue";
 /* ---- Route parameterization constants ---- */
 inline constexpr int kRouteCount = 100;
 inline constexpr int kAttrSetCount = 10;
+
+/* ---- Partial route-publish batch sizes (subset of kRouteCount) ---- */
+// First batch, large enough to fill a blocking peer's queue and detach it.
+inline constexpr int kDetachTriggerBatch = 20;
+// Follow-up batch (DSP) that advances the group past the detached peer.
+inline constexpr int kGroupAdvanceBatch = 12;
+// Rounds of drain-then-publish used to advance the group's changelist marker.
+inline constexpr int kGroupAdvanceRounds = 5;
+
+/* ---- Bounded out-queue sizing ---- */
+// Large default out-queue: peers never block under normal test load.
+inline constexpr size_t kDefaultOutQueueCapacity = 1000;
+inline constexpr size_t kDefaultOutQueueHighWm = 800;
+inline constexpr size_t kDefaultOutQueueLowWm = 50;
+// Small out-queue capacity used to make a peer block after a few routes.
+inline constexpr size_t kBlockingOutQueueCapacity = 10;
+
+/* ---- Blocking-queue watermarks (capacity kBlockingOutQueueCapacity) ----
+ * A "target" peer gets a lower high-watermark than its "blocker" so it blocks
+ * first and is the one detached.
+ */
+// blockGroupViaPeerOnEvb: single blocked peer.
+inline constexpr size_t kBlockGroupHighWm = 8;
+inline constexpr size_t kBlockGroupLowWm = 2;
+// triggerDetachedBlockedFromDetachedOnEvb.
+inline constexpr size_t kDetachFromDetachedTargetHighWm = 7;
+inline constexpr size_t kDetachFromDetachedBlockerHighWm = 8;
+inline constexpr size_t kDetachFromDetachedLowWm = 2;
+// triggerPeerDetachedReadyToJoinOnEvb.
+inline constexpr size_t kReadyToJoinTargetHighWm = 6;
+inline constexpr size_t kReadyToJoinBlockerHighWm = 7;
+inline constexpr size_t kReadyToJoinLowWm = 0;
+// DSP blocker: larger queue so it doesn't block on the first batch.
+inline constexpr size_t kDspBlockerCapacity = 20;
+inline constexpr size_t kDspBlockerHighWm = 12;
+// triggerDetachedBlockedFromJoinedOnEvb: tiny queue pre-filled to force block.
+inline constexpr size_t kFillQueueCapacity = 3;
+inline constexpr size_t kFillQueueHighWm = 2;
+inline constexpr size_t kFillQueueLowWm = 1;
+// triggerDetachedInitDump: out-queue for the re-established peer.
+inline constexpr size_t kInitDumpQueueCapacity = 100;
+inline constexpr size_t kInitDumpQueueHighWm = 80;
+inline constexpr size_t kInitDumpQueueLowWm = 10;
+
+/* ---- Slow-peer detection thresholds ---- */
+/*
+ * Sentinels large enough that the corresponding trigger effectively never
+ * fires.
+ */
+inline constexpr auto kSlowPeerTimeNever = std::chrono::milliseconds(50000000);
+inline constexpr int kSlowPeerBlockCountNever = 100000;
+inline constexpr auto kSlowPeerBlockWindowNever =
+    std::chrono::milliseconds(50000000);
+// Standard finite block-count window.
+inline constexpr auto kSlowPeerBlockWindow = std::chrono::milliseconds(60000);
+// Lenient (finite) time threshold used when isolating frequency-based detach.
+inline constexpr auto kSlowPeerTimeLenient = std::chrono::milliseconds(600000);
+// Detach on the first block (frequency) / almost immediately (duration).
+inline constexpr int kSlowPeerBlockCountImmediate = 1;
+inline constexpr auto kSlowPeerTimeImmediate = std::chrono::milliseconds(1);
 
 class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
  protected:
@@ -160,7 +219,10 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     adjRib->peeringParams_.peerGroupName = peerGroupName;
     adjRib->adjRibOutQueue_ = std::make_shared<AdjRib::AdjRibOutQueueT>();
     adjRib->boundedAdjRibOutQueue_ =
-        std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(1000, 800, 50);
+        std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
+            kDefaultOutQueueCapacity,
+            kDefaultOutQueueHighWm,
+            kDefaultOutQueueLowWm);
     adjRib->pathIdGenerator_ = std::make_unique<PathIdGenerator>(false);
     adjRib->enableEgressQueueBackpressure(true);
     adjRib->isAfiIpv4Negotiated_ = true;
@@ -409,14 +471,18 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
 
     evb.runInEventBaseThreadAndWait([&]() {
       auto& adjRib = ctx.adjRibs.at(blockedPeerId);
-      resizePeerQueue(adjRib, 10, 8, 2);
+      resizePeerQueue(
+          adjRib,
+          kBlockingOutQueueCapacity,
+          kBlockGroupHighWm,
+          kBlockGroupLowWm);
 
       auto group = adjRib->getUpdateGroup();
       UpdateGroupConfig cfg;
       cfg.allowSlowPeerDetach = true;
-      cfg.slowPeerTimeThreshold = std::chrono::milliseconds(50000000);
-      cfg.slowPeerBlockCountThreshold = 100000;
-      cfg.slowPeerBlockCountWindow = std::chrono::milliseconds(50000000);
+      cfg.slowPeerTimeThreshold = kSlowPeerTimeNever;
+      cfg.slowPeerBlockCountThreshold = kSlowPeerBlockCountNever;
+      cfg.slowPeerBlockCountWindow = kSlowPeerBlockWindowNever;
       group->setUpdateGroupConfigForTesting(cfg);
     });
   }
@@ -460,23 +526,27 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
       UpdateGroupConfig cfg;
       cfg.allowSlowPeerDetach = true;
       if (useBlockFrequency) {
-        cfg.slowPeerTimeThreshold = std::chrono::milliseconds(600000);
-        cfg.slowPeerBlockCountThreshold = 1;
-        cfg.slowPeerBlockCountWindow = std::chrono::milliseconds(60000);
+        cfg.slowPeerTimeThreshold = kSlowPeerTimeLenient;
+        cfg.slowPeerBlockCountThreshold = kSlowPeerBlockCountImmediate;
+        cfg.slowPeerBlockCountWindow = kSlowPeerBlockWindow;
       } else {
-        cfg.slowPeerTimeThreshold = std::chrono::milliseconds(1);
-        cfg.slowPeerBlockCountThreshold = 100000;
-        cfg.slowPeerBlockCountWindow = std::chrono::milliseconds(60000);
+        cfg.slowPeerTimeThreshold = kSlowPeerTimeImmediate;
+        cfg.slowPeerBlockCountThreshold = kSlowPeerBlockCountNever;
+        cfg.slowPeerBlockCountWindow = kSlowPeerBlockWindow;
       }
       group->setUpdateGroupConfigForTesting(cfg);
 
-      auto smallQueue =
-          std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(3, 2, 1);
+      /*
+       * Tiny queue pre-filled past its high-watermark to force the blocked
+       * state: push kFillQueueHighWm messages into a kFillQueueCapacity queue.
+       */
+      auto smallQueue = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
+          kFillQueueCapacity, kFillQueueHighWm, kFillQueueLowWm);
       targetAdjRib->boundedAdjRibOutQueue_ = smallQueue;
 
       nettools::bgplib::FiberBgpPeer::InputMessageT dummyMsg{
           nettools::bgplib::BgpEndOfRib{}};
-      for (int i = 0; i < 2; ++i) {
+      for (size_t i = 0; i < kFillQueueHighWm; ++i) {
         smallQueue->push(
             std::optional<nettools::bgplib::FiberBgpPeer::InputMessageT>(
                 dummyMsg));
@@ -529,18 +599,28 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
       auto group = ctx.adjRibs.at(targetPeerId)->getUpdateGroup();
       UpdateGroupConfig cfg;
       cfg.allowSlowPeerDetach = true;
-      cfg.slowPeerTimeThreshold = std::chrono::milliseconds(50000000);
-      cfg.slowPeerBlockCountThreshold = 1;
-      cfg.slowPeerBlockCountWindow = std::chrono::milliseconds(60000);
+      cfg.slowPeerTimeThreshold = kSlowPeerTimeNever;
+      cfg.slowPeerBlockCountThreshold = kSlowPeerBlockCountImmediate;
+      cfg.slowPeerBlockCountWindow = kSlowPeerBlockWindow;
       group->setUpdateGroupConfigForTesting(cfg);
 
-      resizePeerQueue(ctx.adjRibs.at(targetPeerId), 10, 7, 2);
-      resizePeerQueue(ctx.adjRibs.at(blockerPeerId), 10, 8, 2);
+      // Target's high-watermark is below the blocker's so it blocks first.
+      resizePeerQueue(
+          ctx.adjRibs.at(targetPeerId),
+          kBlockingOutQueueCapacity,
+          kDetachFromDetachedTargetHighWm,
+          kDetachFromDetachedLowWm);
+      resizePeerQueue(
+          ctx.adjRibs.at(blockerPeerId),
+          kBlockingOutQueueCapacity,
+          kDetachFromDetachedBlockerHighWm,
+          kDetachFromDetachedLowWm);
     });
 
     // Step 2: Publish routes to trigger detachment.
-    publishRouteUpdates(
-        ctx, /*isInitialDump=*/false, [](int i) { return i < 20; });
+    publishRouteUpdates(ctx, /*isInitialDump=*/false, [](int i) {
+      return i < kDetachTriggerBatch;
+    });
     expectEventualStateOnEvb(
         ctx, targetPeerId, PeerUpdateState::DETACHED_BLOCKED);
 
@@ -561,7 +641,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
      * frozen at its marker because its queue is full, so the gap between its
      * marker and the group's keeps growing.
      */
-    for (int round = 0; round < 5; ++round) {
+    for (int round = 0; round < kGroupAdvanceRounds; ++round) {
       drainQueue(ctx, blockerPeerId);
       publishRouteUpdates(ctx, /*isInitialDump=*/false);
     }
@@ -631,22 +711,34 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
       auto group = ctx.adjRibs.at(targetPeerId)->getUpdateGroup();
       UpdateGroupConfig cfg;
       cfg.allowSlowPeerDetach = true;
-      cfg.slowPeerTimeThreshold = std::chrono::milliseconds(50000000);
-      cfg.slowPeerBlockCountThreshold = 1;
-      cfg.slowPeerBlockCountWindow = std::chrono::milliseconds(60000);
+      cfg.slowPeerTimeThreshold = kSlowPeerTimeNever;
+      cfg.slowPeerBlockCountThreshold = kSlowPeerBlockCountImmediate;
+      cfg.slowPeerBlockCountWindow = kSlowPeerBlockWindow;
       group->setUpdateGroupConfigForTesting(cfg);
 
-      // Target: hiWm=6 so it blocks before the blocker (hiWm=7)
-      resizePeerQueue(ctx.adjRibs.at(targetPeerId), 10, 6, 0);
+      // Target's high-watermark is below the blocker's so it blocks first.
+      resizePeerQueue(
+          ctx.adjRibs.at(targetPeerId),
+          kBlockingOutQueueCapacity,
+          kReadyToJoinTargetHighWm,
+          kReadyToJoinLowWm);
       if (isDFP) {
-        resizePeerQueue(ctx.adjRibs.at(blockerPeerId), 10, 7, 0);
+        resizePeerQueue(
+            ctx.adjRibs.at(blockerPeerId),
+            kBlockingOutQueueCapacity,
+            kReadyToJoinBlockerHighWm,
+            kReadyToJoinLowWm);
       } else {
         /*
          * DSP: blocker needs a larger queue so it doesn't block on
          * the first batch, allowing the group to advance on the CL
          * before blocking on the second batch.
          */
-        resizePeerQueue(ctx.adjRibs.at(blockerPeerId), 20, 12, 0);
+        resizePeerQueue(
+            ctx.adjRibs.at(blockerPeerId),
+            kDspBlockerCapacity,
+            kDspBlockerHighWm,
+            kReadyToJoinLowWm);
       }
     });
 
@@ -654,8 +746,9 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
      * Step 2: Publish routes to trigger distribution.
      * Target peer blocks → frequency detach → DETACHED_BLOCKED.
      */
-    publishRouteUpdates(
-        ctx, /*isInitialDump=*/false, [](int i) { return i < 20; });
+    publishRouteUpdates(ctx, /*isInitialDump=*/false, [](int i) {
+      return i < kDetachTriggerBatch;
+    });
 
     expectEventualStateOnEvb(
         ctx, targetPeerId, PeerUpdateState::DETACHED_BLOCKED);
@@ -666,8 +759,9 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
      * proceeding, so the group has fully processed the new routes.
      */
     if (!isDFP) {
-      publishRouteUpdates(
-          ctx, /*isInitialDump=*/false, [](int i) { return i < 12; });
+      publishRouteUpdates(ctx, /*isInitialDump=*/false, [](int i) {
+        return i < kGroupAdvanceBatch;
+      });
       expectEventualStateOnEvb(
           ctx, blockerPeerId, PeerUpdateState::JOINED_BLOCKED);
     }
@@ -717,7 +811,12 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     expectEventualStateOnEvb(ctx, peerId, PeerUpdateState::DOWN);
 
     ctx.peerMgr->testOnlySetDeferInitDump(peerId.peerAddr, true);
-    triggerPeerUpOnEvb(ctx, peerId, 100, 80, 10);
+    triggerPeerUpOnEvb(
+        ctx,
+        peerId,
+        kInitDumpQueueCapacity,
+        kInitDumpQueueHighWm,
+        kInitDumpQueueLowWm);
 
     /*
      * sessionEstablished creates a new AdjRib. Refresh ctx.adjRibs
@@ -759,9 +858,9 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   void triggerPeerUpOnEvb(
       TestContext& ctx,
       const BgpPeerId& peerId,
-      int queueCapacity = 1000,
-      int queueHighWm = 800,
-      int queueLowWm = 50) {
+      int queueCapacity = kDefaultOutQueueCapacity,
+      int queueHighWm = kDefaultOutQueueHighWm,
+      int queueLowWm = kDefaultOutQueueLowWm) {
     auto adjRibOutQ = std::make_shared<AdjRib::AdjRibOutQueueT>();
     auto boundedAdjRibOutQ = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
         queueCapacity, queueHighWm, queueLowWm);
@@ -796,21 +895,19 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
-   * Construct an ad-hoc BgpServiceBB for driving the policy RPCs in tests. The
-   * RibBase/Watchdog references are placeholders that the policy RPCs never
-   * touch (they only use peerMgr_ and configManager_).
+   * Resolve the effective per-peer policies for the peers selected by `filter`
+   * from `newConfig` and apply them through PeerManager. This mirrors the body
+   * of the BgpServiceBB policy RPCs (config update -> resolveEffectivePeer-
+   * Policies -> updateIngressEgressPolicyNames) without calling the generated
+   * Thrift handler methods directly.
    */
-  std::shared_ptr<BgpServiceBB> makeBgpServiceBB(TestContext& ctx) {
-    static std::aligned_storage_t<sizeof(RibBase), alignof(RibBase)> ribBuf;
-    static std::aligned_storage_t<sizeof(Watchdog), alignof(Watchdog)>
-        watchdogBuf;
-    return std::make_shared<BgpServiceBB>(
-        *ctx.peerMgr,
-        ctx.configMgr,
-        reinterpret_cast<RibBase&>(ribBuf),
-        reinterpret_cast<Watchdog&>(watchdogBuf),
-        /*nlWrapper=*/nullptr,
-        /*enable_thrift_protection=*/false);
+  void applyResolvedPeerPolicies(
+      TestContext& ctx,
+      const std::shared_ptr<const Config>& newConfig,
+      const std::function<bool(const folly::IPAddress&, const BgpPeerConfig&)>&
+          filter) {
+    ctx.peerMgr->updateIngressEgressPolicyNames(
+        resolveEffectivePeerPolicies(*newConfig, filter));
   }
 
   /*
@@ -830,31 +927,25 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
-   * Install a per-peer egress policy override via
-   * BgpServiceBB::co_setPeersPolicy (peerOverride becomes true). This updates
-   * the config and pushes the resolved egress name onto the AdjRib's
+   * Install a per-peer egress policy override (peerOverride becomes true). This
+   * updates the config and pushes the resolved egress name onto the AdjRib's
    * egressPolicyName_.
    */
   void updatePeerEgressPolicyOnEvb(
       TestContext& ctx,
       const BgpPeerId& peerId,
       const std::string& newPolicyName) {
-    auto bgpService = makeBgpServiceBB(ctx);
-    auto peersPolicy = std::make_unique<
-        std::map<std::string, std::map<bgp_policy::DIRECTION, std::string>>>();
-    (*peersPolicy)[peerId.peerAddr.str()][bgp_policy::DIRECTION::OUT] =
+    std::map<std::string, std::map<bgp_policy::DIRECTION, std::string>>
+        peersPolicy;
+    peersPolicy[peerId.peerAddr.str()][bgp_policy::DIRECTION::OUT] =
         newPolicyName;
-    /*
-     * BgpServiceBB implements the coroutine variant (co_setPeersPolicy); the
-     * sync setPeersPolicy is the unimplemented generated stub. Drive the coro
-     * on the peer manager's evb, blocking the test thread for the result.
-     */
-    auto& evb = ctx.peerMgr->getEventBase();
-    auto result = folly::coro::blockingWait(
-        bgpService->co_setPeersPolicy(std::move(peersPolicy)).scheduleOn(&evb));
-    ASSERT_EQ(
-        result,
-        neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    auto newConfig = ctx.configMgr->updatePeerPolicies(peersPolicy);
+    applyResolvedPeerPolicies(
+        ctx,
+        newConfig,
+        [&](const folly::IPAddress& peerAddr, const BgpPeerConfig&) {
+          return peersPolicy.contains(peerAddr.str());
+        });
     /*
      * co_setPeersPolicy applies egressPolicyName_ via an async lambda posted by
      * updateIngressEgressPolicyNames, which is version-gated. Flush the evb so
@@ -867,8 +958,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
-   * Change a peer group's egress policy via
-   * BgpServiceBB::co_setPeerGroupsPolicy (a peer-group-level, non-override
+   * Change a peer group's egress policy (a peer-group-level, non-override
    * change). This updates the config and pushes the resolved egress name onto
    * every member AdjRib's egressPolicyName_, leaving peerOverride false since
    * no per-peer override is installed.
@@ -877,18 +967,17 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
       TestContext& ctx,
       const std::string& peerGroupName,
       const std::string& newPolicyName) {
-    auto bgpService = makeBgpServiceBB(ctx);
-    auto peerGroupsPolicy = std::make_unique<
-        std::map<std::string, std::map<bgp_policy::DIRECTION, std::string>>>();
-    (*peerGroupsPolicy)[peerGroupName][bgp_policy::DIRECTION::OUT] =
-        newPolicyName;
-    auto& evb = ctx.peerMgr->getEventBase();
-    auto result = folly::coro::blockingWait(
-        bgpService->co_setPeerGroupsPolicy(std::move(peerGroupsPolicy))
-            .scheduleOn(&evb));
-    ASSERT_EQ(
-        result,
-        neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    std::map<std::string, std::map<bgp_policy::DIRECTION, std::string>>
+        peerGroupsPolicy;
+    peerGroupsPolicy[peerGroupName][bgp_policy::DIRECTION::OUT] = newPolicyName;
+    auto newConfig = ctx.configMgr->updatePeerGroupPolicies(peerGroupsPolicy);
+    applyResolvedPeerPolicies(
+        ctx,
+        newConfig,
+        [&](const folly::IPAddress&, const BgpPeerConfig& peerConfig) {
+          const auto& pgName = peerConfig.commonPeerGroupConfig.peerGroupName;
+          return pgName.has_value() && peerGroupsPolicy.contains(*pgName);
+        });
     /*
      * Flush this call's version-gated apply before the next call; see
      * updatePeerEgressPolicyOnEvb.
@@ -898,22 +987,20 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
 
   /*
    * Remove the per-peer egress policy override so the peer falls back to its
-   * peer-group policy (peerOverride becomes false). setPeersPolicy installs a
-   * per-peer override even when the name matches the group's, so unsetting is
-   * the only way to clear the override.
+   * peer-group policy (peerOverride becomes false). A per-peer override is
+   * installed even when the name matches the group's, so unsetting is the only
+   * way to clear the override.
    */
   void unsetPeerEgressPolicyOnEvb(TestContext& ctx, const BgpPeerId& peerId) {
-    auto bgpService = makeBgpServiceBB(ctx);
-    auto peersToUnset = std::make_unique<
-        std::map<std::string, std::set<bgp_policy::DIRECTION>>>();
-    (*peersToUnset)[peerId.peerAddr.str()].insert(bgp_policy::DIRECTION::OUT);
-    auto& evb = ctx.peerMgr->getEventBase();
-    auto result = folly::coro::blockingWait(
-        bgpService->co_unsetPeersPolicy(std::move(peersToUnset))
-            .scheduleOn(&evb));
-    ASSERT_EQ(
-        result,
-        neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    std::map<std::string, std::set<bgp_policy::DIRECTION>> peersToUnset;
+    peersToUnset[peerId.peerAddr.str()].insert(bgp_policy::DIRECTION::OUT);
+    auto newConfig = ctx.configMgr->unsetPeerPolicies(peersToUnset);
+    applyResolvedPeerPolicies(
+        ctx,
+        newConfig,
+        [&](const folly::IPAddress& peerAddr, const BgpPeerConfig&) {
+          return peersToUnset.count(peerAddr.str()) > 0;
+        });
     /*
      * Flush this call's version-gated apply before the next call; see
      * updatePeerEgressPolicyOnEvb.
@@ -964,11 +1051,11 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
-   * Apply a peer-group-level (non-override) egress change covering peerId via
-   * BgpServiceBB::co_setPeerGroupsPolicy, then rebuild peerId's UpdateGroupKey.
-   * Because this changes the peer group's egress (not a per-peer override),
-   * peerOverride stays false. Note this changes the egress for the whole peer
-   * group; callers rebuild each member's key as needed.
+   * Apply a peer-group-level (non-override) egress change covering peerId, then
+   * rebuild peerId's UpdateGroupKey. Because this changes the peer group's
+   * egress (not a per-peer override), peerOverride stays false. Note this
+   * changes the egress for the whole peer group; callers rebuild each member's
+   * key as needed.
    */
   void setNonOverrideEgressAndRebuildKeyOnEvb(
       TestContext& ctx,
@@ -1579,12 +1666,12 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     auto sessionMgrThread = sessionMgr->runInThread();
 
     TestContext ctx{
-        peerMgr,
-        sessionMgr,
-        configManager,
-        std::move(adjRibs),
-        std::move(peerMgrThread),
-        std::move(sessionMgrThread)};
+        .peerMgr = peerMgr,
+        .sessionMgr = sessionMgr,
+        .configMgr = configManager,
+        .adjRibs = std::move(adjRibs),
+        .peerMgrThread = std::move(peerMgrThread),
+        .sessionMgrThread = std::move(sessionMgrThread)};
 
     if (initialDumpCompleted) {
       publishRouteUpdates(ctx);
@@ -1613,9 +1700,8 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
      * Task awaits scope/timer work bound to it.
      */
     for (const auto& group : groups) {
-      folly::coro::blockingWait(
-          group->buildAndScheduleSendInitialDumpFromShadowRib().scheduleOn(
-              &evb));
+      folly::coro::blockingWait(co_withExecutor(
+          &evb, group->buildAndScheduleSendInitialDumpFromShadowRib()));
     }
   }
 
