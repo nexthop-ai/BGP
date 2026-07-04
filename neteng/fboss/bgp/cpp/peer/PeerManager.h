@@ -545,9 +545,10 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
       size_t egressAffectedCount,
       PolicyChangeScope scope);
 
-  // Helper method to send RibDumpReq for peers when egress route
-  // filter/routing policy is updated
-  void sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope);
+  // Handle an egress route filter/routing policy update: schedule egress
+  // policy re-evaluation for affected update groups (or per-peer re-evaluation
+  // when update groups are disabled).
+  void handleEgressPolicyUpdate(PolicyChangeScope scope);
 
   // Collect update groups with pending egress policy re-evaluation
   folly::F14NodeSet<std::shared_ptr<AdjRibOutGroup>>
@@ -562,8 +563,20 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
   // Schedule per-peer egress policy re-evaluation (non-update-group mode)
   void schedulePolicyReEvalForAdjRibs();
 
-  // Orchestrate group-level + detached peer egress policy re-evaluation
-  folly::coro::Task<void> processGroupEgressPolicyReEvaluation(
+  /*
+   * Fleet-wide egress policy re-evaluation for update groups. Rebuilds the
+   * UpdateGroupKey of every affected group's members, then reconciles group
+   * membership in one pass: re-keys in-place groups whose shared (non-override)
+   * key changed, and moves/splits per-peer override peers into the group
+   * matching their new key, scheduling the necessary group/detached RIB walks.
+   */
+  folly::coro::Task<void> processUpdateGroupsEgressPolicyReevaluation();
+
+  /*
+   * Orchestrate group-level + detached peer egress policy re-evaluation.
+   * Runs synchronously (no suspension points).
+   */
+  void processGroupEgressPolicyReEvaluation(
       std::shared_ptr<AdjRibOutGroup> group);
 
   /*

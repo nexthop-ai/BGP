@@ -3945,15 +3945,217 @@ void PeerManager::schedulePolicyReEvalForAdjRibs() {
   }
 }
 
-void PeerManager::sendRibDumpReqForEgressPolicyUpdate(PolicyChangeScope scope) {
-  XLOGF(
-      INFO, "sendRibDumpReqForEgressPolicyUpdate called with scope {}", scope);
+folly::coro::Task<void>
+PeerManager::processUpdateGroupsEgressPolicyReevaluation() {
+  /*
+   * Always clear the scheduled flag on exit -- normal completion, cancellation,
+   * or an exception from any step below. Leaving it set would make
+   * handleEgressPolicyUpdate reject all future re-evaluations for
+   * the rest of the process lifetime.
+   */
+  SCOPE_EXIT {
+    egressPolicyUpdateForUpdateGroupsScheduled_ = false;
+  };
+
+  auto cancelToken = co_await folly::coro::co_current_cancellation_token;
+  if (cancelToken.isCancellationRequested()) {
+    co_return;
+  }
+
+  /*
+   * 1. Rebuild every peer's UpdateGroupKey and, in the same pass, bucket each
+   * peer whose rebuilt key no longer matches its group's key by
+   * target key and source group:
+   *   targetKey -> {
+   *     { sourceGroup1 -> [adjRibsToMoveFrom1] },
+   *     { sourceGroup2 -> [adjRibsToMoveFrom2] },
+   *     ...
+   *   }
+   * Nothing moves physically here.
+   */
+  folly::F14FastMap<
+      UpdateGroupKey,
+      folly::F14FastMap<
+          std::shared_ptr<AdjRibOutGroup>,
+          std::vector<std::shared_ptr<AdjRib>>,
+          std::hash<std::shared_ptr<AdjRibOutGroup>>>,
+      UpdateGroupKeyHash>
+      newKeyToSourceGroups;
+  folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>> sourceGroups;
+  for (const auto& [peerId, adjRib] : adjRibs_) {
+    adjRib->buildAndSetUpdateGroupKey();
+    const auto& group = adjRib->getUpdateGroup();
+    if (!group) {
+      continue;
+    }
+    const auto& key = adjRib->getUpdateGroupKey();
+    if (!(key == group->getGroupKey())) {
+      newKeyToSourceGroups[key][group].push_back(adjRib);
+      sourceGroups.insert(group);
+    }
+  }
+
+  /*
+   * 2. Reconcile each target key's new members. The subset of members
+   * being moved from old group into new group MAY or MAY NOT require an egress
+   * policy change if the name changed between old and new group.
+   *
+   * There are two scenarios for a targetKey.
+   *   (1) A group already exists with that targetKey.
+   *   (2) A group does NOT exist with that targetKey.
+   *
+   * In case (1), we can detach and move the peers from their sourceGroups,
+   * and re-evaluate policy (RIB walk) for each individual peer if needed.
+   *
+   * In case (2), we now have a set of
+   *     { sourceGroup1 -> [adjRibsToMoveFrom1] },
+   *     { sourceGroup2 -> [adjRibsToMoveFrom2] },
+   *     ...
+   *
+   * We should pick one of these groups as the base container,
+   * and detach + move all other adjRibs into that container.
+   *
+   * There are two APIs provided from AdjRibGroup to extract peers
+   * from itself to a new group container; splitToNewGroup and movePeers.
+   * There is also an API that moves the entire group to a new key
+   * without touching the peers, UpdateGroupManager::rekeyGroup.
+   *
+   * The selection for the base container is described below given the existing
+   * APIs.
+   *
+   * We prefer the group with the highest number of in sync peers to preserve
+   * the peers that are already moving in unison.
+   *
+   * If that group should extract all of its peers, then we can use rekeyGroup
+   * to do O(1) membership change for all peers.
+   * Otherwise, create a new group container and use splitToGroup to
+   * copy the peer states of the oldGroup to that new container.
+   *
+   * Once we have created a baseGroup, then we reduce the rest of case (2) to
+   * case (1).
+   */
+  for (auto& [newKey, adjRibsToMoveFromSource] : newKeyToSourceGroups) {
+    auto targetGroup = updateGroupManager_->getGroup(newKey);
+    std::shared_ptr<AdjRibOutGroup> baseGroup;
+
+    /* Case (2), a group did not exist for this key. */
+    if (!targetGroup) {
+      size_t mostInSync = 0;
+      /* Pick the group with the most in sync peers to keep them in unison. */
+      for (const auto& [sourceGroup, adjRibsToMove] : adjRibsToMoveFromSource) {
+        const auto inSync = sourceGroup->getNumInSyncPeers();
+        if (!baseGroup || inSync > mostInSync) {
+          mostInSync = inSync;
+          baseGroup = sourceGroup;
+        }
+      }
+      /*
+       * Use this group as the basis for the new container which will receive
+       * all other moving adjRibs.
+       */
+      const auto& adjRibsFromBaseGroup = adjRibsToMoveFromSource.at(baseGroup);
+      const bool baseGroupNeedsPolicyReEval =
+          baseGroup->getGroupKey().egressPolicyName != newKey.egressPolicyName;
+      if (adjRibsFromBaseGroup.size() == baseGroup->getMemberCount()) {
+        /*
+         * If the entire group needs to move, we can directly rekey the group
+         * with no copying.
+         */
+        updateGroupManager_->rekeyGroup(baseGroup, newKey);
+        targetGroup = baseGroup;
+      } else {
+        /*
+         * Only part of the group moves; copy the state of the group and
+         * split the moving adjRibs into a newly created group container.
+         */
+        targetGroup = updateGroupManager_->findOrCreateGroup(newKey);
+        baseGroup->splitToNewGroup(targetGroup, adjRibsFromBaseGroup);
+      }
+      /*
+       * If the egress policy changed, we need to update the RIB-OUT to
+       * the new policy for this set of peers.
+       *
+       * Not all adjRibs being moved into the group might require egress policy
+       * update, so we must evaluate the situation per set of
+       * <oldGroup, adjRibsToMove>.
+       */
+      if (baseGroupNeedsPolicyReEval) {
+        processGroupEgressPolicyReEvaluation(targetGroup);
+      }
+    }
+
+    /* Case (1), and fall-through handling from case (2). */
+    for (const auto& [sourceGroup, adjRibsToMove] : adjRibsToMoveFromSource) {
+      if (sourceGroup == baseGroup || sourceGroup == targetGroup) {
+        /*
+         * Nothing needed if the adjRibs are in the target group already.
+         * The baseGroup comparison is because we already moved the
+         * adjRibs to the targetGroup, and do not need to do anything on the
+         * baseGroup.
+         */
+        continue;
+      }
+
+      /*
+       * Detach the peers and move their materialized RIB-OUTs and states
+       * to the targetGroup.
+       */
+      sourceGroup->detachPeers(
+          adjRibsToMove, AdjRibOutGroup::DetachReason::Policy);
+      sourceGroup->movePeers(adjRibsToMove, targetGroup);
+
+      /*
+       * Check if this set of peers needs policy re-evaluation and trigger
+       * re-evaluation (i.e. updating the RIB-OUT with the new policy for
+       * items not on the changelist).
+       */
+      if (sourceGroup->getGroupKey().egressPolicyName !=
+          newKey.egressPolicyName) {
+        /* Trigger policy re-evaluation if needed on this set of AdjRibs. */
+        for (const auto& adjRib : adjRibsToMove) {
+          if (isRibDumpScheduledForAdjRib(adjRib)) {
+            XLOGF(
+                DBG1,
+                "Peer {}: cancelling scheduled rib dump before policy re-eval dump",
+                adjRib->getPeerName());
+            cancelRibDumpForAdjRib(adjRib);
+          }
+          processRibDumpReq(adjRib, adjRib->sendAddPath());
+          adjRib->clearPendingEgressPolicyUpdate();
+        }
+      }
+    }
+  }
+
+  /*
+   * 3. Destroy any source group emptied by the moves.
+   */
+  folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>> emptiedOldGroups;
+  for (const auto& group : sourceGroups) {
+    if (group->getMemberCount() == 0) {
+      emptiedOldGroups.insert(group);
+    }
+  }
+  co_await updateGroupManager_->maybeDestroyUpdateGroups(emptiedOldGroups);
+
+  co_return;
+}
+
+void PeerManager::handleEgressPolicyUpdate(PolicyChangeScope scope) {
+  XLOGF(INFO, "handleEgressPolicyUpdate called with scope {}", scope);
   if (enableUpdateGroup_) {
-    egressPolicyUpdateForUpdateGroupsScheduled_ = true;
-    if (scope == PolicyChangeScope::PEER_GROUP) {
-      schedulePolicyReEvalForPendingGroups();
-    } else if (scope == PolicyChangeScope::PEER) {
-      schedulePolicyReEvalForGroupAdjRibs();
+    /*
+     * egressPolicyUpdateForUpdateGroupsScheduled_ stays true while a
+     * re-evaluation is scheduled or in flight on asyncScope_, so concurrent
+     * policy updates don't double-schedule. The coro clears the flag on
+     * completion.
+     */
+    if ((scope == PolicyChangeScope::PEER_GROUP ||
+         scope == PolicyChangeScope::PEER) &&
+        !egressPolicyUpdateForUpdateGroupsScheduled_) {
+      egressPolicyUpdateForUpdateGroupsScheduled_ = true;
+      asyncScope_.add(co_withExecutor(
+          &evb_, processUpdateGroupsEgressPolicyReevaluation()));
     }
   } else {
     schedulePolicyReEvalForAdjRibs();
@@ -4060,7 +4262,7 @@ PeerManager::processGroupEgressPolicyReEvaluationWithCancellationCoro(
     }
   };
 
-  co_await processGroupEgressPolicyReEvaluation(group);
+  processGroupEgressPolicyReEvaluation(group);
   co_return;
 }
 
@@ -4081,7 +4283,7 @@ void PeerManager::scheduleGroupEgressPolicyReEvaluation(
       group->getCancellationTokenForNewEgressPolicyReEvaluation());
 }
 
-folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
+void PeerManager::processGroupEgressPolicyReEvaluation(
     std::shared_ptr<AdjRibOutGroup> group) {
   [[maybe_unused]] ScopedProfile profile(
       "PeerManager::processGroupEgressPolicyReEvaluation");
@@ -4138,8 +4340,6 @@ folly::coro::Task<void> PeerManager::processGroupEgressPolicyReEvaluation(
       INFO,
       "Group {}: Group egress policy re-evaluation complete",
       group->getAdjRibGroupName());
-
-  co_return;
 }
 
 folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
@@ -4177,10 +4377,21 @@ folly::coro::Task<void> PeerManager::processIngressAndEgressRouteFilterUpdate(
   if (egressAffectedCount > 0) {
     XLOGF(
         INFO,
-        "Sending RibDumpReq for {} egress affected adjribs",
+        "Handling egress policy update for {} egress affected adjribs",
         egressAffectedCount);
 
-    sendRibDumpReqForEgressPolicyUpdate(scope);
+    /*
+     * Only the non-update-group path actually sends RibDumpReqs; with update
+     * groups enabled we schedule egress policy re-evaluation instead.
+     */
+    if (!enableUpdateGroup_) {
+      XLOGF(
+          INFO,
+          "Sending RibDumpReq for {} egress affected adjribs",
+          egressAffectedCount);
+    }
+
+    handleEgressPolicyUpdate(scope);
   }
 
   co_return;

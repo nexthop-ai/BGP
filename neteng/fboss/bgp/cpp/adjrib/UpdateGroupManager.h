@@ -60,7 +60,7 @@ class UpdateGroupManager {
   /*
    * @brief: find or create an update group for the given key.
    * @param: update group key
-   * @return: shared_ptr of the existing group, or the newly created one.
+   * @return: the existing or newly created group for the key.
    */
   std::shared_ptr<AdjRibOutGroup> findOrCreateGroup(const UpdateGroupKey& key);
 

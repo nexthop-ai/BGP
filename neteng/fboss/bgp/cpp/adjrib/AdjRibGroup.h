@@ -843,6 +843,24 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       DetachReason reason) noexcept;
 
   /*
+   * Detach a set of peers in the group. Detaching gives each in-sync member
+   * sets the detachedRibVersion and creates the peer's own change-list
+   * consumer so that it can run independent processing. The detachedRibVersion
+   * being explicitly set allows us to know which entries the peer is
+   * sharing with the group.
+   *
+   * The usage of this API is currently for detachment before
+   * moving peers to another group.
+   *
+   * Members already in a DETACHED_* state are skipped, since detachPeer is not
+   * idempotent (it would re-clone the packing list and re-register
+   * the consumer).
+   */
+  void detachPeers(
+      const std::vector<std::shared_ptr<AdjRib>>& peers,
+      DetachReason reason) noexcept;
+
+  /*
    * Detach a slow peer from the group.
    * Calls detachPeer for core logic (including blocked bitmap clear),
    * then handles slow-peer-specific cleanup: stats, last-synced guard,

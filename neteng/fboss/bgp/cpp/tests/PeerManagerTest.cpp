@@ -3977,7 +3977,7 @@ TEST_F(
 
 /**
  * Test that setRouteFilterPolicy with DEVICE_REGEX key type (default)
- * passes PolicyChangeScope::PEER to sendRibDumpReqForEgressPolicyUpdate.
+ * passes PolicyChangeScope::PEER to handleEgressPolicyUpdate.
  */
 TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyScopeDeviceRegexTest) {
   auto config = getConfig(
@@ -4037,7 +4037,7 @@ TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyScopeDeviceRegexTest) {
 
 /**
  * Test that setRouteFilterPolicy with PEER_GROUP_NAME key type
- * passes PolicyChangeScope::PEER_GROUP to sendRibDumpReqForEgressPolicyUpdate.
+ * passes PolicyChangeScope::PEER_GROUP to handleEgressPolicyUpdate.
  */
 TEST_F(PeerManagerTestFixture, SetRouteFilterPolicyScopePeerGroupNameTest) {
   auto config = getConfig(
@@ -6951,7 +6951,7 @@ TEST_F(
 
 /**
  * Test that updateIngressEgressPolicyNames with PolicyChangeScope::PEER
- * passes scope PEER to sendRibDumpReqForEgressPolicyUpdate.
+ * passes scope PEER to handleEgressPolicyUpdate.
  */
 TEST_F(
     PeerManagerDynamicPolicyEvaluationFixture,
@@ -7018,7 +7018,7 @@ TEST_F(
 
 /**
  * Test that updateIngressEgressPolicyNames with PolicyChangeScope::PEER_GROUP
- * passes scope PEER_GROUP to sendRibDumpReqForEgressPolicyUpdate.
+ * passes scope PEER_GROUP to handleEgressPolicyUpdate.
  */
 TEST_F(
     PeerManagerDynamicPolicyEvaluationFixture,

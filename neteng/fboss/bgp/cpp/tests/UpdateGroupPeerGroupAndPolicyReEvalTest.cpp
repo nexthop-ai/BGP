@@ -827,8 +827,10 @@ TEST_F(SplitToGroup, MovesMultiplePeersAtOnce) {
     EXPECT_EQ(adjRib0->getUpdateGroup(), sourceGroup);
     EXPECT_EQ(targetGroup->getMemberCount(), 2);
     EXPECT_EQ(sourceGroup->getMemberCount(), 1);
-    // Moved peers land at distinct bits; each carries its own state and sync
-    // status -- peer 1 detached/out-of-sync, peer 2 in-sync.
+    /*
+     * Moved peers land at distinct bits; each carries its own state and sync
+     * status -- peer 1 detached/out-of-sync, peer 2 in-sync.
+     */
     EXPECT_NE(adjRib1->getGroupBitPosition(), adjRib2->getGroupBitPosition());
     EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::DETACHED_BLOCKED);
     EXPECT_TRUE(adjRib1->isDetachedPeer());
@@ -1089,6 +1091,1047 @@ TEST_F(
     EXPECT_TRUE(adjRib->isEgressPolicyUpdateRequired());
   });
 
+  tearDown(ctx);
+}
+
+/*
+ * processUpdateGroupsEgressPolicyReevaluation coverage, one behavior per test.
+ * Each test stages policy changes (the async pipeline is disabled so the RPCs
+ * only stage config), then drives the coroutine by hand once. The coroutine
+ * rebuilds every peer's UpdateGroupKey, remaps members to their target key, and
+ * reconciles each key into a single group -- keep an existing group at the key,
+ * else rekey/split the most-in-sync contributor, then move the rest in --
+ * re-evaluating a group only when its egress genuinely changed. Groups that
+ * converge on one key (e.g. a partial-override group reset) are merged.
+ */
+class UpdateGroupsEgressReEvalTest : public UpdateGroupPolicyReEvalUTBase {};
+
+/*
+ * G1: a peer-group change plus a per-peer override on EVERY member makes the
+ * whole group override, so it splits into a new group and the original empties
+ * and is destroyed. A reset (unset overrides + reset the peer group to Policy0)
+ * then restores the original {PG, Policy0, override=false} group.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_AllOverrideGroupDestroyedThenResetRestores) {
+  constexpr int kN = 10;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb,
+               [&]() {
+                 return ctx.adjRibs.at(id)->getUpdateGroup()->getMemberCount();
+               })
+        .get();
+  };
+  auto baseline = keyOf(peer(0));
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Mutate: peer-group change, then per-peer override on every member.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy1);
+  for (int i = 0; i < kN; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // Original group emptied and was destroyed; all members in one override
+  // group.
+  EXPECT_FALSE(hasUpdateGroupOnEvb(ctx, baseline));
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // Reset: unset overrides + reset the peer group to Policy0.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kN; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy0);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // Back to the baseline group, all members restored.
+  EXPECT_TRUE(keyOf(peer(0)) == baseline);
+  EXPECT_TRUE(hasUpdateGroupOnEvb(ctx, baseline));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // All members restored to Policy0's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * G4: same net outcome as the all-override case, reached via a messier sequence
+ * -- a per-peer override, a transient peer-group Policy2, override every
+ * member, then peer-group Policy1. The group still ends fully overridden,
+ * splits out, and the original is destroyed; reset restores it.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_OverrideViaMessySequenceDestroyedThenResetRestores) {
+  constexpr int kN = 10;
+  const std::string kPg = "PEERGROUP_4";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+  const std::string kPolicy2 = kPNamePermitAll;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb,
+               [&]() {
+                 return ctx.adjRibs.at(id)->getUpdateGroup()->getMemberCount();
+               })
+        .get();
+  };
+  auto baseline = keyOf(peer(0));
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Mutate: the messy sequence, net = all members overridden on Policy1.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerEgressPolicyOnEvb(ctx, peer(0), kPolicy1);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy2);
+  for (int i = 0; i < kN; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy1);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  EXPECT_FALSE(hasUpdateGroupOnEvb(ctx, baseline));
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // Reset: unset overrides + reset the peer group to Policy0.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kN; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy0);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  EXPECT_TRUE(keyOf(peer(0)) == baseline);
+  EXPECT_TRUE(hasUpdateGroupOnEvb(ctx, baseline));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // All members restored to Policy0's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * G3: a group that is never mutated is left completely alone -- same group
+ * object, same key, same members -- even when a re-evaluation runs because a
+ * different peer group changed. Two groups are set up; the "changed" one is
+ * driven all-override (and destroyed) while the "untouched" one is verified
+ * unaffected.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_UntouchedGroupUnaffectedByOtherGroupReEval) {
+  constexpr int kN = 10;
+  const std::string kChanged = "PEERGROUP_1";
+  const std::string kUntouched = "PEERGROUP_3";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  // Changed peers -> [0,10), untouched peers -> [10,20).
+  auto ctx = setUpGroups({{kChanged, kN}, {kUntouched, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto changed = [](int i) { return makePeerId(i); };
+  auto untouched = [](int i) { return makePeerId(kN + i); };
+  expectEventualStateOnEvb(ctx, changed(0), PeerUpdateState::JOINED_RUNNING);
+  expectEventualStateOnEvb(ctx, untouched(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+
+  auto untouchedBaseline = keyOf(untouched(0));
+  auto untouchedGroupBefore = groupOf(untouched(0));
+
+  std::vector<BgpPeerId> changedPeers;
+  for (int i = 0; i < kN; ++i) {
+    changedPeers.push_back(changed(i));
+  }
+
+  // Drive the changed group all-override so a re-evaluation actually runs.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kChanged, kPolicy1);
+  for (int i = 0; i < kN; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, changed(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, changedPeers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // The untouched group is completely unaffected: same object, key, members.
+  EXPECT_TRUE(keyOf(untouched(0)) == untouchedBaseline);
+  EXPECT_TRUE(hasUpdateGroupOnEvb(ctx, untouchedBaseline));
+  EXPECT_EQ(groupOf(untouched(0)), untouchedGroupBefore);
+  EXPECT_EQ(memberCountOf(untouched(0)), kN);
+
+  // The untouched group still advertises Policy0; the changed group
+  // advertises Policy1.
+  expectRibOutForPolicy(ctx, untouched(0), kPolicy0);
+  expectRibOutForPolicy(ctx, changed(0), kPolicy1);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * G2: a PARTIAL override -- a peer-group change plus per-peer overrides on only
+ * SOME members -- splits the group into a non-override half (rekeyed in place)
+ * and an override half (split into a new group). Resetting (unset the overrides
+ * so the override half falls back to the peer-group egress, then reset the peer
+ * group to Policy0) makes BOTH halves converge on the same
+ * {PG, Policy0, override=false} key. Both halves see an egress-name change
+ * (Policy1 -> Policy0), so both groups are re-evaluated; the reconcile keeps
+ * one at the target key and merges the other into it, ending in a single group
+ * with all members. (This is the "G2" case the earlier move-only reconcile
+ * could not handle -- it overwrote the colliding map slot; see "problem case"
+ * notes.)
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_PartialOverrideResetConvergesToSingleGroup) {
+  constexpr int kN = 10;
+  constexpr int kOverride = 5;
+  const std::string kPg = "PEERGROUP_2";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  auto baseline = keyOf(peer(0));
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  /*
+   * Reconcile #1: peer-group change to Policy1 + a per-peer override on the
+   * first half. The non-override half is re-keyed in place; the override half
+   * splits into a new group.
+   */
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy1);
+  for (int i = 0; i < kOverride; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // One peer group is now backed by two update groups: an override half and a
+  // non-override half.
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  EXPECT_FALSE(keyOf(peer(kOverride)).peerOverride);
+  EXPECT_EQ(memberCountOf(peer(0)), kOverride);
+  EXPECT_EQ(memberCountOf(peer(kOverride)), kN - kOverride);
+
+  /*
+   * Reconcile #2: reset -- unset the overrides (override half falls back to the
+   * peer-group egress) and reset the peer group to Policy0. Both halves now
+   * want {PG, Policy0, override=false}.
+   */
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kOverride; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy0);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // Correct end state: the two halves merge back into a single group with all
+  // members, matching the original baseline key.
+  EXPECT_TRUE(keyOf(peer(0)) == baseline);
+  EXPECT_TRUE(hasUpdateGroupOnEvb(ctx, baseline));
+  EXPECT_EQ(groupOf(peer(0)), groupOf(peer(kOverride)));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+  // Both halves now advertise Policy0's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(kOverride), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * Basic single-transition membership reshuffles between the base group states
+ * (a group's key is {PeerGroup, egress, peerOverride}; same PeerGroup below):
+ *   - S1: {Policy0, peerOverride=false}
+ *   - S2: {Policy1, peerOverride=true}
+ *   - S3: {Policy0, peerOverride=false} + {Policy1, peerOverride=true}
+ *
+ * Each test reaches its start state with one reconcile, then applies exactly
+ * one transition and checks the resulting composition. Three of these are
+ * merges -- S3 -> S2 (merge to override), S3 -> S1 (merge to non-override), and
+ * the k-groups unset-all collapse -- and all merge correctly: the transition
+ * changes the ex-override members' egress name, so their group is re-evaluated
+ * and the reconcile merges its members into the group already at the target key
+ * instead of overwriting it.
+ */
+
+/*
+ * S3 -> S2 (merge to override): override the non-override half onto the
+ * existing override policy so both halves converge on {PG, P1, true}. The
+ * ex-non-override members flow through the bucketed move path into the existing
+ * override group; the emptied non-override group is destroyed.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    BasicMembershipReshuffle_S3ToS2MergeToOverride) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Reach S3: override the first half onto P1 (peer-group egress stays P0).
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kHalf; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  ASSERT_TRUE(keyOf(peer(0)).peerOverride);
+  ASSERT_FALSE(keyOf(peer(kHalf)).peerOverride);
+
+  // Transition S3 -> S2: override the non-override half onto the same P1.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = kHalf; i < kN; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // One override group holds everyone; the old non-override group is gone.
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  EXPECT_EQ(groupOf(peer(0)), groupOf(peer(kHalf)));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // The merged override group advertises Policy1's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy1);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy1);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * S3 -> S3, egress converges but the override flag does not: move the
+ * peer-group egress onto P1 while the override half is already on P1. The
+ * non-override half becomes {PG, P1, false} and the override half stays
+ * {PG, P1, true} -- same egress, different override flag -- so it is NOT a
+ * merge; the group stays split. (Guards that only the flag+egress pair keys a
+ * group.)
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    BasicMembershipReshuffle_SameEgressDistinctOverrideStaysSplit) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Reach S3: override the first half onto P1 (peer-group egress stays P0).
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kHalf; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  ASSERT_TRUE(keyOf(peer(0)).peerOverride);
+  ASSERT_FALSE(keyOf(peer(kHalf)).peerOverride);
+
+  // Transition: move the peer-group egress to P1 too. The non-override half
+  // becomes {PG, P1, false}; the override half stays {PG, P1, true}.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy1);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // Still two distinct groups (same egress, different override flag).
+  EXPECT_NE(groupOf(peer(0)), groupOf(peer(kHalf)));
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  EXPECT_FALSE(keyOf(peer(kHalf)).peerOverride);
+  ASSERT_TRUE(keyOf(peer(0)).egressPolicyName.has_value());
+  ASSERT_TRUE(keyOf(peer(kHalf)).egressPolicyName.has_value());
+  EXPECT_EQ(*keyOf(peer(0)).egressPolicyName, kPolicy1);
+  EXPECT_EQ(*keyOf(peer(kHalf)).egressPolicyName, kPolicy1);
+  EXPECT_EQ(memberCountOf(peer(0)), kHalf);
+  EXPECT_EQ(memberCountOf(peer(kHalf)), kN - kHalf);
+
+  // Both groups advertise Policy1's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy1);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy1);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * S3 -> S1 (merge to non-override): unset the overrides with the peer-group
+ * egress unchanged, so the ex-override members fall back from P1 to P0 and both
+ * halves want {PG, P0, false}. That P1 -> P0 change re-evaluates the
+ * ex-override group; the reconcile merges its members into the non-override
+ * group already at {PG, P0, false} rather than overwriting it, ending in one
+ * group.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    BasicMembershipReshuffle_S3ToS1MergeSameEgress) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  auto baseline = keyOf(peer(0));
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Reach S3: override the first half onto P1 (peer-group egress stays P0).
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kHalf; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  ASSERT_TRUE(keyOf(peer(0)).peerOverride);
+  ASSERT_FALSE(keyOf(peer(kHalf)).peerOverride);
+
+  // Transition S3 -> S1: unset the overrides; the peer-group egress stays P0.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kHalf; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // Correct end state: one merged non-override group with everyone.
+  EXPECT_TRUE(keyOf(peer(0)) == baseline);
+  EXPECT_EQ(groupOf(peer(0)), groupOf(peer(kHalf)));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // Both halves now advertise Policy0's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * Unset-all collapse across THREE groups: a peer group split into a
+ * non-override group + two distinct override groups (P1, P2). Unsetting every
+ * override reverts P1 and P2 back to P0, so all three converge on {PG, P0,
+ * false}. Both ex-override groups are re-evaluated (their egress name changed)
+ * and the reconcile merges their members into the single non-override group at
+ * the target key -- no overwrite; everyone ends in one group.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    BasicMembershipReshuffle_UnsetAllMergesGroups) {
+  constexpr int kThird = 5;
+  constexpr int kN = 3 * kThird;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+  const std::string kPolicy2 = kPNamePermitAll;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  auto baseline = keyOf(peer(2 * kThird));
+
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Reach 3 groups: override [0,kThird) onto P1 and [kThird,2*kThird) onto P2;
+  // leave [2*kThird, kN) non-override on P0.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kThird; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  for (int i = kThird; i < 2 * kThird; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy2);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  ASSERT_NE(groupOf(peer(0)), groupOf(peer(kThird)));
+  ASSERT_NE(groupOf(peer(0)), groupOf(peer(2 * kThird)));
+  ASSERT_NE(groupOf(peer(kThird)), groupOf(peer(2 * kThird)));
+
+  // Transition: unset every override -> all three groups want {PG, P0, false}.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < 2 * kThird; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // Correct end state: one merged non-override group with everyone.
+  EXPECT_TRUE(keyOf(peer(0)) == baseline);
+  EXPECT_EQ(groupOf(peer(0)), groupOf(peer(2 * kThird)));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+
+  // All members now advertise Policy0's RIB-OUT.
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(2 * kThird), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * Rapid oscillation: repeatedly split off an override half and reset it,
+ * cycling the override policy (P1, P2, P1). Every reset must merge back to a
+ * single Policy0 group; the final RIB-OUT must be correct.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_RapidOscillation) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+  const std::string kPolicy2 = kPNamePermitAll;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  auto baseline = keyOf(peer(0));
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  for (const auto& overridePolicy : {kPolicy1, kPolicy2, kPolicy1}) {
+    // Split off the override half.
+    disableAsyncEgressReEvalOnEvb(ctx);
+    for (int i = 0; i < kHalf; ++i) {
+      updatePeerEgressPolicyOnEvb(ctx, peer(i), overridePolicy);
+    }
+    markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+    runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+    EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+    EXPECT_NE(groupOf(peer(0)), groupOf(peer(kHalf)));
+
+    // Reset: unset the override, merge back to one Policy0 group.
+    disableAsyncEgressReEvalOnEvb(ctx);
+    for (int i = 0; i < kHalf; ++i) {
+      unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+    }
+    markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+    runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+    EXPECT_TRUE(keyOf(peer(0)) == baseline);
+    EXPECT_EQ(groupOf(peer(0)), groupOf(peer(kHalf)));
+    EXPECT_EQ(memberCountOf(peer(0)), kN);
+  }
+
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * Three-way split, then a partial merge: a non-override group plus two override
+ * groups (P1, P2). Unsetting only the P2 third merges it into the non-override
+ * group while the P1 override group is left intact.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_ThreeWaySplitPartialMerge) {
+  constexpr int kThird = 5;
+  constexpr int kN = 3 * kThird;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+  const std::string kPolicy2 = kPNamePermitAll;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // Reach three groups: [0,kThird) override P1, [kThird,2*kThird) override P2,
+  // [2*kThird,kN) non-override P0.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kThird; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+  }
+  for (int i = kThird; i < 2 * kThird; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy2);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  ASSERT_NE(groupOf(peer(0)), groupOf(peer(kThird)));
+  ASSERT_NE(groupOf(peer(0)), groupOf(peer(2 * kThird)));
+  ASSERT_NE(groupOf(peer(kThird)), groupOf(peer(2 * kThird)));
+  expectRibOutForPolicy(ctx, peer(0), kPolicy1);
+  expectRibOutForPolicy(ctx, peer(kThird), kPolicy2);
+  expectRibOutForPolicy(ctx, peer(2 * kThird), kPolicy0);
+
+  // Unset only the P2 third -> merges into the non-override P0 group.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = kThird; i < 2 * kThird; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // P2 third merged into the non-override group; P1 override group unchanged.
+  EXPECT_EQ(groupOf(peer(kThird)), groupOf(peer(2 * kThird)));
+  EXPECT_EQ(memberCountOf(peer(2 * kThird)), 2 * kThird);
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  EXPECT_EQ(memberCountOf(peer(0)), kThird);
+  EXPECT_NE(groupOf(peer(0)), groupOf(peer(2 * kThird)));
+  expectRibOutForPolicy(ctx, peer(2 * kThird), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(kThird), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(0), kPolicy1);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * Cross-policy churn: move the peer-group egress across P0 -> P1 -> P2 while a
+ * subset overrides, exercising in-place rekey, split,
+ * same-egress/different-flag (no merge), and a final unset-driven merge.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_CrossPolicyChurn) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+  const std::string kPolicy2 = kPNamePermitAll;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  // A: peer-group egress P0 -> P1 (all non-override rekey in place).
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy1);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  EXPECT_FALSE(keyOf(peer(0)).peerOverride);
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+  expectRibOutForPolicy(ctx, peer(0), kPolicy1);
+
+  // B: override the first half to P2 -> split.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kHalf; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy2);
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  EXPECT_NE(groupOf(peer(0)), groupOf(peer(kHalf)));
+  EXPECT_TRUE(keyOf(peer(0)).peerOverride);
+  expectRibOutForPolicy(ctx, peer(0), kPolicy2);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy1);
+
+  // C: peer-group egress P1 -> P2: non-override half becomes {P2,false}; the
+  // override half is {P2,true} -- same egress, different flag -> stays split.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerGroupEgressPolicyOnEvb(ctx, kPg, kPolicy2);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  EXPECT_NE(groupOf(peer(0)), groupOf(peer(kHalf)));
+  ASSERT_TRUE(keyOf(peer(kHalf)).egressPolicyName.has_value());
+  EXPECT_EQ(*keyOf(peer(kHalf)).egressPolicyName, kPolicy2);
+  expectRibOutForPolicy(ctx, peer(0), kPolicy2);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy2);
+
+  // D: unset overrides -> merge to one {P2,false} group.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  for (int i = 0; i < kHalf; ++i) {
+    unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+  }
+  markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+  EXPECT_EQ(groupOf(peer(0)), groupOf(peer(kHalf)));
+  EXPECT_EQ(memberCountOf(peer(0)), kN);
+  EXPECT_FALSE(keyOf(peer(0)).peerOverride);
+  expectRibOutForPolicy(ctx, peer(0), kPolicy2);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * Split-and-remerge: drive S1 -> S3 -> S1 repeatedly with the same override
+ * policy, stressing the rekey-vs-merge survivor choice across rounds. Ends as
+ * one Policy0 group with correct RIB-OUT.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_SplitAndRemerge) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  auto baseline = keyOf(peer(0));
+  std::vector<BgpPeerId> peers;
+  for (int i = 0; i < kN; ++i) {
+    peers.push_back(peer(i));
+  }
+
+  for (int round = 0; round < 3; ++round) {
+    // Split: override the first half to P1.
+    disableAsyncEgressReEvalOnEvb(ctx);
+    for (int i = 0; i < kHalf; ++i) {
+      updatePeerEgressPolicyOnEvb(ctx, peer(i), kPolicy1);
+    }
+    markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+    runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+    EXPECT_NE(groupOf(peer(0)), groupOf(peer(kHalf)));
+
+    // Remerge: unset -> back to one Policy0 group.
+    disableAsyncEgressReEvalOnEvb(ctx);
+    for (int i = 0; i < kHalf; ++i) {
+      unsetPeerEgressPolicyOnEvb(ctx, peer(i));
+    }
+    markEgressPolicyUpdateRequiredOnEvb(ctx, peers);
+    runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+    EXPECT_EQ(groupOf(peer(0)), groupOf(peer(kHalf)));
+    EXPECT_EQ(memberCountOf(peer(0)), kN);
+    EXPECT_TRUE(keyOf(peer(0)) == baseline);
+  }
+
+  expectRibOutForPolicy(ctx, peer(0), kPolicy0);
+  expectRibOutForPolicy(ctx, peer(kHalf), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * All group shapes reconciled in one pass: four peer groups driven into
+ * distinct shapes -- fully overridden (A), partially overridden (B),
+ * peer-group rekey (C), and untouched (D) -- then a single reconcile must land
+ * each in its correct state with correct RIB-OUT.
+ */
+TEST_F(
+    UpdateGroupsEgressReEvalTest,
+    CompositeMembershipReshuffle_AllGroupShapesInOneReeval) {
+  constexpr int kN = 10;
+  constexpr int kHalf = 5;
+  const std::string kAllOvr = "PEERGROUP_A";
+  const std::string kPartial = "PEERGROUP_B";
+  const std::string kRekey = "PEERGROUP_C";
+  const std::string kUntouched = "PEERGROUP_D";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+  const std::string kPolicy2 = kPNamePermitAll;
+
+  auto ctx = setUpGroups(
+      {{kAllOvr, kN}, {kPartial, kN}, {kRekey, kN}, {kUntouched, kN}},
+      true,
+      kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  // Global index bases: A=[0,10), B=[10,20), C=[20,30), D=[30,40).
+  auto a = [&](int i) { return peer(i); };
+  auto b = [&](int i) { return peer(kN + i); };
+  auto c = [&](int i) { return peer(2 * kN + i); };
+  auto d = [&](int i) { return peer(3 * kN + i); };
+  expectEventualStateOnEvb(ctx, a(0), PeerUpdateState::JOINED_RUNNING);
+  expectEventualStateOnEvb(ctx, d(0), PeerUpdateState::JOINED_RUNNING);
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto keyOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroupKey(); })
+        .get();
+  };
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto memberCountOf = [&](const BgpPeerId& id) {
+    return groupOf(id)->getMemberCount();
+  };
+  auto dBaseline = keyOf(d(0));
+  std::vector<BgpPeerId> allPeers;
+  for (int i = 0; i < 4 * kN; ++i) {
+    allPeers.push_back(peer(i));
+  }
+
+  // Stage all shapes, then run ONE reconcile.
+  disableAsyncEgressReEvalOnEvb(ctx);
+  // A: fully overridden to P1.
+  for (int i = 0; i < kN; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, a(i), kPolicy1);
+  }
+  // B: first half overridden to P1 (rest stays P0).
+  for (int i = 0; i < kHalf; ++i) {
+    updatePeerEgressPolicyOnEvb(ctx, b(i), kPolicy1);
+  }
+  // C: peer-group egress rekey P0 -> P2.
+  updatePeerGroupEgressPolicyOnEvb(ctx, kRekey, kPolicy2);
+  // D: untouched.
+  markEgressPolicyUpdateRequiredOnEvb(ctx, allPeers);
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  // A: one override group, all members, P1.
+  EXPECT_TRUE(keyOf(a(0)).peerOverride);
+  EXPECT_EQ(memberCountOf(a(0)), kN);
+  expectRibOutForPolicy(ctx, a(0), kPolicy1);
+  // B: split -- override half P1, non-override half P0.
+  EXPECT_NE(groupOf(b(0)), groupOf(b(kHalf)));
+  EXPECT_EQ(memberCountOf(b(0)), kHalf);
+  EXPECT_EQ(memberCountOf(b(kHalf)), kN - kHalf);
+  expectRibOutForPolicy(ctx, b(0), kPolicy1);
+  expectRibOutForPolicy(ctx, b(kHalf), kPolicy0);
+  // C: rekeyed in place to P2, all members, non-override.
+  EXPECT_FALSE(keyOf(c(0)).peerOverride);
+  EXPECT_EQ(memberCountOf(c(0)), kN);
+  expectRibOutForPolicy(ctx, c(0), kPolicy2);
+  // D: untouched, still P0.
+  EXPECT_TRUE(keyOf(d(0)) == dBaseline);
+  EXPECT_EQ(memberCountOf(d(0)), kN);
+  expectRibOutForPolicy(ctx, d(0), kPolicy0);
+
+  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 

@@ -3305,6 +3305,17 @@ void AdjRibOutGroup::detachPeer(
       lastSeenRibVersion_);
 }
 
+void AdjRibOutGroup::detachPeers(
+    const std::vector<std::shared_ptr<AdjRib>>& peers,
+    DetachReason reason) noexcept {
+  for (const auto& adjRib : peers) {
+    // detachPeer is not idempotent; only in-sync members need detaching.
+    if (!adjRib->isDetachedPeer()) {
+      detachPeer(adjRib, reason);
+    }
+  }
+}
+
 /*
  * Detach a slow peer from the group.
  */

@@ -390,9 +390,8 @@ TEST_F(
     ctx.adjRib3->setPendingEgressPolicyUpdate(true);
   });
 
-  folly::coro::blockingWait(
-      folly::coro::co_withExecutor(
-          &evb, ctx.peerMgr->processGroupEgressPolicyReEvaluation(group)));
+  evb.runInEventBaseThreadAndWait(
+      [&]() { ctx.peerMgr->processGroupEgressPolicyReEvaluation(group); });
 
   WITH_RETRIES({
     evb.runInEventBaseThreadAndWait([&]() {
@@ -444,9 +443,8 @@ TEST_F(
     ctx.adjRib2->setPendingEgressPolicyUpdate(true);
   });
 
-  folly::coro::blockingWait(
-      folly::coro::co_withExecutor(
-          &evb, ctx.peerMgr->processGroupEgressPolicyReEvaluation(group)));
+  evb.runInEventBaseThreadAndWait(
+      [&]() { ctx.peerMgr->processGroupEgressPolicyReEvaluation(group); });
 
   evb.runInEventBaseThreadAndWait([&]() {
     // Each peer's UpdateGroupKey should reflect the new policy

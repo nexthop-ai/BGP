@@ -62,7 +62,6 @@ std::shared_ptr<AdjRibOutGroup> UpdateGroupManager::findOrCreateGroup(
 
   XLOGF(INFO, "Update group: {} is created", group->getGroupDescriptor());
 
-  // TODO: register with changeListTracker to not lose subsequent updates
   return group;
 }
 

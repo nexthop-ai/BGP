@@ -65,6 +65,7 @@ inline constexpr auto kPNameMatchNoAdvtDeny =
     "match-no-advt-community-deny-continue";
 inline constexpr auto kPNameMatchModifyAppend =
     "match-modify-community-append-tag-continue";
+inline constexpr auto kPNamePermitAll = "permit-all-continue";
 
 /* ---- Route parameterization constants ---- */
 inline constexpr int kRouteCount = 100;
@@ -224,12 +225,30 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
         kPNameMatchModifyAppend, {std::move(tagTerm), std::move(acceptTerm)});
   }
 
+  /*
+   * Permit-all policy. Used as a distinct third egress policy name in
+   * multi-group re-evaluation tests; its filtering behavior is irrelevant --
+   * only the policy name (as part of the UpdateGroupKey) matters there.
+   */
+  static bgp_policy::BgpPolicyStatement buildPermitAllPolicy() {
+    auto permit =
+        createBgpPolicyAction(bgp_policy::BgpPolicyActionType::PERMIT);
+    auto acceptTerm = createBgpPolicyTerm(
+        "accept-all",
+        "",
+        {},
+        {std::move(permit)},
+        bgp_policy::FlowControlAction::NEXT_TERM);
+    return createBgpPolicyStatement(kPNamePermitAll, {std::move(acceptTerm)});
+  }
+
   static bgp_policy::BgpPolicies buildPolicies() {
     bgp_policy::BgpPolicies policies;
     policies.bgp_policy_statements()->emplace_back(
         buildMatchNoAdvtDenyPolicy());
     policies.bgp_policy_statements()->emplace_back(
         buildMatchModifyAppendPolicy());
+    policies.bgp_policy_statements()->emplace_back(buildPermitAllPolicy());
     return policies;
   }
 
@@ -777,23 +796,50 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
-   * Update a peer's egress policy via BgpServiceBase::setPeersPolicy.
-   * This updates the config and the AdjRib's egressPolicyName_.
+   * Construct an ad-hoc BgpServiceBB for driving the policy RPCs in tests. The
+   * RibBase/Watchdog references are placeholders that the policy RPCs never
+   * touch (they only use peerMgr_ and configManager_).
    */
-  void updatePeerEgressPolicyOnEvb(
-      TestContext& ctx,
-      const BgpPeerId& peerId,
-      const std::string& newPolicyName) {
+  std::shared_ptr<BgpServiceBB> makeBgpServiceBB(TestContext& ctx) {
     static std::aligned_storage_t<sizeof(RibBase), alignof(RibBase)> ribBuf;
     static std::aligned_storage_t<sizeof(Watchdog), alignof(Watchdog)>
         watchdogBuf;
-    auto bgpService = std::make_shared<BgpServiceBB>(
+    return std::make_shared<BgpServiceBB>(
         *ctx.peerMgr,
         ctx.configMgr,
         reinterpret_cast<RibBase&>(ribBuf),
         reinterpret_cast<Watchdog&>(watchdogBuf),
         /*nlWrapper=*/nullptr,
         /*enable_thrift_protection=*/false);
+  }
+
+  /*
+   * Flush the peer manager's EventBase: run a no-op to completion on the evb so
+   * every task queued ahead of it has run. The setPolicy RPCs below apply the
+   * egress policy names via a version-gated lambda posted with
+   * runInEventBaseThread (PeerManager::updateIngressEgressPolicyNames), not
+   * synchronously. Without a flush between calls, several such lambdas queue
+   * up; the first to run stamps lastAppliedPolicyVersion_ to the latest config
+   * version, so the version gate skips the rest and their change sets are
+   * dropped -- leaving some peers' egress unapplied. Flushing after each RPC
+   * forces its apply to land (and bump the version) before the next RPC bumps
+   * the config version again.
+   */
+  void flushEventBase(TestContext& ctx) {
+    ctx.peerMgr->getEventBase().runInEventBaseThreadAndWait([]() {});
+  }
+
+  /*
+   * Install a per-peer egress policy override via
+   * BgpServiceBB::co_setPeersPolicy (peerOverride becomes true). This updates
+   * the config and pushes the resolved egress name onto the AdjRib's
+   * egressPolicyName_.
+   */
+  void updatePeerEgressPolicyOnEvb(
+      TestContext& ctx,
+      const BgpPeerId& peerId,
+      const std::string& newPolicyName) {
+    auto bgpService = makeBgpServiceBB(ctx);
     auto peersPolicy = std::make_unique<
         std::map<std::string, std::map<bgp_policy::DIRECTION, std::string>>>();
     (*peersPolicy)[peerId.peerAddr.str()][bgp_policy::DIRECTION::OUT] =
@@ -809,6 +855,33 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     ASSERT_EQ(
         result,
         neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    flushEventBase(ctx);
+  }
+
+  /*
+   * Change a peer group's egress policy via
+   * BgpServiceBB::co_setPeerGroupsPolicy (a peer-group-level, non-override
+   * change). This updates the config and pushes the resolved egress name onto
+   * every member AdjRib's egressPolicyName_, leaving peerOverride false since
+   * no per-peer override is installed.
+   */
+  void updatePeerGroupEgressPolicyOnEvb(
+      TestContext& ctx,
+      const std::string& peerGroupName,
+      const std::string& newPolicyName) {
+    auto bgpService = makeBgpServiceBB(ctx);
+    auto peerGroupsPolicy = std::make_unique<
+        std::map<std::string, std::map<bgp_policy::DIRECTION, std::string>>>();
+    (*peerGroupsPolicy)[peerGroupName][bgp_policy::DIRECTION::OUT] =
+        newPolicyName;
+    auto& evb = ctx.peerMgr->getEventBase();
+    auto result = folly::coro::blockingWait(
+        bgpService->co_setPeerGroupsPolicy(std::move(peerGroupsPolicy))
+            .scheduleOn(&evb));
+    ASSERT_EQ(
+        result,
+        neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    flushEventBase(ctx);
   }
 
   /*
@@ -818,16 +891,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
    * the only way to clear the override.
    */
   void unsetPeerEgressPolicyOnEvb(TestContext& ctx, const BgpPeerId& peerId) {
-    static std::aligned_storage_t<sizeof(RibBase), alignof(RibBase)> ribBuf;
-    static std::aligned_storage_t<sizeof(Watchdog), alignof(Watchdog)>
-        watchdogBuf;
-    auto bgpService = std::make_shared<BgpServiceBB>(
-        *ctx.peerMgr,
-        ctx.configMgr,
-        reinterpret_cast<RibBase&>(ribBuf),
-        reinterpret_cast<Watchdog&>(watchdogBuf),
-        /*nlWrapper=*/nullptr,
-        /*enable_thrift_protection=*/false);
+    auto bgpService = makeBgpServiceBB(ctx);
     auto peersToUnset = std::make_unique<
         std::map<std::string, std::set<bgp_policy::DIRECTION>>>();
     (*peersToUnset)[peerId.peerAddr.str()].insert(bgp_policy::DIRECTION::OUT);
@@ -838,6 +902,150 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     ASSERT_EQ(
         result,
         neteng::fboss::bgp::thrift::BgpPolicyChangeResult::POLICIES_APPLIED);
+    flushEventBase(ctx);
+  }
+
+  /*
+   * Helpers for driving egress policy re-evaluation from tests
+   * (processUpdateGroupsEgressPolicyReevaluation is private; this fixture is a
+   * friend).
+   */
+
+  /*
+   * Mark the async egress re-evaluation as already scheduled so that the
+   * co_setPeersPolicy / co_setPeerGroupsPolicy calls below do not kick off
+   * processUpdateGroupsEgressPolicyReevaluation on asyncScope_. These tests
+   * stage config and drive the re-evaluation by hand; letting the async
+   * pipeline also run races the manual call, moves peers out from under it, and
+   * leaves keys inconsistent (leaking the AdjRibPolicyCache singleton at
+   * teardown). The flag is intentionally left set for the fixture's lifetime.
+   */
+  void disableAsyncEgressReEvalOnEvb(TestContext& ctx) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      ctx.peerMgr->egressPolicyUpdateForUpdateGroupsScheduled_ = true;
+    });
+  }
+
+  /*
+   * co_setPeersPolicy / co_setPeerGroupsPolicy apply egressPolicyName_ on the
+   * peer manager evb asynchronously (updateIngressEgressPolicyNames posts the
+   * apply via runInEventBaseThread), so poll until it lands before rebuilding
+   * the key -- otherwise the rebuild races the apply and captures a stale
+   * egress for some peers.
+   */
+  void waitForEgressPolicyUpdatedAdjRibOnEvb(
+      TestContext& ctx,
+      const BgpPeerId& peerId,
+      const std::string& policyName) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    WITH_RETRIES({
+      auto name = folly::via(&evb, [&]() {
+                    return ctx.adjRibs.at(peerId)->egressPolicyName_;
+                  }).get();
+      EXPECT_EVENTUALLY_TRUE(name.has_value() && name.value() == policyName);
+    });
+  }
+
+  /*
+   * Apply a peer-group-level (non-override) egress change covering peerId via
+   * BgpServiceBB::co_setPeerGroupsPolicy, then rebuild peerId's UpdateGroupKey.
+   * Because this changes the peer group's egress (not a per-peer override),
+   * peerOverride stays false. Note this changes the egress for the whole peer
+   * group; callers rebuild each member's key as needed.
+   */
+  void setNonOverrideEgressAndRebuildKeyOnEvb(
+      TestContext& ctx,
+      const BgpPeerId& peerId,
+      const std::string& policyName) {
+    disableAsyncEgressReEvalOnEvb(ctx);
+    auto& evb = ctx.peerMgr->getEventBase();
+    std::string peerGroupName;
+    evb.runInEventBaseThreadAndWait([&]() {
+      peerGroupName =
+          ctx.adjRibs.at(peerId)->peeringParams_.peerGroupName.value_or("");
+    });
+    updatePeerGroupEgressPolicyOnEvb(ctx, peerGroupName, policyName);
+    waitForEgressPolicyUpdatedAdjRibOnEvb(ctx, peerId, policyName);
+    evb.runInEventBaseThreadAndWait(
+        [&]() { ctx.adjRibs.at(peerId)->buildAndSetUpdateGroupKey(); });
+  }
+
+  /*
+   * Make a peer a per-peer egress override (peerOverride=true) for policyName,
+   * then rebuild its UpdateGroupKey.
+   */
+  void setOverrideEgressAndRebuildKeyOnEvb(
+      TestContext& ctx,
+      const BgpPeerId& peerId,
+      const std::string& policyName) {
+    disableAsyncEgressReEvalOnEvb(ctx);
+    updatePeerEgressPolicyOnEvb(ctx, peerId, policyName);
+    waitForEgressPolicyUpdatedAdjRibOnEvb(ctx, peerId, policyName);
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait(
+        [&]() { ctx.adjRibs.at(peerId)->buildAndSetUpdateGroupKey(); });
+  }
+
+  /*
+   * Drive the full processUpdateGroupsEgressPolicyReevaluation coroutine on the
+   * evb: rebuild affected peers' keys, rekey affected groups, move override
+   * members out, and destroy any old group emptied by the moves.
+   */
+  void runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(TestContext& ctx) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    folly::coro::blockingWait(
+        ctx.peerMgr->processUpdateGroupsEgressPolicyReevaluation().scheduleOn(
+            &evb));
+  }
+
+  // Whether the update group manager still tracks a group for the given key.
+  bool hasUpdateGroupOnEvb(TestContext& ctx, const UpdateGroupKey& key) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    return folly::via(
+               &evb,
+               [&]() {
+                 return ctx.peerMgr->updateGroupManager_->hasGroup(key);
+               })
+        .get();
+  }
+
+  /*
+   * Mark the given peers as needing egress policy re-evaluation; the affected-
+   * peer scan in processUpdateGroupsEgressPolicyReevaluation keys off this
+   * flag. Set it explicitly because each policy RPC's apply ASSIGNS the flag
+   * for every peer from that RPC's change set, so it does not accumulate across
+   * the several RPCs a multi-group scenario issues -- the config/keys are
+   * correct, only the dirty flags need to be (re)asserted before a manual
+   * reeval.
+   */
+  void markEgressPolicyUpdateRequiredOnEvb(
+      TestContext& ctx,
+      const std::vector<BgpPeerId>& peers) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      for (const auto& id : peers) {
+        ctx.adjRibs.at(id)->setPendingEgressPolicyUpdate(true);
+      }
+    });
+  }
+
+  /*
+   * Re-align every peer's stored UpdateGroupKey to its current group's key.
+   * A test that diverges a peer's key from its group (e.g. installs an override
+   * but does not move the peer) must call this before tearDown -- otherwise
+   * shutdown's maybeDestroyUpdateGroup keys off the stale key, never finds the
+   * group, and leaks it (and its AdjRibPolicyCache references).
+   */
+  void realignPeerKeysToGroupsOnEvb(TestContext& ctx) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      for (auto& [peerId, adjRib] : ctx.adjRibs) {
+        if (auto group = adjRib->getUpdateGroup()) {
+          adjRib->updateGroupKey_ = group->getGroupKey();
+        }
+      }
+    });
   }
 
   static std::function<bool(const AdjRibEntry&, const folly::CIDRNetwork&)>
@@ -959,6 +1167,57 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
+   * Verify a peer's RIB-OUT matches what its group's egress policy should
+   * advertise over the 100 setup routes (100.0.i.0/24; odd i carry the
+   * no-advertise community, i % 3 == 0 carry the modify community):
+   *   - kPNameMatchNoAdvtDeny: the 50 even routes advertised, the 50 odd
+   *     (no-advertise) routes denied;
+   *   - kPNameMatchModifyAppend: all 100 advertised, the 34 modify routes carry
+   *     the appended kPCommAppend;
+   *   - kPNamePermitAll: all 100 advertised, unmodified.
+   */
+  void expectRibOutForPolicy(
+      TestContext& ctx,
+      const BgpPeerId& peerId,
+      const std::string& policyName) {
+    if (policyName == kPNameMatchNoAdvtDeny) {
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx,
+              peerId,
+              [](int i) { return i % 2 == 0; },
+              verifyAdvertised()),
+          50u);
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx,
+              peerId,
+              [](int i) { return i % 2 == 1; },
+              verifyNotAdvertised()),
+          50u);
+    } else if (policyName == kPNameMatchModifyAppend) {
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx, peerId, [](int) { return true; }, verifyAdvertised()),
+          100u);
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx,
+              peerId,
+              [](int i) { return i % 3 == 0; },
+              verifyCommOnAdvertisedRoute(kPCommAppend)),
+          34u);
+    } else if (policyName == kPNamePermitAll) {
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx, peerId, [](int) { return true; }, verifyAdvertised()),
+          100u);
+    } else {
+      FAIL() << "expectRibOutForPolicy: unknown policy " << policyName;
+    }
+  }
+
+  /*
    * Serialize a group's RIB-OUT for a single owner so two snapshots can be
    * compared for exact equality (e.g. before/after splitToNewGroup). Produces a
    * deterministic string of comma-separated tokens:
@@ -1073,7 +1332,16 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
    *   - numPeers AdjRibs in the same group
    *   - 100 routes in shadowRibEntries_
    */
-  TestContext setUp(int numPeers = 2, bool initialDumpCompleted = true) {
+  /*
+   * Multi-peer-group setup. Each entry in groupSpecs is a (peerGroupName,
+   * peerCount); peers get sequential global indices across all groups (group 0
+   * -> [0, c0), group 1 -> [c0, c0+c1), ...), matching makePeerId(index). Every
+   * peer group starts with egressPolicy, so each becomes its own update group.
+   */
+  TestContext setUpGroups(
+      const std::vector<std::pair<std::string, int>>& groupSpecs,
+      bool initialDumpCompleted = true,
+      const std::string& egressPolicy = kPNameMatchNoAdvtDeny) {
     auto policies = buildPolicies();
 
     auto config = getConfig(
@@ -1092,24 +1360,43 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
         /*enableUpdateGroup=*/true);
 
     auto thriftConfig = config->getConfig();
-    thrift::PeerGroup peerGroupA;
-    peerGroupA.name() = "PEERGROUP_A";
-    peerGroupA.egress_policy_name() = kPNameMatchNoAdvtDeny;
-    thriftConfig.peer_groups()->push_back(std::move(peerGroupA));
 
-    for (int i = 0; i < numPeers; ++i) {
-      auto addr = makePeerId(i).peerAddr;
-      thrift::BgpPeer peer;
-      peer.peer_addr() = addr.str();
-      peer.local_addr() = kLocalAddr1.str();
-      peer.next_hop4() = kV4Nexthop1.str();
-      peer.next_hop6() = kV6Nexthop1.str();
-      peer.remote_as_4_byte() = kAsn1;
-      peer.peer_group_name() = "PEERGROUP_A";
-      thriftConfig.peers()->push_back(std::move(peer));
+    // Flat (globalPeerIndex, peerGroupName) list used to build AdjRibs below.
+    std::vector<std::pair<int, std::string>> peerAssignments;
+    int nextPeerIndex = 0;
+    for (const auto& [peerGroupName, peerCount] : groupSpecs) {
+      thrift::PeerGroup peerGroup;
+      peerGroup.name() = peerGroupName;
+      peerGroup.egress_policy_name() = egressPolicy;
+      thriftConfig.peer_groups()->push_back(std::move(peerGroup));
+      for (int i = 0; i < peerCount; ++i) {
+        int idx = nextPeerIndex++;
+        auto addr = makePeerId(idx).peerAddr;
+        thrift::BgpPeer peer;
+        peer.peer_addr() = addr.str();
+        peer.local_addr() = kLocalAddr1.str();
+        peer.next_hop4() = kV4Nexthop1.str();
+        peer.next_hop6() = kV6Nexthop1.str();
+        peer.remote_as_4_byte() = kAsn1;
+        peer.peer_group_name() = peerGroupName;
+        thriftConfig.peers()->push_back(std::move(peer));
+        peerAssignments.emplace_back(idx, peerGroupName);
+      }
     }
 
-    config = std::make_shared<Config>(std::move(thriftConfig));
+    /*
+     * These tests drive peers directly and never accept inbound BGP
+     * connections. Disable the passive server socket via tunables so the
+     * SessionManager does not bind the configured listen port -- otherwise
+     * FiberBgpPeerManager::run() aborts the SessionManager thread when that
+     * port is unavailable. All other tunables keep their defaults.
+     */
+    BgpSettings tunables(
+        ValidateRemoteAs{true},
+        SupportStatefulGr{true},
+        EnableServerSocket{false},
+        AllowLoopbackReflection{false});
+    config = std::make_shared<Config>(std::move(thriftConfig), tunables);
 
     auto configManager = std::make_shared<ConfigManager>(config);
     auto globalConfig = config->getBgpGlobalConfig();
@@ -1124,8 +1411,8 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     auto& evb = peerMgr->getEventBase();
 
     folly::F14FastMap<BgpPeerId, std::shared_ptr<AdjRib>> adjRibs;
-    for (int i = 0; i < numPeers; ++i) {
-      auto peerId = makePeerId(i);
+    for (const auto& [idx, peerGroupName] : peerAssignments) {
+      auto peerId = makePeerId(idx);
       auto baton = std::make_shared<folly::coro::Baton>();
       peerMgr->sessionTerminateBatons_.insert_or_assign(peerId, baton);
       auto adjRib = setupAdjRibWithPeerGroup(
@@ -1135,8 +1422,8 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
           baton,
           configManager,
           policyManager,
-          fmt::format("adjRib{}", i),
-          "PEERGROUP_A");
+          fmt::format("adjRib{}", idx),
+          peerGroupName);
       /*
        * Post immediately: in production the baton is posted when the
        * AdjRib's processing loop finishes. Since we never start that
@@ -1190,6 +1477,10 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     }
 
     return ctx;
+  }
+
+  TestContext setUp(int numPeers = 2, bool initialDumpCompleted = true) {
+    return setUpGroups({{"PEERGROUP_A", numPeers}}, initialDumpCompleted);
   }
 
   void sendInitialRibDump(TestContext& ctx) {
