@@ -15,11 +15,13 @@
  */
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include <gtest/gtest.h>
 
 #include "fb303/ServiceData.h"
+#include "neteng/fboss/bgp/cpp/common/Types.h"
 #include "neteng/fboss/bgp/cpp/rib/RibCounters.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 
@@ -106,6 +108,49 @@ TEST(RibCountersTest, UnresolvableNexthopsTracksFieldAndFb303) {
   EXPECT_EQ(2, counter(RibStats::kRibUnresolvableNexthopsCount));
 }
 
+// Best-path source breakdown tracks appear / flip / withdrawal transitions,
+// is a no-op on unchanged class, and is isolated per address family.
+TEST(RibCountersTest, BestpathSourceBreakdown) {
+  using RT = BgpRouteType;
+  RibStats::initCounters();
+  RibCounters c;
+
+  // Prefixes appear with each source class (std::nullopt = no best path).
+  c.onBestpathSourceChanged(/*isV4=*/true, std::nullopt, RT::EBGP);
+  c.onBestpathSourceChanged(/*isV4=*/true, std::nullopt, RT::IBGP);
+  c.onBestpathSourceChanged(/*isV4=*/true, std::nullopt, RT::LOCAL);
+  c.onBestpathSourceChanged(/*isV4=*/false, std::nullopt, RT::ConfedEBGP);
+  EXPECT_EQ(1, c.ebgpPrefixes(/*isV4=*/true));
+  EXPECT_EQ(1, c.ibgpPrefixes(/*isV4=*/true));
+  EXPECT_EQ(1, c.localPrefixes(/*isV4=*/true));
+  EXPECT_EQ(1, c.confedEbgpPrefixes(/*isV4=*/false));
+  // Per-AFI isolation: v4 confed and v6 ebgp untouched.
+  EXPECT_EQ(0, c.confedEbgpPrefixes(/*isV4=*/true));
+  EXPECT_EQ(0, c.ebgpPrefixes(/*isV4=*/false));
+
+  // Flip eBGP -> iBGP moves one from ebgp to ibgp.
+  c.onBestpathSourceChanged(/*isV4=*/true, RT::EBGP, RT::IBGP);
+  EXPECT_EQ(0, c.ebgpPrefixes(/*isV4=*/true));
+  EXPECT_EQ(2, c.ibgpPrefixes(/*isV4=*/true));
+
+  // No-op when class is unchanged (full-RIB re-selection safety).
+  c.onBestpathSourceChanged(/*isV4=*/true, RT::IBGP, RT::IBGP);
+  EXPECT_EQ(2, c.ibgpPrefixes(/*isV4=*/true));
+
+  // Withdrawal / unresolvable: iBGP -> no best path decrements.
+  c.onBestpathSourceChanged(/*isV4=*/true, RT::IBGP, std::nullopt);
+  EXPECT_EQ(1, c.ibgpPrefixes(/*isV4=*/true));
+
+  // A winner classified UNKNOWN maps 1:1 to its own bucket, never folded into
+  // iBGP (getBgpPathType does not emit UNKNOWN in practice; passed directly
+  // here).
+  c.onBestpathSourceChanged(/*isV4=*/true, std::nullopt, RT::UNKNOWN);
+  EXPECT_EQ(1, c.unknownPrefixes(/*isV4=*/true));
+  EXPECT_EQ(0, c.ebgpPrefixes(/*isV4=*/true));
+  EXPECT_EQ(1, c.ibgpPrefixes(/*isV4=*/true));
+  EXPECT_EQ(1, c.localPrefixes(/*isV4=*/true));
+}
+
 // reset() zeroes the in-memory fields (used on the shutdown bulk-clear path).
 TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   RibStats::initCounters();
@@ -114,6 +159,8 @@ TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   c.onPrefixAdded(/*isV4=*/false, 64);
   c.setOriginatedRoutes(5);
   c.onUnresolvableNexthopAdded();
+  c.onBestpathSourceChanged(
+      /*isV4=*/true, std::nullopt, BgpRouteType::EBGP);
 
   c.reset();
   EXPECT_EQ(0, c.totalPrefixes());
@@ -121,6 +168,7 @@ TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   EXPECT_EQ(0, c.prefixLenCounts(/*isV4=*/false)[64]);
   EXPECT_EQ(0, c.originatedRoutes());
   EXPECT_EQ(0, c.unresolvableNexthops());
+  EXPECT_EQ(0, c.ebgpPrefixes(/*isV4=*/true));
 }
 
 } // namespace facebook::bgp

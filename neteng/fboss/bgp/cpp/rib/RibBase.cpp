@@ -1518,8 +1518,37 @@ std::pair<bool, bool> RibBase::selectBestPath(
       entry, input, mp.topoInfoChanged, std::move(newNhWtMap));
 }
 
+std::optional<BgpRouteType> RibBase::bestpathSource(
+    const RouteInfo* bestpath) noexcept {
+  // A null best path maps to nullopt (counted in no source bucket).
+  // getBgpPathType classifies every real path into one of
+  // LOCAL/EBGP/ConfedEBGP/ IBGP -- its residual (non-local, non-external,
+  // non-confed-external) case is IBGP, the internal-peer class -- so it does
+  // not return UNKNOWN today. The RibCounters `unknown` bucket therefore stays
+  // 0 in practice; it exists only so an UNKNOWN winner would be isolated there
+  // rather than mis-attributed.
+  if (bestpath == nullptr) {
+    return std::nullopt;
+  }
+  return getBgpPathType(bestpath);
+}
+
+void RibBase::recordBestpathSourceDelta(
+    const folly::CIDRNetwork& prefix,
+    std::optional<BgpRouteType> oldSource,
+    const RouteInfo* newBestpath) noexcept {
+  ribCounters_.onBestpathSourceChanged(
+      prefix.first.isV4(), oldSource, bestpathSource(newBestpath));
+}
+
 std::pair<bool, bool> RibBase::runBestPathSelection(RibEntry& entry) noexcept {
-  return selectBestPath(
+  // Capture the winner's source class (a small value, not the owning
+  // shared_ptr) before selection so the delta covers every bestpath write
+  // inside selectBestPath (positive and all set-to-null paths) without
+  // shared_ptr refcount traffic on the hot path. The old path may be freed by
+  // selection, so we must not retain a pointer to it across the call.
+  const auto oldSource = bestpathSource(entry.getBestPathRaw());
+  auto result = selectBestPath(
       entry,
       multipathSelector_,
       bestpathSelector_,
@@ -1527,6 +1556,10 @@ std::pair<bool, bool> RibBase::runBestPathSelection(RibEntry& entry) noexcept {
       globalConfig_.ucmpWidth,
       std::optional<BgpUcmpQuantizer>(globalConfig_.ucmpQuantizer),
       enableRibAllocatedPathId_);
+
+  recordBestpathSourceDelta(
+      entry.getPrefix(), oldSource, entry.getBestPathRaw());
+  return result;
 }
 
 void RibBase::prepareFibProgramming(bool fullSync) noexcept {
@@ -2195,6 +2228,10 @@ TRibSummary RibBase::getRibSummary(TBgpAfi afi) {
         summary.prefix_length_counts()[static_cast<int16_t>(len)] = counts[len];
       }
     }
+    summary.ebgp_prefixes() = ribCounters_.ebgpPrefixes(isV4);
+    summary.ibgp_prefixes() = ribCounters_.ibgpPrefixes(isV4);
+    summary.confed_ebgp_prefixes() = ribCounters_.confedEbgpPrefixes(isV4);
+    summary.local_prefixes() = ribCounters_.localPrefixes(isV4);
   });
   return summary;
 }

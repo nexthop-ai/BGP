@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <functional>
+#include <optional>
 #include <vector>
 
 #include <folly/IPAddress.h>
@@ -34,6 +35,7 @@
 #include "neteng/fboss/bgp/cpp/common/RibMessage.h"
 #include "neteng/fboss/bgp/cpp/common/RouteInfo.h"
 #include "neteng/fboss/bgp/cpp/common/Structs.h"
+#include "neteng/fboss/bgp/cpp/common/Types.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
 #include "neteng/fboss/bgp/cpp/lib/coro/BackPressuredQueue.h"
 #include "neteng/fboss/bgp/cpp/lib/coro/MPMCQueue.h"
@@ -531,6 +533,31 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   virtual std::pair<bool, bool> runBestPathSelection(RibEntry& entry) noexcept;
 
  protected:
+  /**
+   * Classify a selected best path into its eBGP / iBGP / confed-eBGP / local
+   * source class, or std::nullopt when there is no best path. Takes a raw
+   * pointer so a caller can classify the current best path without copying the
+   * owning shared_ptr on the per-RibEntry best-path hot path.
+   */
+  static std::optional<BgpRouteType> bestpathSource(
+      const RouteInfo* bestpath) noexcept;
+
+  /**
+   * Update the eBGP / iBGP / confed-eBGP / local best-path source counters for
+   * `prefix`, given the source class of the best path BEFORE the pass
+   * (`oldSource`, std::nullopt when there was none) and the best path AFTER the
+   * pass (`newBestpath`, may be null). Safe to call on every pass: it is a
+   * no-op when the source class is unchanged. The old class is passed by value
+   * (not the old shared_ptr) because the previous best path may be freed during
+   * selection; both args avoid shared_ptr refcount traffic on the hot path.
+   * Defined on RibBase -- where the path-type classifier lives -- so RibDC's
+   * selectBestPath override can reuse it.
+   */
+  void recordBestpathSourceDelta(
+      const folly::CIDRNetwork& prefix,
+      std::optional<BgpRouteType> oldSource,
+      const RouteInfo* newBestpath) noexcept;
+
   static PathSelectionInput snapshotAndResetForPathSelection(
       RibEntry& entry) noexcept;
 

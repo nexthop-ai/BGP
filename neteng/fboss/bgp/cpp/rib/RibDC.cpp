@@ -852,6 +852,11 @@ std::pair<bool, bool> RibDC::runBestPathSelection(RibEntry& entry) noexcept {
   // here (rather than in RibBase::prepareFibProgramming) keeps all
   // partial-drain bookkeeping inside RibDC so RibBase stays platform-agnostic.
   const bool oldIsPartialDrain = entry.getIsPartialDrain();
+  // Capture the winner's source class (a small value, not the owning
+  // shared_ptr) before selection so the delta covers every bestpath write
+  // inside selectBestPath (DC has additional set-to-null paths) without
+  // shared_ptr refcount traffic on the hot path.
+  const auto oldSource = bestpathSource(entry.getBestPathRaw());
 
   auto result = RibDC::selectBestPath(
       entry,
@@ -862,6 +867,9 @@ std::pair<bool, bool> RibDC::runBestPathSelection(RibEntry& entry) noexcept {
       std::optional<BgpUcmpQuantizer>(globalConfig_.ucmpQuantizer),
       pathSelectionPolicy_,
       enableRibAllocatedPathId_);
+
+  recordBestpathSourceDelta(
+      entry.getPrefix(), oldSource, entry.getBestPathRaw());
 
   // Mark a publish pending across the pass; onPrepareFibProgrammingComplete()
   // consumes it to drive a single end-of-pass state publish.

@@ -49,6 +49,11 @@ class RibEntry {
   std::shared_ptr<RouteInfo> getBestPath() const {
     return bestpath_;
   }
+  // Raw best path for read-only use without copying the owning shared_ptr
+  // (avoids refcount traffic on the per-RibEntry best-path hot path).
+  const RouteInfo* getBestPathRaw() const {
+    return bestpath_.get();
+  }
   std::shared_ptr<RouteInfo> getAdvertisedBestPath() const {
     return advertisedBestpath_;
   }

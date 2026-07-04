@@ -207,6 +207,36 @@ TEST_F(RibFixture, WithdrawRouteWithAgentReconnectTest) {
 }
 
 /*
+ * getRibSummary reports per-AFI totals, the per-prefix-length histogram, and
+ * the eBGP/iBGP source breakdown, all populated incrementally during path
+ * selection (RibCounters via runBestPathSelection).
+ */
+TEST_F(RibFixture, GetRibSummarySourceBreakdown) {
+  auto ebgpPrefix = IPAddress::createNetwork("10::/64");
+  auto ibgpPrefix = IPAddress::createNetwork("20::/64");
+
+  auto fibFuture = fib_->getFibProgramFuture();
+  sendAnnouncement(
+      PrefixPathIds{{ebgpPrefix, kDefaultPathID}}, eBgpPeer1_, attr_);
+  sendAnnouncement(
+      PrefixPathIds{{ibgpPrefix, kDefaultPathID}}, iBgpPeer_, attr_);
+  sendInitialPathComputation();
+  fibFuture.wait();
+
+  auto summary = rib_->getRibSummary(TBgpAfi::AFI_IPV6);
+  EXPECT_EQ(2, summary.total_prefixes().value());
+  EXPECT_EQ(1, summary.ebgp_prefixes().value());
+  EXPECT_EQ(1, summary.ibgp_prefixes().value());
+  EXPECT_EQ(0, summary.confed_ebgp_prefixes().value());
+  EXPECT_EQ(0, summary.local_prefixes().value());
+  EXPECT_EQ(2, summary.prefix_length_counts().value()[64]);
+
+  // The other address family is empty.
+  auto v4Summary = rib_->getRibSummary(TBgpAfi::AFI_IPV4);
+  EXPECT_EQ(0, v4Summary.total_prefixes().value());
+}
+
+/*
  * Test if EoR is sent, then RIB_COMPUTED event should happen
  */
 TEST_F(RibFixture, EORTest) {

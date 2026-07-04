@@ -18,7 +18,9 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 
+#include "neteng/fboss/bgp/cpp/common/Types.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 
 namespace facebook::bgp {
@@ -83,6 +85,26 @@ class RibCounters {
   }
 
   /**
+   * The selected best path for a prefix changed source class (including
+   * appearing from / disappearing to std::nullopt, i.e. no best path). No-op
+   * when the class is unchanged, so a full-RIB re-selection that leaves each
+   * winner's class the same nets to zero -- callers may invoke this on every
+   * path-selection pass. A null best path is carried as std::nullopt rather
+   * than a sentinel enum value, so it contributes to no source bucket.
+   */
+  void onBestpathSourceChanged(
+      bool isV4,
+      std::optional<BgpRouteType> oldSrc,
+      std::optional<BgpRouteType> newSrc) {
+    if (oldSrc == newSrc) {
+      return;
+    }
+    auto& a = afiOf(isV4);
+    adjustSource(a, oldSrc, -1);
+    adjustSource(a, newSrc, +1);
+  }
+
+  /**
    * Zero the in-memory counts. Called on the RIB EventBase when the Loc-RIB is
    * bulk-cleared during controlled shutdown. The fb303 mirrors are
    * intentionally left untouched here: they are re-initialized on device bootup
@@ -109,6 +131,23 @@ class RibCounters {
     return afiOf(isV4).prefixLenCounts;
   }
 
+  /** Best-path counts for one address family by selected best path's source. */
+  int64_t ebgpPrefixes(bool isV4) const {
+    return afiOf(isV4).ebgp;
+  }
+  int64_t ibgpPrefixes(bool isV4) const {
+    return afiOf(isV4).ibgp;
+  }
+  int64_t confedEbgpPrefixes(bool isV4) const {
+    return afiOf(isV4).confedEbgp;
+  }
+  int64_t localPrefixes(bool isV4) const {
+    return afiOf(isV4).local;
+  }
+  int64_t unknownPrefixes(bool isV4) const {
+    return afiOf(isV4).unknown;
+  }
+
   /** Prefix count across both address families. */
   uint64_t totalPrefixes() const {
     return afis_[0].totalPrefixes + afis_[1].totalPrefixes;
@@ -124,11 +163,49 @@ class RibCounters {
   struct AfiCounters {
     uint64_t totalPrefixes{0};
     std::array<int64_t, kMaxPrefixLen + 1> prefixLenCounts{};
+    // Best-path source breakdown, by the selected best path's class. The
+    // `unknown` bucket maps 1:1 to BgpRouteType::UNKNOWN. getBgpPathType does
+    // not emit UNKNOWN today (its residual case is IBGP, the internal-peer
+    // class), so this bucket stays 0 in practice; it exists only so an UNKNOWN
+    // winner would land here rather than be folded into another source bucket.
+    int64_t ebgp{0};
+    int64_t ibgp{0};
+    int64_t confedEbgp{0};
+    int64_t local{0};
+    int64_t unknown{0};
   };
 
   // Clamp defensively; RIB prefix lengths are already within range.
   static uint8_t bucket(uint8_t prefixLen) {
     return prefixLen > kMaxPrefixLen ? kMaxPrefixLen : prefixLen;
+  }
+
+  static void
+  adjustSource(AfiCounters& a, std::optional<BgpRouteType> src, int64_t delta) {
+    if (!src) {
+      // No best path: not attributed to any source bucket.
+      return;
+    }
+    switch (*src) {
+      case BgpRouteType::EBGP:
+        a.ebgp += delta;
+        break;
+      case BgpRouteType::IBGP:
+        a.ibgp += delta;
+        break;
+      case BgpRouteType::ConfedEBGP:
+        a.confedEbgp += delta;
+        break;
+      case BgpRouteType::LOCAL:
+        a.local += delta;
+        break;
+      case BgpRouteType::UNKNOWN:
+        // 1:1 with the enum. getBgpPathType does not return UNKNOWN today (its
+        // residual case is IBGP), so this is reached only by direct callers; it
+        // keeps any UNKNOWN winner out of the other source buckets.
+        a.unknown += delta;
+        break;
+    }
   }
   AfiCounters& afiOf(bool isV4) {
     return afis_[isV4 ? 0 : 1];
