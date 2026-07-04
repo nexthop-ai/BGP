@@ -4217,24 +4217,6 @@ folly::coro::Task<void> PeerManager::processRibDumpReqForEgressPolicyUpdate(
   adjRib->clearPendingEgressPolicyUpdate(); // Clear flag after completion
 }
 
-/*
- * Orchestrate egress policy re-evaluation for one update group.
- *
- * WARNING: This method performs heavy synchronous processing. Each step
- * walks the full ShadowRib, which can be large. Steps 1 and 2 involve
- * policy evaluation and RIB-OUT tree mutations for every prefix.
- *
- * Step 1: Group-level ShadowRib walk (serves all IN_SYNC members).
- *   processRibAnnouncedEntryForGroup() deep compares with existing entries
- *   and lazy clones for detached peers before mutating group entries.
- *
- * Step 2: Individual processRibDumpReq() for each detached peer.
- *   Per-peer entries already exist (from prior detached processing or
- *   lazy clone in Step 1). processRibDumpReq() re-processes all ShadowRib
- *   entries through processRibAnnouncedEntry() with the new policy.
- *
- * Step 3: Clear pendingEgressPolicyUpdate for all IN_SYNC peers.
- */
 folly::coro::Task<void>
 PeerManager::processGroupEgressPolicyReEvaluationWithCancellationCoro(
     std::shared_ptr<AdjRibOutGroup> group) {
@@ -4287,52 +4269,45 @@ void PeerManager::processGroupEgressPolicyReEvaluation(
     std::shared_ptr<AdjRibOutGroup> group) {
   [[maybe_unused]] ScopedProfile profile(
       "PeerManager::processGroupEgressPolicyReEvaluation");
+
   XLOGF(
       INFO,
       "Group {}: Starting group egress policy re-evaluation",
       group->getAdjRibGroupName());
 
-  // Step 1: Rebuild every member's UpdateGroupKey, then move the group's map
-  // entry to the rebuilt key before re-evaluation.
-  for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
-    adjRib->buildAndSetUpdateGroupKey();
-  }
-  if (!group->getBitToAdjRibs().empty()) {
-    updateGroupManager_->rekeyGroup(
-        group, group->getBitToAdjRibs().begin()->second->getUpdateGroupKey());
-  }
-
-  // Step 2: Group-level re-evaluation (serves all IN_SYNC members)
+  // Step 1: Group-level re-evaluation (serves all IN_SYNC members)
   group->reEvaluateSyncPeersEgressPolicy();
 
-  // Step 3: Re-evaluate detached peers and clear pendingEgressPolicyUpdate.
+  /*
+   * Step 2: Detached peers are not served by the group walk above, so each
+   * needs its own RIB walk. Cancel any rib dump already scheduled for the peer
+   * and run the re-evaluation dump directly (inline) so it completes within
+   * this event-loop turn -- a deferred walk leaves a window where the peer
+   * could rejoin with stale (old-policy) entries and surface discrepancies
+   * during the collapse. In-sync peers were served by the group walk; clear
+   * each member's pending flag as we iterate.
+   */
   for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
-    if (isRibDumpScheduledForAdjRib(adjRib)) {
-      /*
-       * Peer already has a rib walk scheduled or in progress (buffered or in
-       * flight). Leave pendingEgressPolicyUpdate set so it gets picked up
-       * after.
-       */
-      XLOGF(
-          DBG1,
-          "Group {}: Peer {} has a rib walk scheduled, "
-          "deferring egress policy re-evaluation",
-          group->getAdjRibGroupName(),
-          adjRib->getPeerName());
-      continue;
-    }
-
     if (adjRib->isDetachedPeer()) {
-      // Detached peer: re-walk ShadowRib with new policy
       XLOGF(
           INFO,
           "Group {}: Re-evaluating detached peer {}",
           group->getAdjRibGroupName(),
           adjRib->getPeerName());
 
+      if (isRibDumpScheduledForAdjRib(adjRib)) {
+        XLOGF(
+            INFO,
+            "Group {}: Cancelling scheduled rib dump for peer {} to run egress "
+            "policy re-evaluation inline",
+            group->getAdjRibGroupName(),
+            adjRib->getPeerName());
+        cancelRibDumpForAdjRib(adjRib);
+      }
       processRibDumpReq(adjRib, adjRib->sendAddPath());
     }
 
+    /* This flag needs to be cleared for all peers in the group. */
     adjRib->clearPendingEgressPolicyUpdate();
   }
 

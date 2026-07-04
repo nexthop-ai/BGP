@@ -1058,6 +1058,110 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
     });
   }
 
+  /*
+   * Re-align every peer's stored UpdateGroupKey to its current group's key.
+   * A test that diverges a peer's key from its group (e.g. installs an override
+   * but does not move the peer) must call this before tearDown -- otherwise
+   * shutdown's maybeDestroyUpdateGroup keys off the stale key, never finds the
+   * group, and leaks it (and its AdjRibPolicyCache references).
+   */
+  void realignPeerKeysToGroupsOnEvb(TestContext& ctx) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      for (auto& [peerId, adjRib] : ctx.adjRibs) {
+        if (auto group = adjRib->getUpdateGroup()) {
+          adjRib->updateGroupKey_ = group->getGroupKey();
+        }
+      }
+    });
+  }
+
+  /*
+   * Retarget a group and all its members to a new egress policy without going
+   * through config (so the production async re-evaluation is NOT scheduled).
+   * The group walk reads the policy from the group key, and each detached
+   * peer's inline dump reads it from its own egressPolicyName_, so set both.
+   * Marks each member pending egress update. This sets up the precondition that
+   * rekeyAffectedUpdateGroups would establish before
+   * processGroupEgressPolicyReEvaluation runs.
+   */
+  void changeGroupEgressPolicyOnEvb(
+      TestContext& ctx,
+      const std::shared_ptr<AdjRibOutGroup>& group,
+      const std::string& policyName) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>> m;
+      m[bgp_policy::DIRECTION::OUT] = policyName;
+      std::optional<UpdateGroupKey> newKey;
+      for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
+        /*
+         * updateIngressEgressPolicyNames only updates the names and reports
+         * what changed; the caller owns the pending flag (as PeerManager does).
+         */
+        auto [_ingressChanged, egressChanged] =
+            adjRib->updateIngressEgressPolicyNames(m);
+        adjRib->setPendingEgressPolicyUpdate(egressChanged);
+        adjRib->buildAndSetUpdateGroupKey();
+        newKey = adjRib->getUpdateGroupKey();
+      }
+      if (newKey.has_value()) {
+        /*
+         * Rekey via the manager so its map entry tracks the new key too; a bare
+         * setGroupKey would leave the map keyed under the old key and prevent
+         * teardown from destroying the group (leaking its policy cache).
+         */
+        ctx.peerMgr->updateGroupManager_->rekeyGroup(group, *newKey);
+      }
+    });
+  }
+
+  /*
+   * Run PeerManager::processGroupEgressPolicyReEvaluation (private) to
+   * completion, blocking the test thread while it runs on the evb.
+   */
+  void processGroupEgressPolicyReEvaluationOnEvb(
+      TestContext& ctx,
+      const std::shared_ptr<AdjRibOutGroup>& group) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait(
+        [&]() { ctx.peerMgr->processGroupEgressPolicyReEvaluation(group); });
+  }
+
+  /*
+   * Drain all peers and poll until every change-list consumer for the group has
+   * reached the end of the change list (null marker): the group consumer (which
+   * serves the in-sync peers) and each detached peer's own consumer. Draining
+   * unblocks any peer whose full out-queue was stalling its consumer.
+   */
+  void expectPeersAtEndOfChangeList(
+      TestContext& ctx,
+      const std::shared_ptr<AdjRibOutGroup>& group) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    WITH_RETRIES({
+      for (auto& kv : ctx.adjRibs) {
+        drainQueue(ctx, kv.first);
+      }
+      auto atEnd =
+          folly::via(&evb, [&]() {
+            auto groupConsumer = group->getChangeListConsumer();
+            if (groupConsumer && groupConsumer->getMarker() != nullptr) {
+              return false;
+            }
+            for (const auto& [_, adjRib] : group->getBitToAdjRibs()) {
+              if (adjRib->isDetachedPeer()) {
+                auto consumer = adjRib->getDetachedConsumer();
+                if (consumer && consumer->getMarker() != nullptr) {
+                  return false;
+                }
+              }
+            }
+            return true;
+          }).get();
+      EXPECT_EVENTUALLY_TRUE(atEnd);
+    });
+  }
+
   static std::function<bool(const AdjRibEntry&, const folly::CIDRNetwork&)>
   verifyAdvertised() {
     return [](const AdjRibEntry& entry, const folly::CIDRNetwork& prefix) {

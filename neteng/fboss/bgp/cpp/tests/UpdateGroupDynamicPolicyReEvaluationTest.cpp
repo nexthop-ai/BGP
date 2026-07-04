@@ -327,7 +327,8 @@ TEST_F(
  *   IN_SYNC: clears pendingEgressPolicyUpdate immediately
  *   DETACHED (no rib dump scheduled): re-walks the ShadowRib via
  *     processRibDumpReq, which clears pending after
- *   DETACHED + rib dump scheduled: defers (pending flag stays set)
+ *   DETACHED + rib dump scheduled: cancels the scheduled dump, re-walks the
+ *     ShadowRib inline via processRibDumpReq, which clears pending after
  */
 TEST_F(
     UpdateGroupDynamicPolicyReEvaluationTest,
@@ -376,7 +377,7 @@ TEST_F(
   evb.runInEventBaseThreadAndWait(
       [&]() { ctx.peerMgr->scheduleRibDumpForAdjRib(ctx.adjRib3); });
 
-  // Change egress policy on all peers so rekeyGroup updates the map
+  // Change egress policy on all peers so re-evaluation sees the new policy
   evb.runInEventBaseThreadAndWait([&]() {
     folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>>
         newPolicy;
@@ -401,65 +402,10 @@ TEST_F(
       // adjRib2 (DETACHED_RUNNING): pending flag cleared after async rib dump
       EXPECT_EVENTUALLY_FALSE(ctx.adjRib2->isEgressPolicyUpdateRequired());
 
-      // adjRib3 (DETACHED_INIT_DUMP + rib dump scheduled): deferred
-      EXPECT_EVENTUALLY_TRUE(ctx.adjRib3->isEgressPolicyUpdateRequired());
+      // adjRib3 (DETACHED_INIT_DUMP + rib dump scheduled): scheduled dump
+      // cancelled and re-walked inline, pending flag cleared
+      EXPECT_EVENTUALLY_FALSE(ctx.adjRib3->isEgressPolicyUpdateRequired());
     });
-  });
-
-  // Verify the group was re-keyed in the UpdateGroupManager
-  evb.runInEventBaseThreadAndWait([&]() {
-    auto newKey = group->getGroupKey();
-    EXPECT_EQ(newKey.egressPolicyName, "new_group_policy");
-    EXPECT_FALSE(ctx.peerMgr->updateGroupManager_->hasGroup(originalKey));
-    EXPECT_TRUE(ctx.peerMgr->updateGroupManager_->hasGroup(newKey));
-  });
-
-  tearDown(ctx);
-}
-
-TEST_F(
-    UpdateGroupDynamicPolicyReEvaluationTest,
-    ProcessGroupEgressPolicyReEvaluation_UpdatesGroupKey) {
-  auto ctx = setUp(true /* enableUpdateGroup */);
-  auto& evb = ctx.peerMgr->getEventBase();
-
-  auto group = ctx.adjRib1->getUpdateGroup();
-  auto oldKey = group->getGroupKey();
-
-  // Move adjRib2 into adjRib1's group so they share a group
-  ctx.adjRib2->getUpdateGroup()->unregisterPeer(ctx.adjRib2);
-  group->registerPeer(ctx.adjRib2);
-  ctx.adjRib2->setUpdateGroup(group);
-
-  // Change the egress policy name on both peers
-  folly::F14FastMap<bgp_policy::DIRECTION, std::optional<std::string>>
-      newPolicy;
-  newPolicy[bgp_policy::DIRECTION::OUT] = "NEW_EGRESS_POLICY";
-  ctx.adjRib1->updateIngressEgressPolicyNames(newPolicy);
-  ctx.adjRib2->updateIngressEgressPolicyNames(newPolicy);
-
-  evb.runInEventBaseThreadAndWait([&]() {
-    ctx.adjRib1->setPendingEgressPolicyUpdate(true);
-    ctx.adjRib2->setPendingEgressPolicyUpdate(true);
-  });
-
-  evb.runInEventBaseThreadAndWait(
-      [&]() { ctx.peerMgr->processGroupEgressPolicyReEvaluation(group); });
-
-  evb.runInEventBaseThreadAndWait([&]() {
-    // Each peer's UpdateGroupKey should reflect the new policy
-    EXPECT_EQ(
-        ctx.adjRib1->getUpdateGroupKey().egressPolicyName, "NEW_EGRESS_POLICY");
-    EXPECT_EQ(
-        ctx.adjRib2->getUpdateGroupKey().egressPolicyName, "NEW_EGRESS_POLICY");
-
-    // The group's key should also be updated
-    EXPECT_EQ(group->getGroupKey().egressPolicyName, "NEW_EGRESS_POLICY");
-    EXPECT_NE(group->getGroupKey(), oldKey);
-
-    // Pending flags should be cleared
-    EXPECT_FALSE(ctx.adjRib1->isEgressPolicyUpdateRequired());
-    EXPECT_FALSE(ctx.adjRib2->isEgressPolicyUpdateRequired());
   });
 
   tearDown(ctx);

@@ -39,70 +39,6 @@ namespace facebook::bgp {
 class UpdateGroupPeerGroupAndPolicyReEvalTest
     : public UpdateGroupPolicyReEvalUTBase {};
 
-TEST_F(UpdateGroupPeerGroupAndPolicyReEvalTest, FixtureSetup_KeyAndState) {
-  auto ctx = setUp(2);
-  sendInitialRibDump(ctx);
-  auto& evb = ctx.peerMgr->getEventBase();
-
-  evb.runInEventBaseThreadAndWait([&]() {
-    auto peerId0 = makePeerId(0);
-    auto peerId1 = makePeerId(1);
-    auto& adjRib0 = ctx.adjRibs.at(peerId0);
-    auto& adjRib1 = ctx.adjRibs.at(peerId1);
-
-    auto group = adjRib0->getUpdateGroup();
-    ASSERT_NE(group, nullptr);
-    EXPECT_EQ(adjRib1->getUpdateGroup().get(), group.get());
-
-    const auto& groupKey = group->getGroupKey();
-    EXPECT_EQ(groupKey.egressPolicyName, kPNameMatchNoAdvtDeny);
-    EXPECT_FALSE(groupKey.peerOverride);
-    EXPECT_EQ(groupKey.peerGroupName, "PEERGROUP_A");
-
-    const auto& peerKey0 = adjRib0->getUpdateGroupKey();
-    EXPECT_EQ(peerKey0.egressPolicyName, kPNameMatchNoAdvtDeny);
-    EXPECT_FALSE(peerKey0.peerOverride);
-    EXPECT_EQ(peerKey0, groupKey);
-
-    const auto& peerKey1 = adjRib1->getUpdateGroupKey();
-    EXPECT_EQ(peerKey1, groupKey);
-
-    EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
-    EXPECT_EQ(adjRib1->getPeerState(), PeerUpdateState::JOINED_RUNNING);
-
-    EXPECT_EQ(group->getMemberCount(), 2);
-  });
-
-  auto peerId0 = makePeerId(0);
-  updatePeerEgressPolicyOnEvb(ctx, peerId0, kPNameMatchModifyAppend);
-
-  evb.runInEventBaseThreadAndWait([&]() {
-    auto& adjRib0 = ctx.adjRibs.at(peerId0);
-    adjRib0->buildAndSetUpdateGroupKey();
-    const auto& updatedKey = adjRib0->getUpdateGroupKey();
-    EXPECT_EQ(updatedKey.egressPolicyName, kPNameMatchModifyAppend);
-    EXPECT_TRUE(updatedKey.peerOverride);
-  });
-
-  /*
-   * Clear peer0's per-peer override so its update group key matches the group
-   * it is still a member of. The override was only set for the assertion above;
-   * the peer was never moved to a matching group, so leaving the key diverged
-   * makes shutdown's maybeDestroyUpdateGroup key off peer0's stale override
-   * key, never find the group, and leak it. unsetPeersPolicy (not
-   * setPeersPolicy) is required to actually remove the override and clear
-   * peerOverride.
-   */
-  unsetPeerEgressPolicyOnEvb(ctx, peerId0);
-  evb.runInEventBaseThreadAndWait([&]() {
-    auto& adjRib0 = ctx.adjRibs.at(peerId0);
-    adjRib0->buildAndSetUpdateGroupKey();
-    EXPECT_FALSE(adjRib0->getUpdateGroupKey().peerOverride);
-  });
-
-  tearDown(ctx);
-}
-
 TEST_F(
     UpdateGroupPeerGroupAndPolicyReEvalTest,
     TriggerDetachedBlocked_FrequencyDetach) {
@@ -1094,6 +1030,194 @@ TEST_F(
     EXPECT_TRUE(adjRib->isEgressPolicyUpdateRequired());
   });
 
+  tearDown(ctx);
+}
+
+/*
+ * Tests for the execution of PeerManager::processGroupEgressPolicyReEvaluation
+ * on a group with one in-sync peer (JOINED_BLOCKED) and one detached peer. The
+ * in-sync peer is served by the group-level walk (reEvaluateSyncPeersEgress-
+ * Policy); the detached peer -- which the group walk does not serve -- is
+ * re-evaluated by its own inline RIB dump. Each detached state is paired with
+ * the JOINED_BLOCKED peer in its own test.
+ */
+class GroupEgressPolicyReEvalExecution : public UpdateGroupPolicyReEvalUTBase {
+ protected:
+  // Block peer0 (an in-sync peer) so it becomes JOINED_BLOCKED.
+  void makePeer0JoinedBlocked(TestContext& ctx) {
+    blockGroupViaPeerOnEvb(ctx, makePeerId(0));
+    publishRouteUpdates(ctx, /*isInitialDump=*/false);
+    expectEventualStateOnEvb(
+        ctx, makePeerId(0), PeerUpdateState::JOINED_BLOCKED);
+  }
+
+  /*
+   * Retarget the group to an accept-all policy, run the re-evaluation, and
+   * verify both the in-sync JOINED_BLOCKED peer0 (served by the group walk) and
+   * the detached peer1 (served by its inline dump) advertise every route with
+   * the policy's modify action applied, and both pending flags are cleared.
+   */
+  void verifyReEvalAdvertisesToBothPeers(
+      TestContext& ctx,
+      const std::shared_ptr<AdjRibOutGroup>& group) {
+    /*
+     * Baseline: the default deny policy (kPNameMatchNoAdvtDeny) withholds the
+     * 50 odd-indexed routes, so only the 50 even ones are advertised to peer0.
+     * Probe just the even routes -- verifyAdvertised asserts the route is
+     * advertised, so running it over the denied odd routes would fail.
+     */
+    EXPECT_EQ(
+        verifyRibOutEntries(
+            ctx,
+            makePeerId(0),
+            [](int i) { return i % 2 == 0; },
+            verifyAdvertised()),
+        50);
+
+    // Retarget the group + members to an accept-all policy and re-evaluate.
+    changeGroupEgressPolicyOnEvb(ctx, group, kPNameMatchModifyAppend);
+    processGroupEgressPolicyReEvaluationOnEvb(ctx, group);
+
+    // Both consumers (group + detached peer) settle at the end of the CL.
+    expectPeersAtEndOfChangeList(ctx, group);
+
+    for (const auto& peerId : {makePeerId(0), makePeerId(1)}) {
+      /*
+       * All kRouteCount routes (odd and even) are now advertised: peer0 via the
+       * group walk, the detached peer via its inline dump.
+       */
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx, peerId, [](int) { return true; }, verifyAdvertised()),
+          kRouteCount);
+      /*
+       * The egress policy's modify action is applied: the 34 kPCommModify
+       * routes (i % 3 == 0) carry the appended community.
+       */
+      EXPECT_EQ(
+          verifyRibOutEntries(
+              ctx,
+              peerId,
+              [](int i) { return i % 3 == 0; },
+              verifyCommOnAdvertisedRoute(kPCommAppend)),
+          34);
+    }
+
+    // Every member's pending egress flag is cleared.
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      EXPECT_FALSE(
+          ctx.adjRibs.at(makePeerId(0))->isEgressPolicyUpdateRequired());
+      EXPECT_FALSE(
+          ctx.adjRibs.at(makePeerId(1))->isEgressPolicyUpdateRequired());
+    });
+  }
+};
+
+/*
+ * JOINED_BLOCKED peer0 + DETACHED_BLOCKED peer1: re-evaluation re-advertises
+ * all routes to both.
+ */
+TEST_F(GroupEgressPolicyReEvalExecution, JoinedBlockedAndDetachedBlocked) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  expectEventualStateOnEvb(ctx, makePeerId(0), PeerUpdateState::JOINED_RUNNING);
+
+  triggerDetachedBlockedFromJoinedOnEvb(ctx, makePeerId(1));
+  expectEventualStateOnEvb(
+      ctx, makePeerId(1), PeerUpdateState::DETACHED_BLOCKED);
+  makePeer0JoinedBlocked(ctx);
+
+  verifyReEvalAdvertisesToBothPeers(
+      ctx, ctx.adjRibs.at(makePeerId(0))->getUpdateGroup());
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * JOINED_BLOCKED peer0 + DETACHED_READY_TO_JOIN peer1: re-evaluation
+ * re-advertises all routes to both.
+ */
+TEST_F(GroupEgressPolicyReEvalExecution, JoinedBlockedAndDetachedReadyToJoin) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  expectEventualStateOnEvb(ctx, makePeerId(0), PeerUpdateState::JOINED_RUNNING);
+
+  /*
+   * triggerPeerDetachedReadyToJoin uses peer0 as the blocker, which leaves it
+   * JOINED_BLOCKED (the only synced member, so it blocks but is not detached).
+   */
+  triggerPeerDetachedReadyToJoin(ctx, makePeerId(1), /*isDFP=*/true);
+  expectEventualStateOnEvb(
+      ctx, makePeerId(1), PeerUpdateState::DETACHED_READY_TO_JOIN);
+  expectEventualStateOnEvb(ctx, makePeerId(0), PeerUpdateState::JOINED_BLOCKED);
+
+  verifyReEvalAdvertisesToBothPeers(
+      ctx, ctx.adjRibs.at(makePeerId(0))->getUpdateGroup());
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * JOINED_BLOCKED peer0 + DETACHED_INIT_DUMP peer1: re-evaluation re-advertises
+ * all routes to both.
+ */
+TEST_F(GroupEgressPolicyReEvalExecution, JoinedBlockedAndDetachedInitDump) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  expectEventualStateOnEvb(ctx, makePeerId(0), PeerUpdateState::JOINED_RUNNING);
+
+  triggerDetachedInitDump(ctx, 1);
+  expectEventualStateOnEvb(
+      ctx, makePeerId(1), PeerUpdateState::DETACHED_INIT_DUMP);
+  makePeer0JoinedBlocked(ctx);
+
+  verifyReEvalAdvertisesToBothPeers(
+      ctx, ctx.adjRibs.at(makePeerId(0))->getUpdateGroup());
+
+  realignPeerKeysToGroupsOnEvb(ctx);
+  tearDown(ctx);
+}
+
+/*
+ * A rib dump already scheduled for the detached peer is cancelled and re-run
+ * inline by the re-evaluation (so the peer can't rejoin with stale, old-policy
+ * entries). Fake the "scheduled" state by arming the peer's rib-dump
+ * cancellation source directly -- no async dump, so the cancel branch is
+ * exercised deterministically.
+ */
+TEST_F(GroupEgressPolicyReEvalExecution, CancelsDetachedPeerScheduledRibDump) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  expectEventualStateOnEvb(ctx, makePeerId(0), PeerUpdateState::JOINED_RUNNING);
+  triggerDetachedBlockedFromJoinedOnEvb(ctx, makePeerId(1));
+  expectEventualStateOnEvb(
+      ctx, makePeerId(1), PeerUpdateState::DETACHED_BLOCKED);
+  auto group = ctx.adjRibs.at(makePeerId(0))->getUpdateGroup();
+  ASSERT_NE(group, nullptr);
+
+  auto detached = ctx.adjRibs.at(makePeerId(1));
+  auto& evb = ctx.peerMgr->getEventBase();
+
+  /*
+   * Arm the detached peer's rib-dump cancellation source to mimic a scheduled
+   * dump (getCancellationTokenForNewRibDump only emplaces the source).
+   */
+  evb.runInEventBaseThreadAndWait(
+      [&]() { detached->getCancellationTokenForNewRibDump(); });
+  EXPECT_TRUE(
+      folly::via(&evb, [&]() { return detached->isRibDumpScheduled(); }).get());
+
+  changeGroupEgressPolicyOnEvb(ctx, group, kPNameMatchModifyAppend);
+  processGroupEgressPolicyReEvaluationOnEvb(ctx, group);
+
+  // The scheduled dump was cancelled and the re-evaluation ran it inline.
+  EXPECT_FALSE(
+      folly::via(&evb, [&]() { return detached->isRibDumpScheduled(); }).get());
+
+  realignPeerKeysToGroupsOnEvb(ctx);
   tearDown(ctx);
 }
 
