@@ -164,6 +164,21 @@ void AdjRibStats::incrementPreOutPrefixCount(bool isIpv4) {
 }
 
 void AdjRibStats::decrementPreOutPrefixCount(bool isIpv4) {
+  if (preOutPrefixCount == 0) {
+    /*
+     * Underflow guard: clamp instead of wrapping the unsigned counter, matching
+     * subtractFromTotalSentPrefixCount. Indicates an increment/decrement
+     * accounting bug upstream. Rate-limited so a stuck call site can't flood
+     * the log. The per-family counters are already 0 when the aggregate is 0,
+     * so leave them untouched.
+     */
+    XLOGF_EVERY_MS(
+        ERR,
+        200000,
+        "preOutPrefixCount underflow: decrementing below 0 for peer {}",
+        peerIdOdsStr);
+    return;
+  }
   preOutPrefixCount--;
   if (isIpv4) {
     preOutPrefixCountIpv4--;
@@ -190,11 +205,39 @@ void AdjRibStats::incrementPostOutPrefixCount(bool isIpv4, uint32_t numPeers) {
 }
 
 void AdjRibStats::decrementPostOutPrefixCount(bool isIpv4, uint32_t numPeers) {
+  if (postOutPrefixCount == 0) {
+    /*
+     * Underflow guard: clamp instead of wrapping the unsigned counter, matching
+     * subtractFromTotalSentPrefixCount and decrementPreOutPrefixCount. Return
+     * early so this container's counter and the global totalSentPrefixCount
+     * cannot diverge silently: with nothing left in this container there is
+     * nothing to remove from the global on its behalf. Rate-limited so a stuck
+     * call site can't flood the log. The per-family counters are already 0 when
+     * the aggregate is 0, so leave them untouched.
+     */
+    XLOGF_EVERY_MS(
+        ERR,
+        200000,
+        "postOutPrefixCount underflow: decrementing below 0 for peer {}",
+        peerIdOdsStr);
+    return;
+  }
   postOutPrefixCount--;
   if (isIpv4) {
     postOutPrefixCountIpv4--;
   } else {
     postOutPrefixCountIpv6--;
+  }
+  if (numPeers > totalSentPrefixCount) {
+    /* Underflow guard: clamp the global to 0 rather than wrapping. */
+    XLOGF_EVERY_MS(
+        ERR,
+        200000,
+        "totalSentPrefixCount underflow: subtracting {} from {} for peer {}",
+        numPeers,
+        totalSentPrefixCount,
+        peerIdOdsStr);
+    numPeers = totalSentPrefixCount;
   }
   totalSentPrefixCount -= numPeers;
   PeerStats::setPeerPostOutPrefixes(peerIdOdsStr, postOutPrefixCount);
@@ -211,6 +254,37 @@ void AdjRibStats::copyEgressPrefixCountsFrom(const AdjRibStats& other) {
   preOutPrefixCountIpv6 = other.preOutPrefixCountIpv6;
   PeerStats::setPeerPostOutPrefixes(peerIdOdsStr, postOutPrefixCount);
   PeerStats::setPeerPreOutPrefixes(peerIdOdsStr, preOutPrefixCount);
+}
+
+void AdjRibStats::clearEgressPrefixCounts() {
+  preOutPrefixCount = 0;
+  preOutPrefixCountIpv4 = 0;
+  preOutPrefixCountIpv6 = 0;
+  postOutPrefixCount = 0;
+  postOutPrefixCountIpv4 = 0;
+  postOutPrefixCountIpv6 = 0;
+  PeerStats::setPeerPostOutPrefixes(peerIdOdsStr, postOutPrefixCount);
+  PeerStats::setPeerPreOutPrefixes(peerIdOdsStr, preOutPrefixCount);
+}
+
+void AdjRibStats::subtractFromTotalSentPrefixCount(uint32_t count) {
+  if (count > totalSentPrefixCount) {
+    /*
+     * Underflow guard: we are removing more than the global total holds, which
+     * indicates an increment/decrement accounting bug upstream. Clamp to avoid
+     * wrapping the unsigned counter and log for investigation.
+     */
+    XLOGF_EVERY_MS(
+        ERR,
+        200000,
+        "totalSentPrefixCount underflow: attempted to subtract {} from {}",
+        count,
+        totalSentPrefixCount);
+    count = totalSentPrefixCount;
+  }
+  totalSentPrefixCount -= count;
+  PeerStats::setTotalSentPrefixes(totalSentPrefixCount);
+  PeerStats::setTotalPaths(totalRcvdPrefixCount + totalSentPrefixCount);
 }
 
 /*******************************************************************************

@@ -173,6 +173,27 @@ class AdjRibStats {
 
   void copyEgressPrefixCountsFrom(const AdjRibStats& other);
 
+  /*
+   * Reset this container's egress (out) prefix counts to zero without touching
+   * the global totalSentPrefixCount. Used when a detached peer rejoins its
+   * group: the peer stops counting independently and folds back into the
+   * group's shared accounting, so its snapshot counts are cleared while the
+   * global total (which already reflects this peer's advertisements, now
+   * tracked via the group) is left as-is.
+   */
+  void clearEgressPrefixCounts();
+
+  /*
+   * Subtract a departed peer's advertised-prefix contribution from the global
+   * totalSentPrefixCount, without altering any per-container
+   * postOutPrefixCount. Used on peer-down under update groups: an in-sync peer
+   * removes the group's postOutPrefixCount (it shared the group's RIB-OUT), a
+   * detached peer removes its own. The per-container counts are intentionally
+   * left untouched -- the group keeps advertising to its remaining in-sync
+   * peers, and a detached peer's snapshot is discarded together with the peer.
+   */
+  void subtractFromTotalSentPrefixCount(uint32_t count);
+
   void incrementEgressQueueBackpressuredEvents();
 
   uint32_t getEgressQueueBackpressuredEvents() const {

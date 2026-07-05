@@ -783,23 +783,79 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
   }
 
   /*
-   * Cleanup adjRibOut radix tree by freeing all bgp attrs.
-   * When update groups are enabled this loop frees nothing — a detached peer's
-   * per-peer entries were already erased by cleanUpDetachedRibEntries, and
-   * in-sync peers have no entries under the peer owner key (they share the
-   * group owner key).
+   * Cleanup adjRibOut radix tree by freeing all bgp attrs. Only needed when
+   * update groups are disabled. With update groups enabled this AdjRib owns no
+   * entries under its peer owner key -- in-sync peers share the group owner
+   * key, and a detached peer's per-peer entries are erased by
+   * AdjRibOutGroup::cleanUpDetachedRibEntries on unregister. The global
+   * totalSentPrefixCount is likewise reconciled in
+   * AdjRibOutGroup::unregisterPeer (by the group's postOutPrefixCount for
+   * in-sync peers, or the peer's own for detached peers). Running this loop
+   * then would risk double-counting the global total, so skip it entirely.
    */
-  std::vector<folly::CIDRNetwork> deletePrefixSet;
-  if (sendAddPath_) {
-    auto itr = adjRibOutGroup_->PathTree_.begin();
-    while (itr != adjRibOutGroup_->PathTree_.end()) {
-      auto ownerItr = itr->value().find(getPeerOwnerKey());
-      if (ownerItr == itr->value().end()) {
-        itr++;
-        continue;
-      }
+  if (!enableUpdateGroup_) {
+    std::vector<folly::CIDRNetwork> deletePrefixSet;
+    if (sendAddPath_) {
+      auto itr = adjRibOutGroup_->PathTree_.begin();
+      while (itr != adjRibOutGroup_->PathTree_.end()) {
+        auto ownerItr = itr->value().find(getPeerOwnerKey());
+        if (ownerItr == itr->value().end()) {
+          itr++;
+          continue;
+        }
 
-      for (const auto& [_, adjRibEntry] : ownerItr->second) {
+        for (const auto& [_, adjRibEntry] : ownerItr->second) {
+          if (adjRibEntry->getPostAttr()) {
+            adjRibEntry->setPostAttr(nullptr);
+            XLOGF_IF(
+                DBG1,
+                stats_.getPostOutPrefixCount() == 0,
+                "Invalid sent prefix count for {}",
+                getPeerName());
+            stats_.decrementPostOutPrefixCount(itr.ipAddress().isV4());
+          }
+          adjRibEntry->setPreOut(nullptr);
+        }
+        ownerItr->second.clear();
+        itr->value().erase(getPeerOwnerKey());
+        if (itr->value().size() == 0) {
+          if (itr == adjRibOutGroup_->PathTree_.begin()) {
+            /**
+             * On egress, in the most common case, all peers in the same group
+             * share the same to be advertised routes. So, if this was the last
+             * remotePeerId_ for this prefix, likely-hood is all the prefixes
+             * have only this last peer that is going away. Thus, if we find
+             * this to be the case for the first prefix in the tree, then it is
+             * most effecient to erase this prefix and start from new begin()
+             */
+            adjRibOutGroup_->PathTree_.erase(itr);
+            itr = adjRibOutGroup_->PathTree_.begin();
+            continue;
+          } else {
+            /**
+             * If the prefix is not the first in the tree for which last peer
+             * reference is removed then likely hitting very un-common case
+             * where only this prefix or few of such prefixes are without any
+             * peers. And so very few prefixes to be removed from the tree. In
+             * that case save the list of those prefixes, iterate over them,
+             * after this loop is complete, to remove them from the tree
+             */
+            deletePrefixSet.emplace_back(itr.ipAddress(), itr.masklen());
+          }
+        }
+
+        itr++;
+      }
+    } else {
+      auto itr = adjRibOutGroup_->LiteTree_.begin();
+      while (itr != adjRibOutGroup_->LiteTree_.end()) {
+        auto ownerItr = itr->value().find(getPeerOwnerKey());
+        if (ownerItr == itr->value().end()) {
+          itr++;
+          continue;
+        }
+
+        auto adjRibEntry = ownerItr->second.get();
         if (adjRibEntry->getPostAttr()) {
           adjRibEntry->setPostAttr(nullptr);
           XLOGF_IF(
@@ -810,81 +866,31 @@ folly::coro::Task<void> AdjRib::sessionTerminated(
           stats_.decrementPostOutPrefixCount(itr.ipAddress().isV4());
         }
         adjRibEntry->setPreOut(nullptr);
-      }
-      ownerItr->second.clear();
-      itr->value().erase(getPeerOwnerKey());
-      if (itr->value().size() == 0) {
-        if (itr == adjRibOutGroup_->PathTree_.begin()) {
-          /**
-           * On egress, in the most common case, all peers in the same group
-           * share the same to be advertised routes. So, if this was the last
-           * remotePeerId_ for this prefix, likely-hood is all the prefixes have
-           * only this last peer that is going away. Thus, if we find this to be
-           * the case for the first prefix in the tree, then it is most
-           * effecient to erase this prefix and start from new begin()
-           */
-          adjRibOutGroup_->PathTree_.erase(itr);
-          itr = adjRibOutGroup_->PathTree_.begin();
-          continue;
-        } else {
-          /**
-           * If the prefix is not the first in the tree for which last peer
-           * reference is removed then likely hitting very un-common case where
-           * only this prefix or few of such prefixes are without any peers.
-           * And so very few prefixes to be removed from the tree. In that case
-           * save the list of those prefixes, iterate over them, after this loop
-           * is complete, to remove them from the tree
-           */
-          deletePrefixSet.emplace_back(itr.ipAddress(), itr.masklen());
+        itr->value().erase(getPeerOwnerKey());
+        if (itr->value().size() == 0) {
+          if (itr == adjRibOutGroup_->LiteTree_.begin()) {
+            adjRibOutGroup_->LiteTree_.erase(itr);
+            itr = adjRibOutGroup_->LiteTree_.begin();
+            continue;
+          } else {
+            deletePrefixSet.emplace_back(itr.ipAddress(), itr.masklen());
+          }
         }
-      }
-
-      itr++;
-    }
-  } else {
-    auto itr = adjRibOutGroup_->LiteTree_.begin();
-    while (itr != adjRibOutGroup_->LiteTree_.end()) {
-      auto ownerItr = itr->value().find(getPeerOwnerKey());
-      if (ownerItr == itr->value().end()) {
         itr++;
-        continue;
       }
-
-      auto adjRibEntry = ownerItr->second.get();
-      if (adjRibEntry->getPostAttr()) {
-        adjRibEntry->setPostAttr(nullptr);
-        XLOGF_IF(
-            DBG1,
-            stats_.getPostOutPrefixCount() == 0,
-            "Invalid sent prefix count for {}",
-            getPeerName());
-        stats_.decrementPostOutPrefixCount(itr.ipAddress().isV4());
-      }
-      adjRibEntry->setPreOut(nullptr);
-      itr->value().erase(getPeerOwnerKey());
-      if (itr->value().size() == 0) {
-        if (itr == adjRibOutGroup_->LiteTree_.begin()) {
-          adjRibOutGroup_->LiteTree_.erase(itr);
-          itr = adjRibOutGroup_->LiteTree_.begin();
-          continue;
-        } else {
-          deletePrefixSet.emplace_back(itr.ipAddress(), itr.masklen());
-        }
-      }
-      itr++;
     }
-  }
 
-  /**
-   * If to be deleted prefix set is non-empty, remove them from the
-   * relevant radix tree
-   */
-  if (!deletePrefixSet.empty()) {
-    for (const auto& prefix : deletePrefixSet) {
-      if (sendAddPath_) {
-        adjRibOutGroup_->PathTree_.erase(prefix.first, prefix.second);
-      } else {
-        adjRibOutGroup_->LiteTree_.erase(prefix.first, prefix.second);
+    /**
+     * If to be deleted prefix set is non-empty, remove them from the
+     * relevant radix tree
+     */
+    if (!deletePrefixSet.empty()) {
+      for (const auto& prefix : deletePrefixSet) {
+        if (sendAddPath_) {
+          adjRibOutGroup_->PathTree_.erase(prefix.first, prefix.second);
+        } else {
+          adjRibOutGroup_->LiteTree_.erase(prefix.first, prefix.second);
+        }
       }
     }
   }
@@ -1201,7 +1207,7 @@ AdjRib::getPostPolicyAttributesPolicyTermAndInfo(
 }
 
 /*
- * @brief  Arm this peer's OWN change list consumer to track the FULL change
+ * @brief  Set up this peer's OWN change list consumer to track the FULL change
  *         list. Used by an in-sync peer (and by all peers when update groups
  *         are disabled).
  *
@@ -1368,14 +1374,14 @@ void AdjRib::deactivateChangeListConsumer() noexcept {
  *         this peer. Used by a detached peer running independently behind/at
  *         its update group.
  *
- *         Unlike activateChangeListConsumer() (which arms the peer's existing
- *         consumer to consume the ENTIRE change list), this CREATES a new
- *         "DetachedCL-<peer>" consumer whose polled timer consumes only UP TO
- *         the group consumer's marker via
+ *         Unlike activateChangeListConsumer() (which sets up the peer's
+ *         existing consumer to consume the ENTIRE change list), this CREATES a
+ *         new "DetachedCL-<peer>" consumer whose polled timer consumes only UP
+ *         TO the group consumer's marker via
  *         iterateChangesUntilExcluding(groupMarker): a detached peer must never
  *         advance past the group on the change list, to preserve lazy-clone
- *         correctness. The timer is created unscheduled; sendBgpUpdates() arms
- *         it after the packing list drains.
+ *         correctness. The timer is created unscheduled; sendBgpUpdates()
+ *         schedules it after the packing list drains.
  *
  * @return void
  */

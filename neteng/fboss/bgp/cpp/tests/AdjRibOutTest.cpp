@@ -3952,12 +3952,20 @@ TEST_F(AdjRibOutboundFixture, ProcessRibWithdrawTest) {
 
     adjRib_->processRibWithdraw(kV4Prefix1, 0);
 
-    EXPECT_EQ(2, messages.size());
+    // decrementPostOutPrefixCount returns early on the postOutPrefixCount == 0
+    // underflow path, so it does not reach the totalSentPrefixCount decrement
+    // (keeping per-container and global counters from diverging). Hence only
+    // the postOutPrefixCount underflow is logged, not a totalSentPrefixCount
+    // underflow.
+    EXPECT_EQ(3, messages.size());
     EXPECT_TRUE(
         messages[0].first.getMessage().starts_with(
             "Invalid sent prefix count"));
     EXPECT_TRUE(
-        messages[1].first.getMessage().starts_with("Withdrawing prefix"));
+        messages[1].first.getMessage().starts_with(
+            "postOutPrefixCount underflow"));
+    EXPECT_TRUE(
+        messages[2].first.getMessage().starts_with("Withdrawing prefix"));
   }
 }
 
@@ -3999,12 +4007,18 @@ TEST_F(AdjRibOutboundFixture, TryInsertWithdrawalTest) {
     adjRib_->tryInsertWithdrawal(
         kV4Prefix1, &adjRibEntry, "Dummy inserted", "Dummy not inserted");
 
-    EXPECT_EQ(2, messages.size());
-    // stats_.getPostOutPrefixCount == 0 is invalid
+    // stats_.getPostOutPrefixCount == 0 is invalid. decrementPostOutPrefixCount
+    // returns early on this underflow path, so it does not reach the
+    // totalSentPrefixCount decrement -- only the postOutPrefixCount underflow
+    // is logged.
+    EXPECT_EQ(3, messages.size());
     EXPECT_TRUE(
         messages[0].first.getMessage().starts_with(
             "Invalid sent prefix count"));
-    EXPECT_EQ(messages[1].first.getMessage(), "Dummy inserted");
+    EXPECT_TRUE(
+        messages[1].first.getMessage().starts_with(
+            "postOutPrefixCount underflow"));
+    EXPECT_EQ(messages[2].first.getMessage(), "Dummy inserted");
   }
 }
 

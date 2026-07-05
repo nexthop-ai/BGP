@@ -673,6 +673,10 @@ class AdjRib : boost::noncopyable,
     stats_.copyEgressPrefixCountsFrom(other);
   }
 
+  void clearEgressPrefixCounts() {
+    stats_.clearEgressPrefixCounts();
+  }
+
   void incrementPreOutPrefixCount(bool isIpv4) {
     stats_.incrementPreOutPrefixCount(isIpv4);
   }

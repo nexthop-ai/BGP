@@ -449,6 +449,68 @@ TEST_F(SplitToGroup, MovesJoinedRunningPeer) {
 }
 
 /*
+ * Regression: splitToNewGroup seeds the new group's egress prefix counts from
+ * the source group (copyGroupFieldsToNewGroup -> copyEgressPrefixCountsFrom),
+ * so the new group's postOutPrefixCount matches the prefix set it inherits at
+ * split time instead of starting at 0. Left at 0, a later withdrawal would
+ * underflow it and an in-sync peer going down would subtract 0 from the global
+ * totalSentPrefixCount (leaking that peer's share). The global total itself is
+ * unchanged by the split -- it only re-homes existing advertisements.
+ */
+TEST_F(SplitToGroup, CopiesEgressPrefixCountsToNewGroup) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  auto peerId1 = makePeerId(1);
+  expectEventualStateOnEvb(ctx, peerId1, PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId1);
+    auto sourceGroup = adjRib->getUpdateGroup();
+
+    /* Source already advertises the setup routes -> nonzero postOut. */
+    const auto srcPost = sourceGroup->getStats().getPostOutPrefixCount();
+    const auto srcPostV4 = sourceGroup->getStats().getPostOutPrefixCountIpv4();
+    const auto srcPostV6 = sourceGroup->getStats().getPostOutPrefixCountIpv6();
+    const auto srcPre = sourceGroup->getStats().getPreOutPrefixCount();
+    ASSERT_GT(srcPost, 0u);
+
+    const auto globalBefore = totalSentPrefixCount;
+
+    auto targetGroup = std::make_shared<AdjRibOutGroup>(
+        evb,
+        "split_target",
+        sourceGroup->getGroupId() + 1,
+        /*enableUpdateGroup=*/true,
+        sourceGroup->getGroupKey());
+    sourceGroup->splitToNewGroup(targetGroup, {adjRib});
+
+    /* New group inherits the counts; source group's counts are unchanged. */
+    EXPECT_EQ(targetGroup->getStats().getPostOutPrefixCount(), srcPost);
+    EXPECT_EQ(targetGroup->getStats().getPostOutPrefixCountIpv4(), srcPostV4);
+    EXPECT_EQ(targetGroup->getStats().getPostOutPrefixCountIpv6(), srcPostV6);
+    EXPECT_EQ(targetGroup->getStats().getPreOutPrefixCount(), srcPre);
+    EXPECT_EQ(sourceGroup->getStats().getPostOutPrefixCount(), srcPost);
+
+    /* The split re-homes existing advertisements: global total is untouched. */
+    EXPECT_EQ(totalSentPrefixCount, globalBefore);
+
+    /* Mandatory cleanup of the unmanaged target group (see other split tests).
+     */
+    targetGroup->unregisterPeer(adjRib);
+    adjRib->setUpdateGroup(nullptr);
+    if (auto consumer = targetGroup->getChangeListConsumer()) {
+      consumer->resetBitmap();
+      consumer->terminate();
+      consumer->deregisterFromTracker();
+    }
+    targetGroup->resetChangeListConsumer();
+  });
+
+  tearDown(ctx);
+}
+
+/*
  * A JOINED_BLOCKED peer is still an in-sync state: the split preserves the
  * blocked state, keeps it in sync, and preserves its RIB-OUT entry-for-entry.
  */

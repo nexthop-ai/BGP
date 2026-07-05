@@ -110,7 +110,13 @@
       DSPRejoinDeferredUntilGroupPackingListDrains);                           \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachLifecycleTest,                                          \
-      AheadDepASelfPromotesWhenGroupHasNoSharingPeers);
+      AheadDepASelfPromotesWhenGroupHasNoSharingPeers);                        \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      SyncPeerDownSubtractsGroupShareFromGlobal);                              \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      DetachedPeerDownSubtractsOwnShareFromGlobal);
 
 #define AdjRibOutGroup_TEST_FRIENDS                                            \
   friend class UpdateGroupDetachedPeerTest;                                    \
@@ -214,7 +220,13 @@
       UpdateGroupDetachedPeerTest, PromoteLitePeerOnlyEntryMovedToGroupKey);   \
   FRIEND_TEST(                                                                 \
       UpdateGroupDetachedPeerTest, PromotePathMovesPeerPathsToGroupKey);       \
-  FRIEND_TEST(UpdateGroupDetachedPeerTest, PromotePathDeletesGroupOnlyEntry);
+  FRIEND_TEST(UpdateGroupDetachedPeerTest, PromotePathDeletesGroupOnlyEntry);  \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      SyncPeerDownSubtractsGroupShareFromGlobal);                              \
+  FRIEND_TEST(                                                                 \
+      UpdateGroupDetachLifecycleTest,                                          \
+      DetachedPeerDownSubtractsOwnShareFromGlobal);
 
 #include <fmt/core.h>
 #include <folly/coro/BlockingWait.h>
@@ -1887,6 +1899,59 @@ TEST_F(UpdateGroupDetachedPeerTest, PromoteDetachedPeerToSyncTransitionsPeer) {
   // Group adopted the peer's RIB version; peer's detached version was reset.
   EXPECT_EQ(group_->getLastSeenRibVersion(), 99);
   EXPECT_EQ(adjRib->getDetachedRibVersion(), 0);
+
+  // Cleanup before the local tracker is destroyed.
+  group_->resetChangeListConsumer();
+}
+
+/*
+ * Test (Rule 6): promoting a detached peer to sync makes the group adopt the
+ * peer's egress counts, clears the peer's snapshot (via markPeerInSync), and
+ * leaves the global totalSentPrefixCount untouched -- promotion advertises
+ * nothing, it only re-parents the sole surviving view of the RIB-OUT.
+ */
+TEST_F(UpdateGroupDetachedPeerTest, PromoteDetachedPeerAdoptsPeerEgressCounts) {
+  auto adjRib = createAndRegisterPeer(0);
+
+  // Wire the group's tracker so registerGroupConsumer() can create its
+  // consumer, and give the detached peer its own CL consumer to be promoted at.
+  auto changeTracker =
+      std::make_shared<ChangeTracker<ShadowRibEntry>>("test_tracker");
+  ConsumerBitmap addPathBitmap;
+  ConsumerBitmap nonAddPathBitmap;
+  group_->setChangeListTracker(changeTracker, addPathBitmap, nonAddPathBitmap);
+  adjRib->registerDetachedConsumer(
+      changeTracker, addPathBitmap, nonAddPathBitmap);
+
+  group_->markPeerDetached(adjRib);
+  adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib->setLastSeenRibVersion(99);
+
+  /*
+   * The detached peer has advertised 2 prefixes independently; the group's
+   * counts are stale (0 here, since it has no in-sync peers left).
+   */
+  auto totalSentBefore = totalSentPrefixCount;
+  adjRib->incrementPostOutPrefixCount(true /* isIpv4 */);
+  adjRib->incrementPostOutPrefixCount(true /* isIpv4 */);
+  adjRib->incrementPreOutPrefixCount(true /* isIpv4 */);
+  adjRib->incrementPreOutPrefixCount(true /* isIpv4 */);
+  EXPECT_EQ(adjRib->getStats().getPostOutPrefixCount(), 2);
+  EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 0);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 2);
+
+  group_->promoteDetachedPeerToSync(adjRib);
+
+  /*
+   * Group adopts the peer's counts, the peer's snapshot is cleared, and the
+   * global total is unchanged by the promotion.
+   */
+  EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 2);
+  EXPECT_EQ(group_->getStats().getPreOutPrefixCount(), 2);
+  EXPECT_EQ(adjRib->getStats().getPostOutPrefixCount(), 0);
+  EXPECT_EQ(adjRib->getStats().getPreOutPrefixCount(), 0);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 2);
 
   // Cleanup before the local tracker is destroyed.
   group_->resetChangeListConsumer();
@@ -4975,16 +5040,106 @@ TEST_F(
   setGroupConsumerReady();
   group_->checkAndAcceptReadyToJoinPeers();
 
-  /* After rejoin, peer's counts should match the group's counts */
+  /*
+   * After rejoin the peer folds back into the group's shared accounting, so
+   * markPeerInSync clears its snapshot egress counts. The group keeps the
+   * counts, and the global totalSentPrefixCount is untouched by the rejoin --
+   * nothing is advertised or withdrawn.
+   */
   EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::JOINED_RUNNING);
+  EXPECT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 0);
+  EXPECT_EQ(adjRib0->getStats().getPreOutPrefixCount(), 0);
+  EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 4);
+  EXPECT_EQ(group_->getStats().getPreOutPrefixCount(), 4);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 8);
+}
+
+/*
+ * Test (Rule 4): when an in-sync peer goes down, the group's local counts are
+ * left untouched, but the peer's share of the global totalSentPrefixCount --
+ * equal to the group's postOutPrefixCount -- is removed.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    SyncPeerDownSubtractsGroupShareFromGlobal) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib0, 0);
+  setUpJoinedRunningPeer(adjRib1, 1);
+
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  TinyPeerInfo peerInfo{
+      folly::IPAddress("1.1.1.1"), 65000, 0, BgpSessionType::EBGP, false};
+
+  auto totalSentBefore = totalSentPrefixCount;
+
+  /* Group announces 3 v4 prefixes to its 2 in-sync peers. */
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix2, kV4Prefix3}) {
+    RibOutAnnouncementEntry entry{prefix, kDefaultPathID, peerInfo, attrs};
+    group_->processRibAnnouncedEntryForGroup(entry);
+  }
+  EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 3);
+  /* 2 in-sync peers * 3 prefixes. */
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 6);
+
+  /* An in-sync peer goes down. */
+  group_->unregisterPeer(adjRib0);
+
+  /* Group local counts unchanged; global drops by the group's share (3). */
+  EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 3);
+  EXPECT_EQ(group_->getNumInSyncPeers(), 1);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 3);
+}
+
+/*
+ * Test (Rule 5): when a detached peer goes down, its OWN postOutPrefixCount
+ * (which may differ from the group's after independent processing) is removed
+ * from the global totalSentPrefixCount, and the group's local counts are left
+ * untouched.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    DetachedPeerDownSubtractsOwnShareFromGlobal) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib0, 0);
+  setUpJoinedRunningPeer(adjRib1, 1);
+  group_->setLastSeenRibVersion(42);
+
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  TinyPeerInfo peerInfo{
+      folly::IPAddress("1.1.1.1"), 65000, 0, BgpSessionType::EBGP, false};
+
+  auto totalSentBefore = totalSentPrefixCount;
+
+  /* Group announces 3 v4 prefixes to its 2 in-sync peers. */
+  for (const auto& prefix : {kV4Prefix1, kV4Prefix2, kV4Prefix3}) {
+    RibOutAnnouncementEntry entry{prefix, kDefaultPathID, peerInfo, attrs};
+    group_->processRibAnnouncedEntryForGroup(entry);
+  }
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 6);
+
+  /* Detach peer 0: it snapshots the group's egress counts (3); global steady.
+   */
+  adjRib0->setPeerState(PeerUpdateState::JOINED_BLOCKED);
+  group_->markPeerBlocked(adjRib0);
+  group_->detachSlowPeer(adjRib0);
+  ASSERT_TRUE(adjRib0->isDetachedPeer());
+  EXPECT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 3);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 6);
+
+  /* Peer 0 independently advertises one more prefix: own count and global +1.
+   */
+  adjRib0->incrementPostOutPrefixCount(true /* isIpv4 */);
+  adjRib0->incrementPreOutPrefixCount(true /* isIpv4 */);
   EXPECT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 4);
-  EXPECT_EQ(adjRib0->getStats().getPreOutPrefixCount(), 4);
-  EXPECT_EQ(
-      adjRib0->getStats().getPostOutPrefixCount(),
-      group_->getStats().getPostOutPrefixCount());
-  EXPECT_EQ(
-      adjRib0->getStats().getPreOutPrefixCount(),
-      group_->getStats().getPreOutPrefixCount());
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 7);
+
+  /* Detached peer goes down: remove its OWN contribution (4) from the global.
+   */
+  group_->unregisterPeer(adjRib0);
+  EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 3);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 3);
 }
 
 /*

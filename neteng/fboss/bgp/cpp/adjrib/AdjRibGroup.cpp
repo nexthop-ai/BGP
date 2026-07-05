@@ -1473,7 +1473,8 @@ AdjRibEntry* FOLLY_NULLABLE AdjRibOutGroup::tryInsertRibOutEntry(
  *         Similar to AdjRib::tryInsertWithdrawal but operates at group level
  *
  * Key differences from peer-level:
- * - Skips stats tracking (no stats_.decrementPostOutPrefixCount)
+ * - Decrements the group's postOutPrefixCount by getNumInSyncPeers() -- the
+ *   prefix was advertised to every in-sync peer -- not by 1
  * - Uses tryUpdateAttrToPrefixMapForGroup instead of tryUpdateAttrToPrefixMap
  * - Logs with group name instead of peer name
  *
@@ -2463,8 +2464,37 @@ void AdjRibOutGroup::unregisterPeer(
      * cleanUpDetachedRibEntries depends on the detachedRibVersion for
      * counting.
      */
+    /*
+     * A detached peer counted its own advertisements independently, so remove
+     * its own postOutPrefixCount from the global totalSentPrefixCount. Read the
+     * count here, while the peer's snapshot is still intact: neither
+     * cleanUpDetachedRibEntries nor deactivateDetachedModeProcessing changes
+     * it, and the AdjRib::sessionTerminated teardown loop is a no-op for this
+     * peer once cleanUpDetachedRibEntries has erased its per-peer entries.
+     */
+    stats_.subtractFromTotalSentPrefixCount(
+        adjRib->getStats().getPostOutPrefixCount());
     cleanUpDetachedRibEntries(adjRib);
     adjRib->deactivateDetachedModeProcessing();
+  } else if (isPeerInSync(bit)) {
+    /*
+     * An in-sync peer shares the group's RIB-OUT, so the prefixes it advertised
+     * equal the group's postOutPrefixCount. Remove that single peer's share
+     * from the global total. The group's own local counts are left untouched
+     * because it keeps advertising the same prefixes to its remaining in-sync
+     * peers.
+     *
+     * Gate on isPeerInSync: only in-sync peers are counted in the global, so a
+     * peer torn down before reaching in-sync must not subtract its group share.
+     *
+     * Gate on enableUpdateGroup_: when update groups are disabled, the
+     * AdjRib::sessionTerminated teardown loop decrements the global per-prefix
+     * (itself guarded by !enableUpdateGroup_), so subtracting the group share
+     * here too would double-decrement.
+     */
+    if (enableUpdateGroup_) {
+      stats_.subtractFromTotalSentPrefixCount(stats_.getPostOutPrefixCount());
+    }
   }
 
   XLOGF(
@@ -2604,8 +2634,9 @@ void AdjRibOutGroup::decrementPeersDetachedAfterJoin() noexcept {
      * Underflow: a peer is leaving the detached set but the counter is already
      * zero. This indicates an increment/decrement accounting bug.
      */
-    XLOGF(
+    XLOGF_EVERY_MS(
         ERR,
+        200000,
         "Group {}: numPeersDetachedAfterJoin_ underflow on decrement",
         groupDescriptor_);
     return;
@@ -2958,6 +2989,17 @@ void AdjRibOutGroup::copyGroupFieldsToNewGroup(
   newGroup->egressEoRPendingV6_ = egressEoRPendingV6_;
   newGroup->updateGroupConfig_ = updateGroupConfig_;
   newGroup->initialDumpCompletionTimeMs_ = initialDumpCompletionTimeMs_;
+  /*
+   * The split copies this group's RIB-OUT entries into newGroup (see
+   * movePeersSharedRibOut*), so newGroup advertises the same prefix set at
+   * split time. Seed its egress prefix counts to match, or newGroup's
+   * postOutPrefixCount would stay 0 while it advertises real prefixes: a later
+   * withdrawal would underflow it, and an in-sync peer going down would
+   * subtract 0 from the global totalSentPrefixCount (leaking that peer's
+   * share). The global total itself is left untouched -- the split advertises
+   * nothing new, it just re-homes existing advertisements under newGroup.
+   */
+  newGroup->stats_.copyEgressPrefixCountsFrom(stats_);
 }
 
 void AdjRibOutGroup::splitToNewGroup(
@@ -3373,6 +3415,38 @@ void AdjRibOutGroup::markPeerInSync(
   auto bit = adjRib->getGroupBitPosition();
   setSyncBit(bit);
   detachedPeers_.erase(adjRib);
+  /*
+   * The peer is folding back into the group's shared accounting, so it no
+   * longer counts advertisements independently. Clear its snapshot egress
+   * counts. The global totalSentPrefixCount is left untouched: the peer's
+   * already-sent prefixes stay counted and are now tracked via the group.
+   * (On promotion, promoteDetachedPeerToSync first copies these counts into the
+   * group's stats_ so the group adopts the peer's view before this clear.)
+   *
+   * By this point the peer's snapshot egress counts should already equal the
+   * group's -- the rejoin collapse / promotion reconciled the RIB-OUTs. A
+   * mismatch indicates an upstream increment/decrement accounting bug. We do
+   * NOT reconcile here: the group's stats_ is authoritative and we still clear
+   * so the peer folds in cleanly. The mismatch is surfaced only via the ERR
+   * log below (grep/Scuba) -- there is intentionally no ODS counter for it, so
+   * a resulting global divergence is observable in logs but not in ODS charts.
+   */
+  const auto& peerStats = adjRib->getStats();
+  if (peerStats.getPreOutPrefixCount() != stats_.getPreOutPrefixCount() ||
+      peerStats.getPostOutPrefixCount() != stats_.getPostOutPrefixCount()) {
+    XLOGF(
+        ERR,
+        "Group {}: Peer {} egress prefix counts differ from the group before "
+        "clearing on markPeerInSync (peer preOut {} / postOut {}, group "
+        "preOut {} / postOut {})",
+        groupDescriptor_,
+        adjRib->getPeerName(),
+        peerStats.getPreOutPrefixCount(),
+        peerStats.getPostOutPrefixCount(),
+        stats_.getPreOutPrefixCount(),
+        stats_.getPostOutPrefixCount());
+  }
+  adjRib->clearEgressPrefixCounts();
   XLOGF(
       DBG2,
       "Group {}: Peer {} at bit {} marked in sync",
@@ -3866,7 +3940,17 @@ void AdjRibOutGroup::promoteDetachedPeerToSync(
    */
   adjRib->deactivateDetachedModeProcessing();
 
-  /* 6. Mark the peer in sync (sets sync bit, removes it from detachedPeers_).
+  /*
+   * 6. The promoted peer's RIB-OUT is now the group's source of truth, so adopt
+   * its egress prefix counts into the group's stats_ (the group's prior counts
+   * are stale -- it had no in-sync peers). The global totalSentPrefixCount is
+   * left unchanged: promotion advertises/withdraws nothing and the peer's
+   * contribution is already counted. markPeerInSync (below) then clears the
+   * peer's snapshot counts.
+   */
+  stats_.copyEgressPrefixCountsFrom(adjRib->getStats());
+
+  /* 7. Mark the peer in sync (sets sync bit, removes it from detachedPeers_).
    */
   adjRib->setPeerState(PeerUpdateState::JOINED_RUNNING);
   adjRib->incrementTimesRejoined();
