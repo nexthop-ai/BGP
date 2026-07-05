@@ -482,8 +482,10 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
 
   /*
    * Build initial RIB dump from shadow RIB. Returns lastSeenRibVersion_.
+   * @param sendWithEoR - true if the peer still has pending EoRs to send,
+   *        false if the peer has already sent EoRs (e.g., group move).
    */
-  uint64_t processRibDumpForGroup();
+  uint64_t processRibDumpForGroup(bool sendWithEoR = true);
 
   /*
    * Build initial dump, transition INIT peers to JOINED_RUNNING,

@@ -599,7 +599,8 @@ class PeerManager : public BgpModuleBase, public MonitoredModule {
       std::shared_ptr<AdjRib> adjRib);
   void processRibDumpReq(
       const std::shared_ptr<AdjRib>& adjRib,
-      bool sendAddPath);
+      bool sendAddPath,
+      bool sendWithEoR);
 
   /*
    * Whether a rib dump is pending for this peer in either form: buffered in

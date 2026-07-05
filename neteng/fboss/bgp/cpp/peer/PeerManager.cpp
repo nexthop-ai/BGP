@@ -952,7 +952,8 @@ folly::coro::Task<void> PeerManager::processRibDumpReqCoro(
     co_return;
   }
 
-  processRibDumpReq(adjrib->second, ribDumpReq.sendAddPath);
+  processRibDumpReq(
+      adjrib->second, ribDumpReq.sendAddPath, true /* sendWithEoR */);
   co_return;
 }
 
@@ -1011,13 +1012,14 @@ folly::coro::Task<void> PeerManager::processRibDumpReqWithCancellationCoro(
     }
   };
 
-  processRibDumpReq(adjRib, adjRib->sendAddPath());
+  processRibDumpReq(adjRib, adjRib->sendAddPath(), /*sendWithEoR=*/true);
   co_return;
 }
 
 void PeerManager::processRibDumpReq(
     const std::shared_ptr<AdjRib>& adjRib,
-    bool sendAddPath) {
+    bool sendAddPath,
+    bool sendWithEoR) {
   [[maybe_unused]] ScopedProfile profile("PeerManager::processRibDumpReq");
   auto ribVersionBeforeWalk = adjRib->getLastSeenRibVersion();
   XLOGF(
@@ -1101,8 +1103,8 @@ void PeerManager::processRibDumpReq(
     }
   }
 
-  // Last RibOutAnnouncement with `sendWithEoR` flag set to indicate End-of-Rib.
-  announcement.sendWithEoR = true;
+  // Last RibOutAnnouncement with `sendWithEoR` flag to indicate End-of-Rib.
+  announcement.sendWithEoR = sendWithEoR;
 
   XLOGF(DBG1, "{}", formatRibOutAnnouncementLog(announcement));
 
@@ -4092,7 +4094,10 @@ PeerManager::processUpdateGroupsEgressPolicyReevaluation() {
                 adjRib->getPeerName());
             cancelRibDumpForAdjRib(adjRib);
           }
-          processRibDumpReq(adjRib, adjRib->sendAddPath());
+          processRibDumpReq(
+              adjRib,
+              adjRib->sendAddPath(),
+              adjRib->egressEoRsPending() /* sendWithEoR */);
           adjRib->clearPendingEgressPolicyUpdate();
         }
       }
@@ -4226,7 +4231,10 @@ void PeerManager::processGroupEgressPolicyReEvaluation(
             adjRib->getPeerName());
         cancelRibDumpForAdjRib(adjRib);
       }
-      processRibDumpReq(adjRib, adjRib->sendAddPath());
+      processRibDumpReq(
+          adjRib,
+          adjRib->sendAddPath(),
+          adjRib->egressEoRsPending() /* sendWithEoR */);
     }
 
     /* This flag needs to be cleared for all peers in the group. */

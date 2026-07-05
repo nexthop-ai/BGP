@@ -677,9 +677,12 @@ uint64_t AdjRibOutGroup::walkAndProcessShadowRib(bool sendWithEoR) {
  * Walks shadow RIB, builds RibOutAnnouncement, processes it.
  * Transitions from UNINITIALIZED to WAITING state.
  */
-uint64_t AdjRibOutGroup::processRibDumpForGroup() {
+uint64_t AdjRibOutGroup::processRibDumpForGroup(bool sendWithEoR) {
   XLOGF(
-      INFO, "Group {} starting initial dump from shadow RIB", groupDescriptor_);
+      INFO,
+      "Group {} starting initial dump from shadow RIB (sendWithEoR={})",
+      groupDescriptor_,
+      sendWithEoR);
 
   if (!shadowRibEntries_) {
     XLOGF(
@@ -690,7 +693,7 @@ uint64_t AdjRibOutGroup::processRibDumpForGroup() {
     return lastSeenRibVersion_;
   }
 
-  auto maxRibVersion = walkAndProcessShadowRib(true /* sendWithEoR */);
+  auto maxRibVersion = walkAndProcessShadowRib(sendWithEoR);
 
   /*
    * Transition to WAITING state - ready to send updates
@@ -736,15 +739,6 @@ AdjRibOutGroup::buildAndScheduleSendInitialDumpFromShadowRib() {
     if (!adjRib) {
       continue;
     }
-    /*
-     * The group's initial dump (with EoR) is now complete, so members are no
-     * longer in their initial announcement. The non-update-group path clears
-     * this per peer after sending the initial dump's EoR
-     * (PeerManager::distributeRibOutAnnouncementToAdjRibs); do the equivalent
-     * here for the whole group. Leaving it set would suppress later egress
-     * policy re-evaluation (setPendingEgressPolicyUpdate is a no-op while a
-     * peer is in initial announcement).
-     */
     adjRib->resetInInitialAnnouncement();
     if (adjRib->getPeerState() == PeerUpdateState::INIT) {
       XLOGF(
