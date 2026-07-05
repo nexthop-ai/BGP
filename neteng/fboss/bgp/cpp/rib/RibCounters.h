@@ -66,6 +66,20 @@ class RibCounters {
     RibStats::decrRibPrefixCount();
   }
 
+  /**
+   * The number of paths held for one prefix changed by `delta` (positive when
+   * paths are announced, negative when withdrawn). Driven from the single
+   * RIB-in choke point as the change in that prefix's total path count, so it
+   * is add-path-correct: one peer advertising several add-path IDs for a prefix
+   * contributes one per ID. A no-op when `delta` is 0.
+   */
+  void onPathsDelta(bool isV4, int64_t delta) {
+    if (delta == 0) {
+      return;
+    }
+    afiOf(isV4).totalPaths += delta;
+  }
+
   /** The set of locally-originated routes was (re)computed to `count`. */
   void setOriginatedRoutes(uint64_t count) {
     originatedRoutes_ = count;
@@ -122,6 +136,11 @@ class RibCounters {
     return afiOf(isV4).totalPrefixes;
   }
 
+  /** Path count for one address family (add-path-correct; see onPathsDelta). */
+  uint64_t totalPaths(bool isV4) const {
+    return afiOf(isV4).totalPaths;
+  }
+
   /**
    * Per-prefix-length counts for one address family, indexed by prefix
    * length. Index i holds the number of /i prefixes in that family.
@@ -168,6 +187,11 @@ class RibCounters {
   uint64_t totalPrefixes() const {
     return afis_[0].totalPrefixes + afis_[1].totalPrefixes;
   }
+
+  /** Path count across both address families (add-path-correct). */
+  uint64_t totalPaths() const {
+    return afis_[0].totalPaths + afis_[1].totalPaths;
+  }
   uint64_t originatedRoutes() const {
     return originatedRoutes_;
   }
@@ -178,6 +202,7 @@ class RibCounters {
  private:
   struct AfiCounters {
     uint64_t totalPrefixes{0};
+    uint64_t totalPaths{0};
     std::array<int64_t, kMaxPrefixLen + 1> prefixLenCounts{};
     // Best-path source breakdown, by the selected best path's class. The
     // `unknown` bucket maps 1:1 to BgpRouteType::UNKNOWN. getBgpPathType does

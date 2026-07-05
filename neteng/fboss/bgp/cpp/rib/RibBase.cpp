@@ -743,6 +743,17 @@ RibBase::processSingleRibInUpdate(
    * entry reference after this call
    */
   auto newAllPathCnt = entry.getAllPathsCnt();
+
+  /*
+   * Single maintenance point for the per-AFI total path count: the change in
+   * this prefix's path count is add-path-correct here, and aggregate routes
+   * also funnel through this method.
+   */
+  ribCounters_.onPathsDelta(
+      prefix.first.isV4(),
+      static_cast<int64_t>(newAllPathCnt) -
+          static_cast<int64_t>(oldAllPathCnt));
+
   if (!attrs) {
     checkWithdrawalBeforeRouteProgrammed(prefix, entry);
   }
@@ -2222,6 +2233,7 @@ TRibSummary RibBase::getRibSummary(TBgpAfi afi) {
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
     const bool isV4 = afi == TBgpAfi::AFI_IPV4;
     summary.total_prefixes() = ribCounters_.totalPrefixes(isV4);
+    summary.total_paths() = ribCounters_.totalPaths(isV4);
     const auto& counts = ribCounters_.prefixLenCounts(isV4);
     for (size_t len = 0; len < counts.size(); ++len) {
       if (counts[len] != 0) {
@@ -2728,13 +2740,15 @@ rib_policy::TRibPolicy RibBase::getRibPolicy() {
 void RibBase::updateEntryStats(TEntryStats& stats) noexcept {
   stats.total_ucast_routes() = ribEntries_.size();
   stats.total_originated_routes() = localRoutes_.size();
-  uint64_t totalRibPaths = 0;
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    for (const auto& [_, ribEntry] : ribEntries_) {
-      totalRibPaths += ribEntry.getAllPathsCnt();
-    }
-  });
-  stats.total_rib_paths() = totalRibPaths;
+
+  /*
+   * total_rib_paths is the add-path-correct sum of every prefix's path count.
+   * RibCounters maintains it incrementally on the RIB evb (see onPathsDelta),
+   * so read it directly instead of walking all ribEntries_ (O(total paths)) on
+   * every getEntryStats call.
+   */
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
+      [&]() { stats.total_rib_paths() = ribCounters_.totalPaths(); });
 }
 
 void RibBase::clearRibPolicy() {

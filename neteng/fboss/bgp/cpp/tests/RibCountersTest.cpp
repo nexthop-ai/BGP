@@ -80,6 +80,35 @@ TEST(RibCountersTest, PerAfiPrefixAndPerLengthCounts) {
   EXPECT_EQ(2, c.totalPrefixes(/*isV4=*/true));
 }
 
+// Total paths are tracked per address family from signed deltas (positive on
+// announce, negative on withdraw), so add-path -- multiple paths from one peer
+// for a prefix, surfacing as a delta > 1 -- is counted correctly. The fb303
+// mirror is added in a later diff; this verifies the in-memory field only.
+TEST(RibCountersTest, TotalPathsPerAfiFromDeltas) {
+  RibStats::initCounters();
+  RibCounters c;
+  EXPECT_EQ(0, c.totalPaths());
+
+  // v4 prefix gains a first path, then a second add-path from the same peer.
+  c.onPathsDelta(/*isV4=*/true, 1);
+  c.onPathsDelta(/*isV4=*/true, 1);
+  // v6 prefix gains two paths in one update (e.g. two peers).
+  c.onPathsDelta(/*isV4=*/false, 2);
+
+  EXPECT_EQ(2, c.totalPaths(/*isV4=*/true));
+  EXPECT_EQ(2, c.totalPaths(/*isV4=*/false));
+  EXPECT_EQ(4, c.totalPaths());
+
+  // Withdrawing one v4 path decrements only v4; v6 is untouched.
+  c.onPathsDelta(/*isV4=*/true, -1);
+  EXPECT_EQ(1, c.totalPaths(/*isV4=*/true));
+  EXPECT_EQ(2, c.totalPaths(/*isV4=*/false));
+
+  // A zero delta (an update that did not change the path count) is a no-op.
+  c.onPathsDelta(/*isV4=*/true, 0);
+  EXPECT_EQ(1, c.totalPaths(/*isV4=*/true));
+}
+
 TEST(RibCountersTest, OriginatedRoutesTracksFieldAndFb303) {
   RibStats::initCounters();
   RibCounters c;
@@ -186,6 +215,7 @@ TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   RibCounters c;
   c.onPrefixAdded(/*isV4=*/true, 24);
   c.onPrefixAdded(/*isV4=*/false, 64);
+  c.onPathsDelta(/*isV4=*/true, 3);
   c.setOriginatedRoutes(5);
   c.onUnresolvableNexthopAdded();
   c.onBestpathSourceChanged(
@@ -194,6 +224,7 @@ TEST(RibCountersTest, ResetZeroesInMemoryFields) {
   c.reset();
   EXPECT_EQ(0, c.totalPrefixes());
   EXPECT_EQ(0, c.totalPrefixes(/*isV4=*/true));
+  EXPECT_EQ(0, c.totalPaths());
   EXPECT_EQ(0, c.prefixLenCounts(/*isV4=*/false)[64]);
   EXPECT_EQ(0, c.originatedRoutes());
   EXPECT_EQ(0, c.unresolvableNexthops());

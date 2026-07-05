@@ -225,6 +225,8 @@ TEST_F(RibFixture, GetRibSummarySourceBreakdown) {
 
   auto summary = rib_->getRibSummary(TBgpAfi::AFI_IPV6);
   EXPECT_EQ(2, summary.total_prefixes().value());
+  // Two prefixes, one path each (no add-path), so two total paths.
+  EXPECT_EQ(2, summary.total_paths().value());
   EXPECT_EQ(1, summary.ebgp_prefixes().value());
   EXPECT_EQ(1, summary.ibgp_prefixes().value());
   EXPECT_EQ(0, summary.confed_ebgp_prefixes().value());
@@ -237,6 +239,7 @@ TEST_F(RibFixture, GetRibSummarySourceBreakdown) {
   // The other address family is empty.
   auto v4Summary = rib_->getRibSummary(TBgpAfi::AFI_IPV4);
   EXPECT_EQ(0, v4Summary.total_prefixes().value());
+  EXPECT_EQ(0, v4Summary.total_paths().value());
 }
 
 /*
