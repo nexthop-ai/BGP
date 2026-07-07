@@ -3430,83 +3430,88 @@ GrLoadResult PeerManagerBase::readGrState() const noexcept {
   };
 }
 
+void PeerManagerBase::applyRouteFilterPolicy(
+    std::unique_ptr<RouteFilterPolicy> policy,
+    bool forceUpdate) noexcept {
+  if (!forceUpdate && routeFilterPolicy_ && policy &&
+      routeFilterPolicy_->getVersion() > policy->getVersion()) {
+    XLOGF(
+        WARNING,
+        "Route filter policy update ignored: version {} < {}",
+        policy->getVersion(),
+        routeFilterPolicy_->getVersion());
+    return;
+  }
+
+  routeFilterPolicy_ = std::move(policy);
+
+  // Mark affected adjRibs and count changes
+  size_t ingressAffectedCount = 0;
+  size_t egressAffectedCount = 0;
+
+  for (auto& [peerId, adjRib] : adjRibs_) {
+    auto [ingressChanged, egressChanged] = setRouteFilterStatement(adjRib);
+
+    /**
+     * Mark adjRib as pending policy update if new policy changed in the
+     * ingress or egress.
+     *
+     * These flags will be cleared after policy re-evaluation:
+     * - Ingress flag: cleared in processAdjRibReEvaluationTask() after
+     *  calling adjRib->processAdjRibReEvaluation()
+     * - Egress flag: for non-update-group, cleared in
+     *  processRibDumpReqForEgressPolicyUpdate() after the per-peer dump
+     *  completes. For update-group, cleared once the scheduled rib dump
+     *  completes in processRibDumpReqWithCancellationCoro(), and
+     *  processGroupEgressPolicyReEvaluation() additionally clears it for
+     *  in-sync peers served by the group walk rather than a per-peer dump.
+     *
+     */
+
+    adjRib->setPendingIngressPolicyUpdate(ingressChanged);
+    adjRib->setPendingEgressPolicyUpdate(egressChanged);
+
+    // Collect stats for number of adjRibs affected by the policy change
+    if (adjRib->isPendingIngressPolicyUpdate()) {
+      ingressAffectedCount++;
+    }
+    if (adjRib->isEgressPolicyUpdateRequired()) {
+      egressAffectedCount++;
+    }
+    setGoldenPrefixPolicy(adjRib);
+  }
+
+  // Record stats for number of peers affected by the route filter policy
+  // change
+  BgpStats::setIngressRouteFilterPolicyAffectedPeers(ingressAffectedCount);
+  BgpStats::setEgressRouteFilterPolicyAffectedPeers(egressAffectedCount);
+
+  // Only call processIngressAndEgressRouteFilterUpdate if any adjRib's
+  // route filter policy updated
+  if (ingressAffectedCount == 0 && egressAffectedCount == 0) {
+    XLOG(INFO, "Route filter policy update: no adjRibs affected");
+    return;
+  }
+
+  XLOGF(
+      INFO,
+      "Route filter policy update for : {} ingress, {} egress adjRibs",
+      ingressAffectedCount,
+      egressAffectedCount);
+
+  asyncScope_.add(co_withExecutor(
+      &evb_,
+      processIngressAndEgressRouteFilterUpdate(
+          ingressAffectedCount, egressAffectedCount)));
+}
+
 void PeerManagerBase::setRouteFilterPolicy(
     std::unique_ptr<RouteFilterPolicy> policy,
     bool forceUpdate) noexcept {
-  evb_.runInEventBaseThread([policy = std::move(policy),
-                             forceUpdate,
-                             this]() mutable {
-    if (!forceUpdate && routeFilterPolicy_ && policy &&
-        routeFilterPolicy_->getVersion() > policy->getVersion()) {
-      XLOGF(
-          WARNING,
-          "Route filter policy update ignored: version {} < {}",
-          policy->getVersion(),
-          routeFilterPolicy_->getVersion());
-      return;
-    }
-
-    routeFilterPolicy_ = std::move(policy);
-
-    // Mark affected adjRibs and count changes
-    size_t ingressAffectedCount = 0;
-    size_t egressAffectedCount = 0;
-
-    for (auto& [peerId, adjRib] : adjRibs_) {
-      auto [ingressChanged, egressChanged] = setRouteFilterStatement(adjRib);
-
-      /**
-       * Mark adjRib as pending policy update if new policy changed in the
-       * ingress or egress.
-       *
-       * These flags will be cleared after policy re-evaluation:
-       * - Ingress flag: cleared in processAdjRibReEvaluationTask() after
-       *  calling adjRib->processAdjRibReEvaluation()
-       * - Egress flag: for non-update-group, cleared in
-       *  processRibDumpReqForEgressPolicyUpdate() after the per-peer dump
-       *  completes. For update-group, cleared once the scheduled rib dump
-       *  completes in processRibDumpReqWithCancellationCoro(), and
-       *  processGroupEgressPolicyReEvaluation() additionally clears it for
-       *  in-sync peers served by the group walk rather than a per-peer dump.
-       *
-       */
-
-      adjRib->setPendingIngressPolicyUpdate(ingressChanged);
-      adjRib->setPendingEgressPolicyUpdate(egressChanged);
-
-      // Collect stats for number of adjRibs affected by the policy change
-      if (adjRib->isPendingIngressPolicyUpdate()) {
-        ingressAffectedCount++;
-      }
-      if (adjRib->isEgressPolicyUpdateRequired()) {
-        egressAffectedCount++;
-      }
-      setGoldenPrefixPolicy(adjRib);
-    }
-
-    // Record stats for number of peers affected by the route filter policy
-    // change
-    BgpStats::setIngressRouteFilterPolicyAffectedPeers(ingressAffectedCount);
-    BgpStats::setEgressRouteFilterPolicyAffectedPeers(egressAffectedCount);
-
-    // Only call processIngressAndEgressRouteFilterUpdate if any adjRib's
-    // route filter policy updated
-    if (ingressAffectedCount == 0 && egressAffectedCount == 0) {
-      XLOG(INFO, "Route filter policy update: no adjRibs affected");
-      return;
-    }
-
-    XLOGF(
-        INFO,
-        "Route filter policy update for : {} ingress, {} egress adjRibs",
-        ingressAffectedCount,
-        egressAffectedCount);
-
-    asyncScope_.add(co_withExecutor(
-        &evb_,
-        processIngressAndEgressRouteFilterUpdate(
-            ingressAffectedCount, egressAffectedCount)));
-  });
+  evb_.runInEventBaseThread(
+      [policy = std::move(policy), forceUpdate, this]() mutable {
+        applyRouteFilterPolicy(std::move(policy), forceUpdate);
+      });
 }
 
 void PeerManagerBase::clearIngressEgressRouteFiltersPolicy() noexcept {

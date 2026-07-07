@@ -882,6 +882,15 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
   std::pair<folly::IPAddress, std::unique_ptr<PeeringParams>>
   getStreamPeeringParams();
 
+  /*
+   * Apply (or, with a null policy, clear) the route filter policy and
+   * propagate it to affected adjRibs. MUST be called on the evb_ thread;
+   * setRouteFilterPolicy() is the public entry point that schedules this.
+   */
+  void applyRouteFilterPolicy(
+      std::unique_ptr<RouteFilterPolicy> policy,
+      bool forceUpdate) noexcept;
+
   std::tuple<bool, bool> setRouteFilterStatement(
       std::shared_ptr<AdjRib> adjRib) noexcept;
   bool setGoldenPrefixPolicy(
