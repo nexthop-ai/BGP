@@ -39,6 +39,11 @@ jobs:
       # (fboss/github/CMakeLists.txt reads it via $ENV{BUILD_SAI_FAKE}); without
       # it the fboss build fails since no real vendor SAI is available in OSS.
       # It is passed via `sudo env` because sudo strips the ambient environment.
+      # --scratch-path MUST live OUTSIDE the checkout: getdeps applies dependency
+      # patches with `git apply` after cd-ing to the enclosing git repo root, so a
+      # scratch dir nested in this repo makes it patch from the BGP root and fail
+      # (e.g. boost -> "No such file or directory"). runner.temp is a sibling of
+      # the checkout and is not a git repo.
       - name: Build BGP (getdeps / CMake)
         run: >
           sudo
@@ -48,7 +53,7 @@ jobs:
           build/fbcode_builder/getdeps.py
           --allow-system-packages
           --scratch-path
-          ${{ github.workspace }}/build-output
+          ${{ runner.temp }}/bgp-build
           build
           --src-dir=.
           --num-jobs
@@ -59,6 +64,7 @@ jobs:
           chown
           -R
           runner:runner
+          ${{ runner.temp }}/bgp-build
           ${{ github.workspace }}
       # Retain the build output only for non-PR runs (daily schedule + manual
       # dispatch). PRs stay build-only so they finish faster and don't pile up
@@ -68,7 +74,7 @@ jobs:
         id: instdir
         run: >
           echo "dir=$(python3 build/fbcode_builder/getdeps.py
-          --scratch-path ${{ github.workspace }}/build-output
+          --scratch-path ${{ runner.temp }}/bgp-build
           show-inst-dir --src-dir=. bgp)" >> "$GITHUB_OUTPUT"
       - name: Upload BGP build output
         if: github.event_name != 'pull_request'
