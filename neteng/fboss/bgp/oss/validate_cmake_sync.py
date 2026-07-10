@@ -42,7 +42,7 @@ THRIFT_SRC_DIRS = {
 EXCLUDED_DIRS = {"facebook", "tests", "eos_wrapper", "test", "sim"}
 EXCLUDED_FILES = {
     "MainOSS.cpp",
-    "PeerManagerVipManager.cpp",
+    "PeerManagerDC.cpp",
     "VipPeerManager.cpp",
     # NetlinkWrapper.cpp pulls openr/messaging + openr/nl, neither vendored;
     # netlink-based nexthop tracking is BB-only (see CMakeLists.txt).

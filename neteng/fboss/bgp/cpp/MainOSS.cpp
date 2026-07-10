@@ -276,7 +276,7 @@ int main(int argc, char** argv) {
       false, /* enableMessagesOverNotifyQueue */
       true); /* enableCoroNotifyQueue */
 
-  // Start peer thread (plain PeerManagerBase, not PeerManagerVipManager)
+  // Start peer thread (plain PeerManagerBase, not PeerManagerDC)
   PeerManagerBase peerMgr(
       configManager,
       policyManager,

@@ -17,12 +17,12 @@
 #pragma once
 #include <gmock/gmock.h>
 
-#include "neteng/fboss/bgp/cpp/peer/facebook/PeerManagerVipManager.h"
+#include "neteng/fboss/bgp/cpp/peer/facebook/PeerManagerDC.h"
 #include "neteng/fboss/bgp/cpp/watchdog/MonitoredQueue.h"
 
 namespace facebook::bgp {
 
-class MockPeerManager : public PeerManagerVipManager {
+class MockPeerManager : public PeerManagerDC {
  public:
   // needed for unit tests
   MockPeerManager(
@@ -31,7 +31,7 @@ class MockPeerManager : public PeerManagerVipManager {
       MonitoredMPMCQueue<RibOutMessage>& ribOutQ,
       std::optional<MonitoredMPMCQueue<NeighborWatcherMessage>>&
           nbrRouteChangeQ)
-      : PeerManagerVipManager(
+      : PeerManagerDC(
             configManager,
             nullptr,
             ribInQ,

@@ -1246,7 +1246,7 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
    */
   bool enableRibAllocatedPathId_{false};
 
-  friend class PeerManagerVipManager;
+  friend class PeerManagerDC;
 
 // per class placeholder for test code injection
 // only need to be setup once here
