@@ -557,18 +557,6 @@ void FiberBgpPeer::stop(
   errorQueue_.put(BgpSessionStop{gracefulRestart, peerDelete});
 }
 
-void FiberBgpPeer::setSocketPauseState(bool isPaused) {
-  XLOGF_IF(
-      WARNING,
-      isSocketReadPaused_ != isPaused,
-      "WARNING! isSocketReadPaused state changed from {} to {} for peer: {}",
-      isSocketReadPaused_ ? "True" : "False",
-      isPaused ? "True" : "False",
-      getRemotePeerAddrWithDescription());
-
-  isSocketReadPaused_ = isPaused;
-}
-
 void FiberBgpPeer::closeSocket() noexcept {
   sock_.close();
   socketClosed_ = true;
@@ -693,12 +681,6 @@ void FiberBgpPeer::readSocketLoop() noexcept {
    */
   uint16_t msgCnt{0};
   while (true) {
-    while (isSocketReadPaused_ && !socketClosed_) {
-      // yield only to the fiber to not read socket. Not the whole thread.
-      CHECK(folly::fibers::onFiber());
-      fiberSleepFor(1ms);
-    }
-
     /**
      * Don't run continuously to avoid hogging CPU by yielding after certain
      * number of messages are processed.

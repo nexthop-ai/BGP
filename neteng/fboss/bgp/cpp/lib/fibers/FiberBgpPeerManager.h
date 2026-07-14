@@ -864,20 +864,6 @@ class FiberBgpPeerManager
 
   void writeToNotifyQueue(ObservableEventT&& event) noexcept;
 
-  /*
-   * [Watchdog Queue Processing]
-   *
-   * Process notification from Watchdog to:
-   *  - 1) stop one particular peer reading from socket
-   *  - 2) stop all peers reading from socket
-   */
-  virtual folly::coro::Task<void> processWatchdogMsgLoop() noexcept;
-
-  // Util function to set socket pause state
-  void setSocketPauseState(
-      std::shared_ptr<BgpConnectionInfo> connectionInfo,
-      bool isSocketReadPause);
-
   void shutdownPeerDueToCollision(std::shared_ptr<FiberBgpPeer> peer);
 
   // Helper to return info of a peer with established session

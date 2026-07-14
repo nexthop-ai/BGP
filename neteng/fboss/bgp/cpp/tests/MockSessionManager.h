@@ -95,11 +95,6 @@ class MockSessionManager : public SessionManager {
       (const nettools::bgplib::BgpPeerId& peerId, const uint64_t versionNumber),
       (const));
 
-  folly::coro::Task<void> processWatchdogMsgLoop() noexcept override {
-    // don't process watchdog message
-    co_return;
-  }
-
   // This override method calls mocked method
   bool isPeerVersionValid(
       const nettools::bgplib::BgpPeerId& peerId,

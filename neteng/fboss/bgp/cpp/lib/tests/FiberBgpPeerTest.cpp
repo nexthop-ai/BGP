@@ -35,7 +35,6 @@ class MockFiberBgpPeer;
   FRIEND_TEST(FiberBgpPeerFixture, SendNotificationWhenHoldTimerExpiredTest); \
   FRIEND_TEST(FiberBgpPeerFixture, SocketCloseTimerTest);                     \
   FRIEND_TEST(FiberBgpPeerFixture, MonitoredQueueTest);                       \
-  FRIEND_TEST(FiberBgpPeerFixture, SocketPauseTest);                          \
   FRIEND_TEST(FiberBgpPeerFixture, ProcessIngressLoopTerminationTest);        \
   FRIEND_TEST(FiberBgpPeerFixture, ProcessEgressLoopTerminationTest);         \
   FRIEND_TEST(                                                                \
@@ -3310,57 +3309,6 @@ TEST_F(FiberBgpPeerFixture, MonitoredQueueTest) {
            peer->monitoredItems_.rlock()->at(bgp::kQueueNameParserOut))
            .get(),
       &(peer->rcvdQueue_));
-}
-
-TEST_F(FiberBgpPeerFixture, SocketPauseTest) {
-  auto& fm = fmWrapper_.get();
-  auto peer = std::make_shared<MockFiberBgpPeer>(
-      params1_,
-      fm,
-      evb_,
-      std::move(*fs0_),
-      peer1Input_,
-      peer1BoundedInput_,
-      peer1Output_);
-
-  // flag is initialized to be false
-  EXPECT_FALSE(peer->isSocketReadPaused_);
-}
-
-TEST_F(FiberBgpPeerFixture, SetSocketPauseTest) {
-  auto& fm = fmWrapper_.get();
-  fm.addTask([&] {
-    std::shared_ptr<MockFiberBgpPeer> peer1, peer2;
-    std::tie(peer1, peer2) = startTwoPeers(params3_, params4_);
-    // wait till session comes up
-    EXPECT_EQ(
-        runUntilTargetStateOrTimeout(
-            peer1, BgpSessionState::ESTABLISHED, 100ms),
-        0);
-    EXPECT_EQ(
-        runUntilTargetStateOrTimeout(
-            peer2, BgpSessionState::ESTABLISHED, 100ms),
-        0);
-
-    // stop reading from socket
-    peer1->setSocketPauseState(true);
-    peer2->setSocketPauseState(true);
-
-    // wait till hold timer expired and session down
-    EXPECT_EQ(
-        runUntilTargetStateOrTimeout(
-            peer1, BgpSessionState::ESTABLISHED, 2 * params3_.holdTime),
-        0);
-    EXPECT_EQ(
-        runUntilTargetStateOrTimeout(
-            peer2, BgpSessionState::ESTABLISHED, 2 * params4_.holdTime),
-        0);
-
-    //  cleanup
-    stopTwoPeers(peer1, peer2);
-  });
-  evb_.loop();
-  SUCCEED();
 }
 
 TEST_F(FiberBgpPeerFixture, SocketSendLoopYieldTest) {

@@ -18,8 +18,6 @@
 
 #define FiberBgpPeerManager_TEST_FRIENDS                                      \
   FRIEND_TEST(FiberBgpPeerManagerFixture, RunBgpPeerWithExceptionTest);       \
-  FRIEND_TEST(FiberBgpPeerManagerFixture, PerPeerSocketPauseTest);            \
-  FRIEND_TEST(FiberBgpPeerManagerFixture, AllPeerSocketPauseTest);            \
   FRIEND_TEST(FiberBgpPeerManagerTest, WriteToNotifyQueueTest);               \
   FRIEND_TEST(FiberBgpPeerManagerFixture, EgressBackpressureFlagTest);        \
   FRIEND_TEST(FiberBgpPeerManagerFixture, SendReceiveLongBgpUpdateTest);      \
@@ -29,8 +27,6 @@
 
 #define FiberBgpPeer_TEST_FRIENDS                                       \
   friend class FiberBgpPeerManagerFixture;                              \
-  FRIEND_TEST(FiberBgpPeerManagerFixture, PerPeerSocketPauseTest);      \
-  FRIEND_TEST(FiberBgpPeerManagerFixture, AllPeerSocketPauseTest);      \
   FRIEND_TEST(FiberBgpPeerManagerFixture, EgressBackpressureFlagTest);  \
   FRIEND_TEST(FiberBgpPeerManagerFixture, PeeringStateResetOnStopTest); \
   FRIEND_TEST(FiberBgpPeerManagerFixture, PeeringStateResetOnStopWithGRTest);
@@ -442,188 +438,6 @@ TEST_F(FiberBgpPeerManagerFixture, MonitoredFiberBgpPeerTest) {
  * Start one fiberBgpPeerManager with the coro task. Validate the notification
  * queue pushing and popping.
  */
-TEST_F(FiberBgpPeerManagerFixture, ReceiveWatchdogNotificationTest) {
-  auto& fm = fmWrapper.get();
-  TestFiberBgpPeerCallback callback1;
-  auto peerMgr1 = initPeerMgr(fm, peerAddr1, callback1);
-
-  // starts logging subscription to validate the log message
-  auto& messages = subscribeToLogMessages("");
-  messages.clear();
-
-  // inject to queue for consumption
-  auto& notificationQ = peerMgr1->getNotificationQueue();
-  facebook::bgp::WatchdogEventMessage msg(
-      std::nullopt, facebook::bgp::OperationStatus::PAUSE);
-  notificationQ.push(std::move(msg));
-
-  // task waiting notificationQ consumed by the coro task.
-  fm.addTask([&] {
-    while (!notificationQ.empty()) {
-      //  yield to other fiber/coro task if not ready
-      fiberSleepFor(100ms);
-    }
-
-    EXPECT_EQ(
-        messages.back().first.getMessage(),
-        fmt::format(
-            "Received a signal: {} from Watchdog for all peers",
-            magic_enum::enum_name(facebook::bgp::OperationStatus::PAUSE)));
-
-    // stop run() fiber task
-    peerMgr1->shutdownWithGR(false);
-  });
-
-  // test starts to run with a pumped eventbase
-  evb.loop();
-  SUCCEED();
-}
-
-TEST_F(FiberBgpPeerManagerFixture, PerPeerSocketPauseTest) {
-  auto& fm = fmWrapper.get();
-  initTwoPeerMgrs(fm);
-  auto& notificationQ = peerMgr2->getNotificationQueue();
-
-  folly::fibers::Baton bt;
-  fm.addTask([&] {
-    // addPeer() is called only by fiberBgpPeerMgr1
-    const auto peerPort2 = peerMgr2->getListenAddress()->getPort();
-    peerMgr1->addPeer(peerAddr1, 100, 100, {kR1Lo1, 0}, peerPort2);
-
-    // wait enough for session coming up
-    fiberSleepFor(1s);
-
-    // addPeer() is called by fiberBgpPeerMgr2 as well
-    const auto peerPort1 = peerMgr1->getListenAddress()->getPort();
-    peerMgr2->addPeer(peerAddr2, 100, 100, {kR2Lo1, 0}, peerPort1);
-
-    waitTillSessionsComeUp(fm, peerMgr1, {peerId1});
-    EXPECT_EQ(1, peerMgr1->allPeers_.size());
-
-    // inject to queue for peerMgr2's watchdog consumption
-    facebook::bgp::WatchdogEventMessage msg(
-        BgpPeerId(peerAddr2, peerPort1), facebook::bgp::OperationStatus::PAUSE);
-    notificationQ.push(std::move(msg));
-
-    // synchronization primitive
-    bt.post();
-  });
-
-  fm.addTask([&] {
-    // synchronization primitive
-    bt.wait();
-
-    while (!notificationQ.empty()) {
-      //  yield to other fiber/coro task if not ready
-      fiberSleepFor(100ms);
-    }
-
-    {
-      auto peerInfoPtr = peerMgr1->allPeers_.begin()->second;
-      EXPECT_NE(nullptr, peerInfoPtr);
-      auto connectionInfoPtr = peerInfoPtr->connectionInfos.begin()->second;
-      EXPECT_NE(nullptr, connectionInfoPtr);
-      auto peer = connectionInfoPtr->activeSessionInfo->peer;
-      EXPECT_NE(nullptr, peer);
-
-      // critical verification for peer
-      EXPECT_FALSE(peer->isSocketReadPaused_);
-    }
-    {
-      auto peerInfoPtr = peerMgr2->allPeers_.begin()->second;
-      EXPECT_NE(nullptr, peerInfoPtr);
-      auto connectionInfoPtr = peerInfoPtr->connectionInfos.begin()->second;
-      EXPECT_NE(nullptr, connectionInfoPtr);
-      auto peer = connectionInfoPtr->activeSessionInfo->peer;
-      EXPECT_NE(nullptr, peer);
-
-      // critical verification for peer
-      EXPECT_TRUE(peer->isSocketReadPaused_);
-    }
-
-    // stop
-    peerMgr1->shutdownWithGR(false);
-    peerMgr2->shutdownWithGR(false);
-    waitTillSessionsGoDown(fm, peerMgr1, {peerId1});
-  });
-
-  evb.loop();
-}
-
-TEST_F(FiberBgpPeerManagerFixture, AllPeerSocketPauseTest) {
-  auto& fm = fmWrapper.get();
-  initTwoPeerMgrs(fm);
-  auto& notificationQ = peerMgr2->getNotificationQueue();
-
-  folly::fibers::Baton bt;
-  fm.addTask([&] {
-    // addPeer() is called only by fiberBgpPeerMgr1
-    const auto peerPort2 = peerMgr2->getListenAddress()->getPort();
-    peerMgr1->addPeer(peerAddr1, 100, 100, {kR1Lo1, 0}, peerPort2);
-
-    // wait enough for session coming up
-    fiberSleepFor(1s);
-
-    // addPeer() is called by fiberBgpPeerMgr2 as well
-    const auto peerPort1 = peerMgr1->getListenAddress()->getPort();
-    peerMgr2->addPeer(peerAddr2, 100, 100, {kR2Lo1, 0}, peerPort1);
-
-    waitTillSessionsComeUp(fm, peerMgr1, {peerId1});
-    EXPECT_EQ(1, peerMgr1->allPeers_.size());
-
-    // inject to queue for peerMgr2's watchdog consumption
-    facebook::bgp::WatchdogEventMessage msg(
-        std::nullopt, facebook::bgp::OperationStatus::PAUSE);
-    notificationQ.push(std::move(msg));
-
-    // synchronization primitive
-    bt.post();
-  });
-
-  fm.addTask([&] {
-    // synchronization primitive
-    bt.wait();
-
-    while (!notificationQ.empty()) {
-      //  yield to other fiber/coro task if not ready
-      fiberSleepFor(100ms);
-    }
-
-    {
-      auto peerInfoPtr = peerMgr1->allPeers_.begin()->second;
-      EXPECT_NE(nullptr, peerInfoPtr);
-      auto connectionInfoPtr = peerInfoPtr->connectionInfos.begin()->second;
-      EXPECT_NE(nullptr, connectionInfoPtr);
-      auto peer = connectionInfoPtr->activeSessionInfo->peer;
-      EXPECT_NE(nullptr, peer);
-
-      // critical verification for peer
-      EXPECT_FALSE(peer->isSocketReadPaused_);
-    }
-    {
-      auto peerInfoPtr = peerMgr2->allPeers_.begin()->second;
-      EXPECT_NE(nullptr, peerInfoPtr);
-      auto connectionInfoPtr = peerInfoPtr->connectionInfos.begin()->second;
-      EXPECT_NE(nullptr, connectionInfoPtr);
-      auto peer = connectionInfoPtr->activeSessionInfo->peer;
-      EXPECT_NE(nullptr, peer);
-
-      // critical verification for peer
-      EXPECT_TRUE(peer->isSocketReadPaused_);
-    }
-
-    // stop
-    peerMgr1->shutdownWithGR(false);
-    peerMgr2->shutdownWithGR(false);
-    waitTillSessionsGoDown(fm, peerMgr1, {peerId1});
-  });
-
-  evb.loop();
-}
-
-//
-// Start one peer manger. Test to make sure that acceptor fiber exits
-// gracefully.
 //
 TEST_F(FiberBgpPeerManagerFixture, StopAcceptFiberLoopTest) {
   auto& fm = fmWrapper.get();

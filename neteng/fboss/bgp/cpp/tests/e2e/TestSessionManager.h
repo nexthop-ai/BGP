@@ -46,10 +46,6 @@ class E2ETestSessionManager : public SessionManager {
   void run() noexcept override;
   void stop() noexcept override;
 
-  folly::coro::Task<void> processWatchdogMsgLoop() noexcept override {
-    co_return;
-  }
-
   bool isPeerVersionValid(
       const nettools::bgplib::BgpPeerId& peerId,
       const uint64_t versionNumber) const noexcept override;

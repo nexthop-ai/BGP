@@ -260,9 +260,6 @@ void FiberBgpPeerManager::run() noexcept {
 
   XLOG(DBG1, "FiberPeerManager started all fibers");
 
-  // start the coro task to handle watchdog message
-  asyncScope_.add(co_withExecutor(&evb_, processWatchdogMsgLoop()));
-
   // wait on errorQueue notification to close sub fiber tasks
   auto err = errorQueue_.getReader();
   auto errMsg = err.get();
@@ -574,81 +571,6 @@ void FiberBgpPeerManager::writeToNotifyQueue(
   } else {
     notifyQueue_.getWriter().put(std::move(event));
   }
-}
-
-folly::coro::Task<void> FiberBgpPeerManager::processWatchdogMsgLoop() noexcept {
-  XLOG(INFO, "Starting watchdog message processing coro task...");
-
-  auto& notificationQ = this->getNotificationQueue();
-  while (true) {
-    // when cancelAndJoinAsync is called, guaranteed to exit
-    co_await folly::coro::co_safe_point;
-
-    auto msg = co_await co_awaitTry(notificationQ.pop());
-    if (!msg.hasValue()) {
-      XLOG(
-          INFO,
-          "[Exit] Coro task cancelled. Terminating processWatchdogMsgLoop");
-      break;
-    }
-
-    bool pauseSocketRead = msg->opStatus_ == bgp::OperationStatus::PAUSE;
-    if (msg->peerId_.has_value()) {
-      BgpPeerId peerId = *msg->peerId_;
-
-      // this message is sent to a dedicated peer
-      XLOGF(
-          DBG1,
-          "Received a signal: {} from Watchdog for peer: {}:{}",
-          magic_enum::enum_name(msg->opStatus_),
-          peerId.peerAddr.str(),
-          peerId.remoteBgpId);
-
-      if (allPeers_.contains(peerId.peerAddr)) {
-        auto peerInfoInternalPtr = allPeers_.at(peerId.peerAddr);
-        if (!peerInfoInternalPtr ||
-            !peerInfoInternalPtr->connectionInfos.contains(
-                peerId.remoteBgpId)) {
-          // safe guard to avoid nullptr access or non-existing key reference
-          continue;
-        }
-        auto connectionInfoPtr =
-            peerInfoInternalPtr->connectionInfos.at(peerId.remoteBgpId);
-        setSocketPauseState(connectionInfoPtr, pauseSocketRead);
-      }
-    } else {
-      // this message is send to ALL peers
-      XLOGF(
-          DBG1,
-          "Received a signal: {} from Watchdog for all peers",
-          magic_enum::enum_name(msg->opStatus_));
-
-      for (const auto& [_, peerInfoInternalPtr] : allPeers_) {
-        if (!peerInfoInternalPtr) {
-          // safe guard to avoid nullptr access
-          continue;
-        }
-        for (const auto& [_, connectionInfoPtr] :
-             peerInfoInternalPtr->connectionInfos) {
-          setSocketPauseState(connectionInfoPtr, pauseSocketRead);
-        }
-      } // for
-    } // if-else
-  } // while
-}
-
-void FiberBgpPeerManager::setSocketPauseState(
-    std::shared_ptr<BgpConnectionInfo> connectionInfo,
-    bool isSocketReadPause) {
-  if (!connectionInfo || !connectionInfo->activeSessionInfo ||
-      !connectionInfo->activeSessionInfo->peer) {
-    // safe guard to avoid nullptr access
-    return;
-  }
-
-  // set socket pause state
-  connectionInfo->activeSessionInfo->peer->setSocketPauseState(
-      isSocketReadPause);
 }
 
 bool FiberBgpPeerManager::needToKeepThisPeer(

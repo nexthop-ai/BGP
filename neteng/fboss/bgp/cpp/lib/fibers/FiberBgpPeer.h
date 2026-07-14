@@ -288,15 +288,6 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
   uint64_t getLastSendQueueBlockTime() const;
   uint64_t getLastSocketEgressBufferedTime() const;
 
-  /*
-   * This is the util function to toggle the socket reading state.
-   *
-   * @param: isPause - true indicates socket reading will be paused.
-   *                   false otherwise.
-   * @return: none
-   */
-  void setSocketPauseState(bool isPaused);
-
  protected:
   // mutable state of peering session
   PeeringState peeringState_;
@@ -446,9 +437,6 @@ class FiberBgpPeer : public std::enable_shared_from_this<FiberBgpPeer>,
 
   // flag indicating socket has already been closed
   bool socketClosed_{false};
-
-  // flag indicating socket reading is paused
-  bool isSocketReadPaused_{false};
 
   /*
    * [Outbound Processing]
