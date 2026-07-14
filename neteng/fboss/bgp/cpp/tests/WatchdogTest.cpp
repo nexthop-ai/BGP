@@ -18,7 +18,6 @@
 
 #define Watchdog_TEST_FRIENDS                                                  \
   FRIEND_TEST(WatchdogTest, MonitorModuleTest);                                \
-  FRIEND_TEST(WatchdogTest, NotificationQueueTest);                            \
   FRIEND_TEST(WatchdogTest, SystemMetricsUpdateBasicTest);                     \
   FRIEND_TEST(WatchdogTestFixture, SystemMetricsLoopTest);                     \
   FRIEND_TEST(WatchdogTestFixture, BasicTest);                                 \
@@ -130,29 +129,6 @@ TEST(WatchdogTest, MonitorModuleTest) {
 
     // not changed
     EXPECT_EQ(&watchdog.monitoredModules_.at("test").get(), &module);
-  }
-}
-
-TEST(WatchdogTest, NotificationQueueTest) {
-  Watchdog watchdog{nullptr};
-  MonitoredModule module;
-
-  watchdog.monitorModule("test", module);
-  EXPECT_TRUE(watchdog.monitoredModules_.contains("test"));
-
-  auto& q = watchdog.monitoredModules_.at("test").get().getNotificationQueue();
-  EXPECT_EQ(0, q.size());
-
-  {
-    WatchdogEventMessage msg(std::nullopt, OperationStatus::PAUSE);
-    q.push(std::move(msg));
-    EXPECT_EQ(1, q.size());
-  }
-  {
-    auto msg = facebook::bgp::test::boundedBlockingPop(q, "q");
-    EXPECT_EQ(0, q.size());
-    EXPECT_EQ(std::nullopt, msg.peerId_);
-    EXPECT_EQ(msg.opStatus_, OperationStatus::PAUSE);
   }
 }
 

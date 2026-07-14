@@ -19,8 +19,6 @@
 #include <folly/container/F14Map.h>
 #include <functional>
 
-#include "neteng/fboss/bgp/cpp/common/Structs.h"
-#include "neteng/fboss/bgp/cpp/lib/coro/MPMCQueue.h"
 #include "neteng/fboss/bgp/cpp/watchdog/MonitorableTrace.h"
 #include "neteng/fboss/bgp/cpp/watchdog/MonitoredQueue.h"
 #include "neteng/fboss/bgp/cpp/watchdog/QueryTree.h"
@@ -69,26 +67,13 @@ class MonitoredModule : public MonitorableTrace {
   folly::F14FastMap<std::string, int> getQueueSizes(
       const QueryNode* queryNode) noexcept;
 
-  facebook::bgp::coro::MPMCQueue<WatchdogEventMessage>&
-  getNotificationQueue() noexcept {
-    return notificationQueue_;
-  }
-
  protected:
-  // It's for Watchdog::sendNotificationToSessionMgr
-  // We cannot only grant friendship to that function only as it would require
-  // definition of the Watchdog class, and it would lead to circular dependency
-  friend class Watchdog;
-
   folly::Synchronized<folly::F14NodeMap<
       std::string,
       std::variant<
           std::reference_wrapper<MonitoredModule>,
           std::reference_wrapper<MonitoredQueueBase>>>>
       monitoredItems_;
-
-  // This is the queue used by watchdog to send notifications.
-  facebook::bgp::coro::MPMCQueue<WatchdogEventMessage> notificationQueue_;
 
 // per class placeholder for test code injection
 // only need to be setup once here

@@ -64,36 +64,6 @@ struct TinyPeerInfo {
   }
 };
 
-/*
- * Watchdog module monitors BGP's internal queue size periodically. When
- * detecting monitored queue in build-up situation, Watchdog will signal the
- * corresponding entity with a dedicated communication channel.
- *
- * WatchdogEventMessage will convey the purpose and designed to be extensible.
- */
-enum OperationStatus {
-  PAUSE = 0,
-  RESUME = 1,
-};
-
-struct WatchdogEventMessage {
-  /*
-   * peerId will be the unique identifier for a particular peer.
-   * NOTE: if peerId_ not specified, the message is broadcasted to all peers.
-   */
-  std::optional<nettools::bgplib::BgpPeerId> peerId_{std::nullopt};
-
-  /*
-   * ENUM value to indicate the operation status, aka, PAUSE or RESUME for now.
-   */
-  OperationStatus opStatus_;
-
-  WatchdogEventMessage(
-      std::optional<nettools::bgplib::BgpPeerId> peerId,
-      OperationStatus opStatus)
-      : peerId_(std::move(peerId)), opStatus_(opStatus) {}
-};
-
 struct NeighborEventMsg {
   const folly::IPAddress nbrAddr;
   const bool isUp;
@@ -140,7 +110,6 @@ struct ClassId {
 // and FIB programming to be paused or resumed.
 enum RibPauseResumeCause {
   SAFE_MODE = 0,
-  WATCHDOG = 1,
   ROUTE_CHURN = 2,
   ROUTE_FILTER_POLICY_UPDATE = 3,
   ROUTING_POLICY_UPDATE = 4,
