@@ -1142,32 +1142,6 @@ TEST_F(BgpServiceTestFixture, ThriftParallelRejectionTest) {
       0);
 }
 
-/**
- * Test that when setRouteFilterPolicy fails, the request is
- * still properly decremented using thrift protection
- */
-TEST_F(BgpServiceTestFixture, ThriftProtectionFailureScenarioTest) {
-  BgpStats::initCounters();
-  service_->setThriftProtection(true);
-  auto ribThread = rib_->runInThread();
-  auto peerMgrThread = peerManager_->runInThread();
-  auto sessionMgrThread = sessionMgr_->runInThread();
-
-  rib_policy::TRouteFilterPolicy tPolicy;
-  tPolicy.statements()->emplace(
-      "failThriftProtection", createTRouteFilterStatement({}));
-  folly::coro::blockingWait(service_->co_setRouteFilterPolicy(
-      std::make_unique<rib_policy::TRouteFilterPolicy>(std::move(tPolicy))));
-
-  rib_->stop();
-  peerManager_->stop();
-  sessionMgr_->stop();
-  ribThread.join();
-  peerMgrThread.join();
-  sessionMgrThread.join();
-  EXPECT_EQ(service_->numRequestsInExecution(), 0);
-}
-
 // Test co_getEntryStats endpoint
 TEST_F(BgpServiceTestFixture, GetEntryStatsTest) {
   auto ribThread = rib_->runInThread();

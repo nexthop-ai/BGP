@@ -2029,25 +2029,9 @@ BgpServiceBase::co_setRouteFilterPolicy(
     co_return ret;
   }
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this, p = std::move(policy)]() mutable {
-        rib_.setRouteFilterPolicy(std::move(p));
-      },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasException()) {
-    auto ret = std::make_unique<TResult>();
-    ret->success() = false;
-    if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-      XLOGF(ERR, "setRouteFilterPolicy timed out — Rib evb unresponsive");
-      ret->err() = "Rib evb unresponsive (timeout)";
-    } else {
-      XLOGF(ERR, "setRouteFilterPolicy failed: {}", result.exception().what());
-      ret->err() = std::string(result.exception().what());
-    }
-    co_return ret;
-  }
+  // No RIB evb hop: the coalescing MergeQueue is thread-safe, so enqueue on the
+  // calling thread.
+  rib_.setRouteFilterPolicy(std::move(policy));
 
   auto ret = std::make_unique<TResult>();
   ret->success() = true;
@@ -2098,19 +2082,7 @@ folly::coro::Task<void> BgpServiceBase::co_clearRouteFilterPolicy() {
 
   peerMgr_.setRouteFilterPolicy(nullptr);
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this]() { rib_.clearRouteFilterPolicy(); },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasException()) {
-    if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-      XLOGF(ERR, "clearRouteFilterPolicy timed out — Rib evb unresponsive");
-    } else {
-      XLOGF(
-          ERR, "clearRouteFilterPolicy failed: {}", result.exception().what());
-    }
-  }
+  rib_.clearRouteFilterPolicy();
 }
 
 /*

@@ -165,18 +165,9 @@ folly::coro::Task<void> BgpServiceDC::co_clearRibPolicy() {
     decrRequestsInExecution();
   };
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this]() { rib_.clearRibPolicy(); },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasException()) {
-    if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-      XLOGF(ERR, "clearRibPolicy timed out — Rib evb unresponsive");
-    } else {
-      XLOGF(ERR, "clearRibPolicy failed: {}", result.exception().what());
-    }
-  }
+  // Enqueue directly on the calling thread; the coalescing MergeQueue is
+  // thread-safe, so there is no RIB evb hop to queue behind a long walk.
+  rib_.clearRibPolicy();
 }
 
 /**
@@ -238,27 +229,10 @@ BgpServiceDC::co_setRouteAttributePolicy(
       anyExpiration ? std::to_string(minExpirationTimeS) : "N/A",
       anyExpiration ? std::to_string(maxExpirationTimeS) : "N/A");
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this, p = std::move(policy)]() mutable {
-        return rib_.setRouteAttributePolicy(std::move(p));
-      },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasValue()) {
-    co_return std::make_unique<TResult>(std::move(result.value()));
-  }
-
-  auto ret = std::make_unique<TResult>();
-  ret->success() = false;
-  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "setRouteAttributePolicy timed out — Rib evb unresponsive");
-    ret->err() = "Rib evb unresponsive (timeout)";
-  } else {
-    XLOGF(ERR, "setRouteAttributePolicy failed: {}", result.exception().what());
-    ret->err() = std::string(result.exception().what());
-  }
-  co_return ret;
+  // Enqueue directly on the calling thread; the coalescing MergeQueue is
+  // thread-safe, so there is no RIB evb hop to queue behind a long walk.
+  co_return std::make_unique<TResult>(
+      rib_.setRouteAttributePolicy(std::move(policy)));
 }
 
 folly::coro::Task<std::unique_ptr<rib_policy::TRouteAttributePolicy>>
@@ -303,21 +277,7 @@ folly::coro::Task<void> BgpServiceDC::co_clearRouteAttributePolicy() {
     decrRequestsInExecution();
   };
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this]() { rib_.clearRouteAttributePolicy(); },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasException()) {
-    if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-      XLOGF(ERR, "clearRouteAttributePolicy timed out — Rib evb unresponsive");
-    } else {
-      XLOGF(
-          ERR,
-          "clearRouteAttributePolicy failed: {}",
-          result.exception().what());
-    }
-  }
+  rib_.clearRouteAttributePolicy();
 }
 
 /**
@@ -344,27 +304,10 @@ BgpServiceDC::co_setPathSelectionPolicy(
     decrRequestsInExecution();
   };
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this, p = std::move(policy)]() mutable {
-        return dcRib_.setPathSelectionPolicy(std::move(p));
-      },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasValue()) {
-    co_return std::make_unique<TResult>(std::move(result.value()));
-  }
-
-  auto ret = std::make_unique<TResult>();
-  ret->success() = false;
-  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-    XLOGF(ERR, "setPathSelectionPolicy timed out — Rib evb unresponsive");
-    ret->err() = "Rib evb unresponsive (timeout)";
-  } else {
-    XLOGF(ERR, "setPathSelectionPolicy failed: {}", result.exception().what());
-    ret->err() = std::string(result.exception().what());
-  }
-  co_return ret;
+  // Enqueue directly on the calling thread; the coalescing MergeQueue is
+  // thread-safe, so there is no RIB evb hop to queue behind a long walk.
+  co_return std::make_unique<TResult>(
+      dcRib_.setPathSelectionPolicy(std::move(policy)));
 }
 
 folly::coro::Task<std::unique_ptr<rib_policy::TPathSelectionPolicy>>
@@ -409,21 +352,7 @@ folly::coro::Task<void> BgpServiceDC::co_clearPathSelectionPolicy() {
     decrRequestsInExecution();
   };
 
-  auto result = co_await co_runOnEvbWithTimeout(
-      rib_.getEventBase(),
-      [this]() { dcRib_.clearPathSelectionPolicy(); },
-      kRibThriftHandlerTimeout);
-
-  if (result.hasException()) {
-    if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
-      XLOGF(ERR, "clearPathSelectionPolicy timed out — Rib evb unresponsive");
-    } else {
-      XLOGF(
-          ERR,
-          "clearPathSelectionPolicy failed: {}",
-          result.exception().what());
-    }
-  }
+  dcRib_.clearPathSelectionPolicy();
 }
 
 folly::coro::Task<std::unique_ptr<std::vector<rib_policy::TPathSelector>>>

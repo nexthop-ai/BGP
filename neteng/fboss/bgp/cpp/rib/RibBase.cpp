@@ -490,6 +490,11 @@ void RibBase::handleRibPolicyClearMsg() noexcept {
   replaceRibPolicy(nullptr);
 }
 
+// Thread-safe: ribPolicyMsgQ_ is a coalescing MergeQueue guarded by its own
+// lock, so callers enqueue directly from any thread (e.g. a thrift handler)
+// rather than hopping onto the RIB evb. Coalescing ahead of the evb keeps a
+// busy consumer (a long RIB walk) from accumulating a backlog of per-call evb
+// tasks.
 void RibBase::enqueueRibPolicyMsg(RibPolicyMessage msg) noexcept {
   RibStats::STATS_ribPolicyMsgEnqueued.add(1);
   // Each sub-policy's set and clear share one slot, so a pending set and a
@@ -2799,8 +2804,7 @@ void RibBase::updateEntryStats(TEntryStats& stats) noexcept {
 
 void RibBase::clearRibPolicy() {
   // push clear message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
-      [&]() { enqueueRibPolicyMsg(RibPolicyClearMsg{}); });
+  enqueueRibPolicyMsg(RibPolicyClearMsg{});
 }
 
 /**
@@ -2820,9 +2824,7 @@ neteng::fboss::bgp::thrift::TResult RibBase::setRouteAttributePolicy(
   }
 
   // push rib policy set message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    enqueueRibPolicyMsg(RouteAttributePolicySetMsg{std::move(*policy)});
-  });
+  enqueueRibPolicyMsg(RouteAttributePolicySetMsg{std::move(*policy)});
   result.success() = true;
   return result;
 }
@@ -2839,8 +2841,7 @@ rib_policy::TRouteAttributePolicy RibBase::getRouteAttributePolicy() {
 
 void RibBase::clearRouteAttributePolicy() {
   // push clear message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
-      [&]() { enqueueRibPolicyMsg(RouteAttributePolicyClearMsg{}); });
+  enqueueRibPolicyMsg(RouteAttributePolicyClearMsg{});
 }
 
 int64_t RibBase::getRouteFilterPolicyVersion() const {
@@ -2854,10 +2855,7 @@ void RibBase::setRouteFilterPolicy(
     std::unique_ptr<rib_policy::TRouteFilterPolicy> policy,
     bool forceUpdate) {
   // push rib policy set message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    enqueueRibPolicyMsg(
-        RouteFilterPolicySetMsg{std::move(*policy), forceUpdate});
-  });
+  enqueueRibPolicyMsg(RouteFilterPolicySetMsg{std::move(*policy), forceUpdate});
 }
 
 rib_policy::TRouteFilterPolicy RibBase::getRouteFilterPolicy() {
@@ -2872,8 +2870,7 @@ rib_policy::TRouteFilterPolicy RibBase::getRouteFilterPolicy() {
 
 void RibBase::clearRouteFilterPolicy() {
   // push clear message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
-      [&]() { enqueueRibPolicyMsg(RouteFilterPolicyClearMsg{}); });
+  enqueueRibPolicyMsg(RouteFilterPolicyClearMsg{});
 }
 
 bool RibBase::replaceRouteFilterPolicy(

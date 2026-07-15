@@ -1084,9 +1084,7 @@ neteng::fboss::bgp::thrift::TResult RibDC::setPathSelectionPolicy(
   }
 
   // push rib policy set message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    enqueueRibPolicyMsg(PathSelectionPolicySetMsg{std::move(*policy)});
-  });
+  enqueueRibPolicyMsg(PathSelectionPolicySetMsg{std::move(*policy)});
   result.success() = true;
   return result;
 }
@@ -1107,8 +1105,7 @@ int64_t RibDC::getPathSelectionPolicyVersion() const {
 
 void RibDC::clearPathSelectionPolicy() {
   // push clear message to policy queue
-  evb_.runImmediatelyOrRunInEventBaseThreadAndWait(
-      [&]() { enqueueRibPolicyMsg(PathSelectionPolicyClearMsg{}); });
+  enqueueRibPolicyMsg(PathSelectionPolicyClearMsg{});
 }
 
 std::vector<rib_policy::TPathSelector> RibDC::getActivePathSelectionCriteria(

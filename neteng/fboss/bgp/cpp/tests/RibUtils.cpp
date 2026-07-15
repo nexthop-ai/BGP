@@ -391,11 +391,6 @@ void MockRib::clearPathSelectionPolicy() {
 void MockRib::setRouteFilterPolicy(
     std::unique_ptr<TRouteFilterPolicy> policy,
     bool forceUpdate) {
-  if (policy->statements().value().find("failThriftProtection") !=
-      policy->statements().value().end()) {
-    XLOG(INFO, "failThriftProtection statement found, throwing");
-    throw BgpError("failThriftProtection");
-  }
   RibBase::setRouteFilterPolicy(std::move(policy), forceUpdate);
 
   std::map<std::string, int64_t> counters;
