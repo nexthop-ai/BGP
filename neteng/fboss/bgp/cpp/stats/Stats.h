@@ -636,6 +636,20 @@ inline constexpr auto kUnsupportedPolicyMsg =
     "bgpd.ribPolicy.numUnsupportedPolicyMsg";
 DECLARE_timeseries(unsupportedPolicyMsg);
 
+// total rib policy messages enqueued onto the coalescing queue (all kinds)
+inline constexpr auto kRibPolicyMsgEnqueued = "bgpd.ribPolicy.numEnqueuedMsg";
+DECLARE_timeseries(ribPolicyMsgEnqueued);
+
+// rib policy messages coalesced into an already-pending same-slot message --
+// the redundant applies the merge queue saved the consumer; a spike means the
+// producers are churning (e.g., the empty->full route-attribute thrash)
+inline constexpr auto kRibPolicyMsgCoalesced = "bgpd.ribPolicy.numCoalescedMsg";
+DECLARE_timeseries(ribPolicyMsgCoalesced);
+
+// rib policy clear-all messages that purged the queue
+inline constexpr auto kRibPolicyMsgPurged = "bgpd.ribPolicy.numPurgedMsg";
+DECLARE_timeseries(ribPolicyMsgPurged);
+
 // time for rib to save rib policy to file
 inline constexpr auto kSaveRibPolicyStateToFileTimeMs =
     "bgpd.ribPolicy.saveStateToFileTimeMs";

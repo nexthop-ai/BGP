@@ -788,6 +788,9 @@ DEFINE_timeseries(raPolicyUpdate, kRaPolicyUpdate, fb303::COUNT);
 DEFINE_timeseries(rfPolicyRcvd, kRfPolicyRcvd, fb303::COUNT);
 DEFINE_timeseries(rfPolicyUpdate, kRfPolicyUpdate, fb303::COUNT);
 DEFINE_timeseries(unsupportedPolicyMsg, kUnsupportedPolicyMsg, fb303::COUNT);
+DEFINE_timeseries(ribPolicyMsgEnqueued, kRibPolicyMsgEnqueued, fb303::COUNT);
+DEFINE_timeseries(ribPolicyMsgCoalesced, kRibPolicyMsgCoalesced, fb303::COUNT);
+DEFINE_timeseries(ribPolicyMsgPurged, kRibPolicyMsgPurged, fb303::COUNT);
 
 // time for rib to save rib policy to file
 DEFINE_quantile_stat(

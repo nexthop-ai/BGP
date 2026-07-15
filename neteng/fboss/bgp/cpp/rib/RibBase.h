@@ -39,6 +39,7 @@
 #include "neteng/fboss/bgp/cpp/config/ConfigStructs.h"
 #include "neteng/fboss/bgp/cpp/lib/coro/BackPressuredQueue.h"
 #include "neteng/fboss/bgp/cpp/lib/coro/MPMCQueue.h"
+#include "neteng/fboss/bgp/cpp/lib/coro/MergeQueue.h"
 #include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopCache.h"
 #include "neteng/fboss/bgp/cpp/nexthopTracker/NexthopInfo.h"
 #include "neteng/fboss/bgp/cpp/policy/PolicyManager.h"
@@ -651,9 +652,13 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   /*
    * [RibPolicy]
    *
-   * Multiple-Producer-Single-Consumer(MPSC Queue) between coro tasks.
+   * Single-consumer coalescing queue: pushes for the same sub-policy slot merge
+   * in place (latest wins) and a clear-all purges everything already pending,
+   * so a superseded push (e.g. an empty route-attribute policy immediately
+   * followed by a full one) never reaches the consumer. See
+   * enqueueRibPolicyMsg.
    */
-  bgp::coro::MPMCQueue<RibPolicyMessage> ribPolicyMsgQ_;
+  bgp::coro::MergeQueue<RibPolicyMessage> ribPolicyMsgQ_;
 
   /* TODO: Move out of RibBase once overwriteRouteAttributes,
      createTRibEntry, and thrift getters no longer access it from RibBase */
@@ -836,6 +841,25 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
   void handleRouteFilterPolicySetMsg(
       const RouteFilterPolicySetMsg& msg) noexcept;
   void handleRouteFilterPolicyClearMsg() noexcept;
+
+  /*
+   * Merge slots for ribPolicyMsgQ_. Set and Clear of the same sub-policy share
+   * a slot (latest wins); the route-attribute TTL timer is its own idempotent
+   * slot. RibPolicyClearMsg maps to kRibPolicyPurgeAllSlot: it takes no merge
+   * slot and purges everything queued.
+   */
+  static constexpr int kRibPolicyPurgeAllSlot = -1;
+  static constexpr int kRibPolicyMergeSlotRouteAttribute = 0;
+  static constexpr int kRibPolicyMergeSlotPathSelection = 1;
+  static constexpr int kRibPolicyMergeSlotRouteFilter = 2;
+  static constexpr int kRibPolicyMergeSlotRouteAttributeTimer = 3;
+
+  /*
+   * Classify a rib-policy message and enqueue it into the coalescing queue: a
+   * clear-all supersedes everything already pending (purge); every other
+   * message merges by slot. All producers push through here.
+   */
+  void enqueueRibPolicyMsg(RibPolicyMessage msg) noexcept;
 
   virtual void overwriteRouteAttributes(
       const std::unordered_set<folly::CIDRNetwork>& /* prefixes */,

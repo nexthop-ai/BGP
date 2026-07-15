@@ -1130,9 +1130,9 @@ void E2ETestFixture::sendUnsupportedDcPolicyMsgs() {
    * numUnsupportedPolicyMsg increment, without mutating RIB state.
    */
   rib_->getEventBase().runInEventBaseThreadAndWait([this]() {
-    rib_->ribPolicyMsgQ_.push(RibBase::PathSelectionPolicyClearMsg{});
-    rib_->ribPolicyMsgQ_.push(RibBase::RouteAttributePolicyClearMsg{});
-    rib_->ribPolicyMsgQ_.push(RibBase::RouteAttributePolicyTimerMsg{});
+    rib_->enqueueRibPolicyMsg(RibBase::PathSelectionPolicyClearMsg{});
+    rib_->enqueueRibPolicyMsg(RibBase::RouteAttributePolicyClearMsg{});
+    rib_->enqueueRibPolicyMsg(RibBase::RouteAttributePolicyTimerMsg{});
   });
 }
 
