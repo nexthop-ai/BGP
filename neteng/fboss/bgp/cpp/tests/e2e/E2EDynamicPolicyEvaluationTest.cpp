@@ -40,12 +40,15 @@
 #include <folly/coro/BlockingWait.h>
 #include <folly/logging/xlog.h>
 
+#include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
+
 #include "fboss/lib/CommonUtils.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/facebook/BgpServiceBB.h"
 #include "neteng/fboss/bgp/cpp/tests/PolicyUtils.h"
 #include "neteng/fboss/bgp/cpp/tests/Utils.h"
 #include "neteng/fboss/bgp/cpp/tests/e2e/E2ETestFixture.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/TBgpService.h"
 
 using namespace facebook::bgp;
 
@@ -122,13 +125,16 @@ class E2EDynamicPolicyEvaluationTest : public E2ETestFixture {
         /*enableEgressBackpressure=*/true);
 
     watchdog_ = std::make_unique<Watchdog>(config_);
-    bgpService_ = std::make_unique<BgpServiceBB>(
+    bgpService_ = std::make_shared<BgpServiceBB>(
         *peerManager_,
         configManager_,
         *rib_,
         *watchdog_,
         /*nlWrapper=*/nullptr,
         false);
+    bgpClient_ = apache::thrift::makeTestClient<
+        apache::thrift::Client<neteng::fboss::bgp::thrift::TBgpService>>(
+        bgpService_);
   }
 
   /**
@@ -175,8 +181,8 @@ class E2EDynamicPolicyEvaluationTest : public E2ETestFixture {
         peersPolicy;
     peersPolicy[peerAddr][direction] = policyName;
 
-    return folly::coro::blockingWait(bgpService_->co_setPeersPolicy(
-        std::make_unique<decltype(peersPolicy)>(std::move(peersPolicy))));
+    return folly::coro::blockingWait(
+        bgpClient_->co_setPeersPolicy(peersPolicy));
   }
 
   /**
@@ -188,12 +194,15 @@ class E2EDynamicPolicyEvaluationTest : public E2ETestFixture {
     std::map<std::string, std::set<bgp_policy::DIRECTION>> peersToUnset;
     peersToUnset[peerAddr].insert(direction);
 
-    return folly::coro::blockingWait(bgpService_->co_unsetPeersPolicy(
-        std::make_unique<decltype(peersToUnset)>(std::move(peersToUnset))));
+    return folly::coro::blockingWait(
+        bgpClient_->co_unsetPeersPolicy(peersToUnset));
   }
 
   std::unique_ptr<Watchdog> watchdog_;
-  std::unique_ptr<BgpServiceBB> bgpService_;
+  std::shared_ptr<BgpServiceBB> bgpService_;
+  std::unique_ptr<
+      apache::thrift::Client<neteng::fboss::bgp::thrift::TBgpService>>
+      bgpClient_;
 };
 
 /**
@@ -224,9 +233,8 @@ TEST_F(
   peerGroupsPolicy["test-peer-group-1"][bgp_policy::DIRECTION::OUT] =
       kDrainPolicyName;
 
-  auto result = folly::coro::blockingWait(bgpService_->co_setPeerGroupsPolicy(
-      std::make_unique<decltype(peerGroupsPolicy)>(
-          std::move(peerGroupsPolicy))));
+  auto result = folly::coro::blockingWait(
+      bgpClient_->co_setPeerGroupsPolicy(peerGroupsPolicy));
   EXPECT_EQ(
       result, neteng::fboss::bgp::thrift::BgpPolicyChangeResult::INPUT_ERROR);
 }
