@@ -275,6 +275,22 @@ class RibPolicyRouteMatcher {
    */
   bool match(const RibEntry& route) const;
 
+  bool hasCommunityMatch() const {
+    return communityMatch_.has_value();
+  }
+
+  bool hasPrefixSet() const {
+    return !prefixSet_.empty();
+  }
+
+  bool communityMatchesPath(const std::shared_ptr<RouteInfo>& path) const {
+    return communityMatch_.has_value() && communityMatch_->Match(path->attrs);
+  }
+
+  bool prefixMatches(const folly::CIDRNetwork& prefix) const {
+    return prefixSet_.contains(prefix);
+  }
+
  private:
   static std::unordered_set<folly::CIDRNetwork> getPrefixSet(
       const rib_policy::TRibRouteMatcher& matcher);
@@ -417,6 +433,10 @@ class RouteAttributeActions {
    */
   bool updateAttribute(RibEntry& route) const;
 
+  void moveWeightIndex(const RouteAttributeActions& other) const {
+    std::swap(weightIndex_, other.weightIndex_);
+  }
+
  private:
   /**
    * Update the link bandwidth of the route.
@@ -467,6 +487,14 @@ class RouteAttributeActions {
    *   configured weight.
    */
   std::optional<bool> divideWeightsByMatchingPathCount_;
+
+  // Inverted index: path attrs -> (first matching action index, weight) or
+  // nullopt if no action matches. Keyed on interned BgpPath for dedup across
+  // prefixes. Mutable for lazy population in updateUcmpWeight.
+  mutable folly::F14FastMap<
+      std::shared_ptr<const BgpPath>,
+      std::optional<std::pair<size_t, int32_t>>>
+      weightIndex_;
 
   // Grant tests access to private and protected members of this class.
 #ifdef RouteAttributeUcmpAction_TEST_FRIENDS
@@ -553,6 +581,26 @@ class RouteAttributeStatement {
    * @returns boolean indicating if route is transformed or not.
    */
   bool updateAttribute(RibEntry& route) const;
+
+  bool hasCommunityMatch() const {
+    return matcher_.hasCommunityMatch();
+  }
+
+  bool communityMatchesPath(const std::shared_ptr<RouteInfo>& path) const {
+    return matcher_.communityMatchesPath(path);
+  }
+
+  bool hasPrefixSet() const {
+    return matcher_.hasPrefixSet();
+  }
+
+  bool prefixMatches(const folly::CIDRNetwork& prefix) const {
+    return matcher_.prefixMatches(prefix);
+  }
+
+  void moveWeightIndex(const RouteAttributeStatement& other) const {
+    actions_.moveWeightIndex(other.actions_);
+  }
 
  private:
   const RibPolicyRouteMatcher matcher_;
@@ -682,7 +730,28 @@ class RouteAttributePolicy {
     std::swap(matchCache_, other.matchCache_);
   }
 
+  /**
+   * Migrate inverted indices from another policy on expiration-only change.
+   * Swaps the community index and per-statement weight indices for O(1)
+   * transfer. Community index is keyed on statement NAME (valid when matchers
+   * unchanged), and weight indices are keyed on path attrs (valid when actions
+   * unchanged). For content changes, do NOTHING (new policy has empty indices,
+   * which rebuild lazily).
+   * @param other The source policy to swap indices with
+   */
+  void moveIndices(RouteAttributePolicy& other) {
+    std::swap(communityToStatement_, other.communityToStatement_);
+    for (const auto& [name, stmt] : statements_) {
+      auto it = other.statements_.find(name);
+      if (it != other.statements_.end()) {
+        stmt.moveWeightIndex(it->second);
+      }
+    }
+  }
+
  private:
+  std::optional<std::string> matchStatement(const RibEntry& route) const;
+
   // unordered maps: statement name -> statement
   folly::F14NodeMap<std::string, RouteAttributeStatement> statements_{};
 
@@ -695,6 +764,18 @@ class RouteAttributePolicy {
   mutable std::unique_ptr<
       folly::F14NodeMap<folly::CIDRNetwork, std::optional<RibPolicyResultBase>>>
       matchCache_;
+
+  // Inverted index: interned community-set -> statement name (or nullopt if
+  // none). Mutable for lazy population in overwriteRouteAttributes. Keyed on
+  // nettools::bgplib::BgpAttrCommunitiesC shared_ptr for dedup across prefixes.
+  mutable folly::F14FastMap<
+      std::shared_ptr<const nettools::bgplib::BgpAttrCommunitiesC>,
+      std::optional<std::string>>
+      communityToStatement_;
+
+  // Names of statements with non-empty prefix sets, checked linearly per
+  // prefix. Populated in constructor.
+  std::vector<std::string> prefixMatcherStatements_;
 
   // Grant tests access to private and protected members of this class.
 #ifdef RouteAttributePolicy_TEST_FRIENDS

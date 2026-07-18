@@ -313,8 +313,7 @@ bool RibPolicyRouteMatcher::matchCommunity(const RibEntry& route) const {
   if (!communityMatch_) {
     return false;
   }
-  const auto paths = route.getAllPaths();
-  for (const auto& path : paths) {
+  for (const auto& path : route.getAllPaths()) {
     if (communityMatch_->Match(path->attrs)) {
       return true;
     }
@@ -474,38 +473,76 @@ bool RouteAttributeActions::updateUcmpWeight(RibEntry& route) const {
     }
   }
 
-  // Convert the collection of path matchers to weight association to next-hop
-  // to weight association.
+  // Helper: look up (actionIdx, weight) for a path in the weight index
+  auto lookupWeight = [this](const std::shared_ptr<RouteInfo>& path)
+      -> std::optional<std::pair<size_t, int32_t>> {
+    const auto& key = path->attrs;
+    auto it = weightIndex_.find(key);
+    if (it != weightIndex_.end()) {
+      RibStats::STATS_raPolicyWeightIndexHit.add(1);
+      return it->second;
+    }
+    RibStats::STATS_raPolicyWeightIndexMiss.add(1);
+    // Compute: iterate actions in index order, first match wins
+    for (size_t idx = 0; idx < nextHopWeightActions_.size(); ++idx) {
+      auto [isMatch, weight] = nextHopWeightActions_[idx]->Match(path);
+      if (isMatch) {
+        auto result = std::make_optional(std::make_pair(idx, weight));
+        weightIndex_.emplace(key, result);
+        return result;
+      }
+    }
+    // No action matched
+    weightIndex_.emplace(key, std::nullopt);
+    return std::nullopt;
+  };
+
+  // Build nexthop -> (actionIdx, weight) map, enforcing "lowest actionIdx wins"
   folly::F14NodeMap<
       folly::IPAddress /* nexthop */,
       std::pair<size_t /* action index */, int32_t /* weight */>>
       policyNexthopAction;
-  // Number of paths matching each action.
-  std::vector<int> matchingPathCount(nextHopWeightActions_.size());
 
-  size_t nhWeightActionIdx = 0;
-  for (const auto& nexthopWeightAction : nextHopWeightActions_) {
-    for (const auto& path : selectedPaths) {
-      // If path matches one matcher, include the path.
-      auto [isMatch, weight] = nexthopWeightAction->Match(path);
-      if (isMatch) {
-        const auto& nh = path->attrs->getNexthop();
-        // Matchers are expected to be mutually exclusive. In the unlikely case
-        // a next hop matches multiple actions, use the first matching action.
-        if (policyNexthopAction.contains(nh)) {
-          XLOGF(
-              WARN,
-              "NH {} for route {} matches multiple actions",
-              nh.str(),
-              route.getPrefix().first.str());
-        } else {
-          policyNexthopAction.emplace(
-              nh, std::make_pair(nhWeightActionIdx, weight));
-          matchingPathCount.at(nhWeightActionIdx)++;
+  for (const auto& path : selectedPaths) {
+    auto weightResult = lookupWeight(path);
+    if (!weightResult.has_value()) {
+      continue;
+    }
+    const auto& nh = path->attrs->getNexthop();
+    const auto [actionIdx, weight] = *weightResult;
+
+    auto it = policyNexthopAction.find(nh);
+    if (it == policyNexthopAction.end()) {
+      // First path to claim this nexthop
+      policyNexthopAction.emplace(nh, std::make_pair(actionIdx, weight));
+    } else {
+      // Nexthop already claimed. Keep the one with lower actionIdx.
+      const auto [existingIdx, existingWeight] = it->second;
+      if (actionIdx != existingIdx) {
+        // A nexthop matched by two different actions is a policy
+        // misconfiguration (actions are expected to be mutually exclusive).
+        // Warn regardless of selectedPaths iteration order; the lowest action
+        // index wins.
+        XLOGF(
+            WARN,
+            "NH {} for route {} matches multiple actions ({} and {})",
+            nh.str(),
+            route.getPrefix().first.str(),
+            existingIdx,
+            actionIdx);
+        if (actionIdx < existingIdx) {
+          it->second = std::make_pair(actionIdx, weight);
         }
       }
     }
-    nhWeightActionIdx++;
+  }
+
+  // Compute matchingPathCount[actionIdx] = number of nexthops whose WINNING
+  // action is actionIdx. This must be computed AFTER resolving winners.
+  std::vector<int> matchingPathCount(nextHopWeightActions_.size(), 0);
+  for (const auto& [nh, actionWeightPair] : policyNexthopAction) {
+    const auto [actionIdx, _] = actionWeightPair;
+    matchingPathCount.at(actionIdx)++;
   }
 
   // Assign the policy weights to the route.
@@ -515,12 +552,12 @@ bool RouteAttributeActions::updateUcmpWeight(RibEntry& route) const {
         it != policyNexthopAction.end()) {
       const auto [actionIdx, policyWeight] = it->second;
       if (divideWeightsByMatchingPathCount_.value_or(false)) {
-        // matchingPathCount[actionIdx] is guaranteed to be >= 1 here:
-        // policyNexthopAction only contains entries that were emplaced
-        // alongside an increment of matchingPathCount[actionIdx] in the
-        // action-match loop above, so finding `nh` in the map implies the
-        // corresponding action has at least one matching path. std::max with
-        // a floor of 1 is for small-numerator rounding, not divide-by-zero.
+        // matchingPathCount[actionIdx] is guaranteed to be >= 1 here: it was
+        // computed above (in the loop over policyNexthopAction) as the number
+        // of nexthops whose winning action is actionIdx, so finding `nh` in
+        // policyNexthopAction means its winning action contributed at least one
+        // such increment. std::max with a floor of 1 is for small-numerator
+        // rounding, not divide-by-zero.
         updatedRouteNexthops.emplace(
             nh, std::max(policyWeight / matchingPathCount.at(actionIdx), 1));
       } else {
@@ -576,6 +613,12 @@ RouteAttributePolicy::RouteAttributePolicy(const TRouteAttributePolicy& policy)
   for (const auto& [name, tStmt] : *policy.statements()) {
     statements_.emplace(name, tStmt);
   }
+  // Populate prefix matcher list
+  for (const auto& [name, stmt] : statements_) {
+    if (stmt.hasPrefixSet()) {
+      prefixMatcherStatements_.push_back(name);
+    }
+  }
 }
 
 TRouteAttributePolicy RouteAttributePolicy::toThrift() const {
@@ -598,6 +641,66 @@ bool RouteAttributePolicy::match(const RibEntry& route) const {
   return false;
 }
 
+std::optional<std::string> RouteAttributePolicy::matchStatement(
+    const RibEntry& route) const {
+  // Check prefix matchers first
+  const auto& prefix = route.getPrefix();
+  for (const auto& name : prefixMatcherStatements_) {
+    const auto& stmt = statements_.at(name);
+    if (stmt.isActive() && stmt.prefixMatches(prefix)) {
+      return name;
+    }
+  }
+
+  // Check community matchers. Statements are mutually exclusive, so a
+  // community-set matches at most one statement. Cache the first *active*
+  // matching statement per interned community-set (or nullopt), mirroring the
+  // isActive() filter in the prefix loop above. isActive() is re-checked at
+  // lookup so an entry stops matching once its statement expires by wall-clock;
+  // a statement reactivated by an expiration extension takes the selective
+  // migration path, which rebuilds this index, so a cached nullopt never goes
+  // stale within a policy generation.
+  //
+  // Selection returns the statement of the first path (getAllPaths order) whose
+  // community-set maps to an active statement, assuming a route's paths do not
+  // carry community-sets mapping to *different* statements (else the choice is
+  // path-order dependent, as the pre-index code was statement-order dependent).
+  for (const auto& path : route.getAllPaths()) {
+    const auto& key =
+        path->attrs->getFields()->attrs.get().communities.getSharedPtr();
+    auto it = communityToStatement_.find(key);
+    if (it == communityToStatement_.end()) {
+      RibStats::STATS_raPolicyCommunityIndexMiss.add(1);
+      std::optional<std::string> matched;
+      for (const auto& [name, stmt] : statements_) {
+        if (stmt.hasCommunityMatch() && stmt.isActive() &&
+            stmt.communityMatchesPath(path)) {
+          matched = name;
+          break;
+        }
+      }
+      it = communityToStatement_.emplace(key, matched).first;
+    } else {
+      RibStats::STATS_raPolicyCommunityIndexHit.add(1);
+    }
+    if (it->second.has_value()) {
+      /*
+       * The index value is a statement NAME. moveIndices() swaps this index
+       * into a new policy assuming the name set is unchanged; if that contract
+       * is ever violated the name may be absent from statements_. Treat a
+       * missing statement as a non-match rather than throwing std::out_of_range
+       * and aborting the RIB walk.
+       */
+      auto stmtIt = statements_.find(*it->second);
+      if (stmtIt != statements_.end() && stmtIt->second.isActive()) {
+        return *it->second;
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
 bool RouteAttributePolicy::overwriteRouteAttributes(
     RibEntry& route,
     RouteAttributePolicy::RibChange& change) const {
@@ -617,11 +720,17 @@ bool RouteAttributePolicy::overwriteRouteAttributes(
       return false;
     } else {
       // Positive cache hit - use cached statement
-      const auto& stmt = statements_.at(cachedItem->second->getStatementName());
-      if (!stmt.isActive()) {
-        // Statement expired - treat as no match
+      auto stmtIt = statements_.find(cachedItem->second->getStatementName());
+      if (stmtIt == statements_.end() || !stmtIt->second.isActive()) {
+        /*
+         * Statement missing or expired - treat as no match. A missing statement
+         * can only arise if moveCache() migrated this entry into a policy whose
+         * statement-name set differs (contract violation); degrade gracefully
+         * instead of throwing std::out_of_range.
+         */
         return false;
       }
+      const auto& stmt = stmtIt->second;
       if (stmt.updateAttribute(route)) {
         change.updatedRoutes.emplace(prefix);
         XLOGF(
@@ -633,16 +742,15 @@ bool RouteAttributePolicy::overwriteRouteAttributes(
     }
   }
 
-  // 2. Cache miss - iterate through statements (O(statements))
+  // 2. Cache miss - use inverted index to find matched statement
   RibStats::STATS_raPolicyCacheMiss.add(1);
-  for (const auto& [name, stmt] : statements_) {
-    if (!stmt.isActive() || !stmt.match(route)) {
-      continue;
-    }
+  auto matchedStmtName = matchStatement(route);
 
-    // Found match - cache it for future lookups
-    matchCache_->emplace(prefix, name);
+  if (matchedStmtName.has_value()) {
+    // Found match - cache it
+    matchCache_->emplace(prefix, *matchedStmtName);
 
+    const auto& stmt = statements_.at(*matchedStmtName);
     if (stmt.updateAttribute(route)) {
       change.updatedRoutes.emplace(prefix);
       XLOGF(
@@ -650,7 +758,6 @@ bool RouteAttributePolicy::overwriteRouteAttributes(
           "RibPolicy updated the route {}",
           folly::IPAddress::networkToString(prefix));
     }
-    // matched
     return true;
   }
 

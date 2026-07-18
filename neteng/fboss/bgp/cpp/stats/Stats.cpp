@@ -869,6 +869,23 @@ DEFINE_quantile_stat(
     fb303::QuantileConsts::kP50_P95_P99,
     fb303::SlidingWindowPeriodConsts::kOneMinTenMin);
 
+DEFINE_timeseries(
+    raPolicyCommunityIndexHit,
+    kRaPolicyCommunityIndexHit,
+    fb303::COUNT);
+DEFINE_timeseries(
+    raPolicyCommunityIndexMiss,
+    kRaPolicyCommunityIndexMiss,
+    fb303::COUNT);
+DEFINE_timeseries(
+    raPolicyWeightIndexHit,
+    kRaPolicyWeightIndexHit,
+    fb303::COUNT);
+DEFINE_timeseries(
+    raPolicyWeightIndexMiss,
+    kRaPolicyWeightIndexMiss,
+    fb303::COUNT);
+
 void publishShadowRibSize(uint64_t shadowRibEntryCount) {
   fb303::ThreadCachedServiceData::get()->setCounter(
       kTotalShadowRibEntries, shadowRibEntryCount);

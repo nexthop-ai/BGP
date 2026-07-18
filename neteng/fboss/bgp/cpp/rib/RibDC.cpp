@@ -540,6 +540,7 @@ RibDC::CacheMigrationResult RibDC::migrateRouteAttributePolicyCache(
   // If hasUpdate but no re-evaluation needed (expiration-only change)
   if (!result.needsReEvaluation) {
     newPolicy.moveCache(oldPolicy);
+    newPolicy.moveIndices(oldPolicy);
     XLOGF(
         INFO,
         "[CTE] Cache migration: only expiration changed, full cache move");

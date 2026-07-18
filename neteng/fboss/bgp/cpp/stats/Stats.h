@@ -721,6 +721,23 @@ inline constexpr auto kRaPolicyCacheMigrationTimeMs =
     "bgpd.ribPolicy.routeAttributePolicyCache.migration.process_time_ms";
 DECLARE_quantile_stat(raPolicyCacheMigrationTimeMs);
 
+// RouteAttributePolicy inverted index counters
+inline constexpr auto kRaPolicyCommunityIndexHit =
+    "bgpd.ribPolicy.communityIndex.hit";
+DECLARE_timeseries(raPolicyCommunityIndexHit);
+
+inline constexpr auto kRaPolicyCommunityIndexMiss =
+    "bgpd.ribPolicy.communityIndex.miss";
+DECLARE_timeseries(raPolicyCommunityIndexMiss);
+
+inline constexpr auto kRaPolicyWeightIndexHit =
+    "bgpd.ribPolicy.weightIndex.hit";
+DECLARE_timeseries(raPolicyWeightIndexHit);
+
+inline constexpr auto kRaPolicyWeightIndexMiss =
+    "bgpd.ribPolicy.weightIndex.miss";
+DECLARE_timeseries(raPolicyWeightIndexMiss);
+
 } // namespace RibStats
 
 //------------------------ FibStats ------------------------//
