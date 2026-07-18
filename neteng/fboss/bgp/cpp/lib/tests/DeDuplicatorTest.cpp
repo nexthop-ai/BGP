@@ -386,11 +386,11 @@ TEST(DeDuplicatedAttributeTests, DeduplicatorSizesAreIndependentTest) {
 
   // Insert 2 communities
   BgpAttrCommunitiesC comm1;
-  comm1.push_back(BgpAttrCommunityC(100, 200));
+  comm1.emplace_back(100, 200);
   DeDuplicatedCommunities dedupComm1(comm1);
 
   BgpAttrCommunitiesC comm2;
-  comm2.push_back(BgpAttrCommunityC(100, 300));
+  comm2.emplace_back(100, 300);
   DeDuplicatedCommunities dedupComm2(comm2);
 
   EXPECT_EQ(DeDuplicatedAsPath::deduplicatorSize(), 1);
@@ -418,19 +418,19 @@ TEST(DeDuplicatedAttributeTests, DeduplicatorSizesAreIndependentTest) {
 
   // Insert 4 ext communities
   BgpAttrExtCommunitiesC ec1;
-  ec1.push_back(BgpAttrExtCommunityC(0, 1));
+  ec1.emplace_back(0, 1);
   DeDuplicatedExtCommunities dedupEc1(ec1);
 
   BgpAttrExtCommunitiesC ec2;
-  ec2.push_back(BgpAttrExtCommunityC(0, 2));
+  ec2.emplace_back(0, 2);
   DeDuplicatedExtCommunities dedupEc2(ec2);
 
   BgpAttrExtCommunitiesC ec3;
-  ec3.push_back(BgpAttrExtCommunityC(0, 3));
+  ec3.emplace_back(0, 3);
   DeDuplicatedExtCommunities dedupEc3(ec3);
 
   BgpAttrExtCommunitiesC ec4;
-  ec4.push_back(BgpAttrExtCommunityC(0, 4));
+  ec4.emplace_back(0, 4);
   DeDuplicatedExtCommunities dedupEc4(ec4);
 
   EXPECT_EQ(DeDuplicatedAsPath::deduplicatorSize(), 1);

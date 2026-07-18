@@ -38,9 +38,9 @@ namespace facebook::bgp {
  * We mock the functions to verify the correctness of each loop
  */
 
-#define SET_CALLED_FUNCTION(functionName)                       \
-  functionsCalled_.withWLock(                                   \
-      [&](auto& strList) { strList.push_back(functionName); }); \
+#define SET_CALLED_FUNCTION(functionName)                          \
+  functionsCalled_.withWLock(                                      \
+      [&](auto& strList) { strList.emplace_back(functionName); }); \
   sem_.signal();
 
 #define SET_CALLED_FUNCTION_IN_CORO(functionName) \
