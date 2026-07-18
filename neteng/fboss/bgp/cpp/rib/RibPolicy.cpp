@@ -295,6 +295,15 @@ RibPolicyRouteMatcher::RibPolicyRouteMatcher(const TRibRouteMatcher& matcher)
   if (prefixSet_.empty() && !communityMatch_) {
     throw BgpError("Missing matching attribute in RibPolicyRouteMatcher");
   }
+  // A statement carries exactly one route matcher -- a prefix set or a
+  // community list, never both. Matching on both is expressible as two separate
+  // statements, and keeping it to one keeps the community->statement index
+  // unambiguous.
+  if (!prefixSet_.empty() && communityMatch_) {
+    throw BgpError(
+        "RibPolicyRouteMatcher must specify either a prefix set or a community "
+        "list, not both; use separate statements");
+  }
 }
 
 TRibRouteMatcher RibPolicyRouteMatcher::toThrift() const {

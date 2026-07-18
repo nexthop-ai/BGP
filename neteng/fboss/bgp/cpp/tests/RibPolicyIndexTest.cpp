@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include "neteng/fboss/bgp/cpp/common/BgpError.h"
 #include "neteng/fboss/bgp/cpp/rib/RibEntry.h"
 #include "neteng/fboss/bgp/cpp/rib/RibPolicy.h"
 #include "neteng/fboss/bgp/cpp/tests/RibPolicyUtils.h"
@@ -1236,6 +1237,21 @@ TEST_F(RibPolicyIndexTest, MatchCacheStaleStatementTreatedAsNoMatch) {
   RouteAttributePolicy::RibChange newChange;
   EXPECT_FALSE(newPolicy.overwriteRouteAttributes(newEntry, newChange));
   EXPECT_FALSE(newEntry.getRibPolicyUcmpWeight().has_value());
+}
+
+TEST_F(RibPolicyIndexTest, RejectsMatcherWithBothPrefixAndCommunity) {
+  auto prefix = folly::IPAddress::createNetwork("1.1.1.0/24");
+
+  TBgpCommunityMatch communityMatch = createTBgpCommunityMatch(
+      100, 200, routing_policy::MatchValueLogicOperator::EQUAL);
+  TCommunityListMatch communityList = createTCommunityListMatch(
+      {communityMatch}, routing_policy::BooleanOperator::OR);
+
+  // A route matcher must carry exactly one matcher; specifying both a prefix
+  // set and a community list is rejected -- use two separate statements
+  // instead.
+  TRibRouteMatcher matcher = createTRibRouteMatcher({prefix}, communityList);
+  EXPECT_THROW(RibPolicyRouteMatcher{matcher}, BgpError);
 }
 
 } // namespace facebook::bgp

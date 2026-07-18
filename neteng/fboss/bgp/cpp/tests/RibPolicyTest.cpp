@@ -1073,14 +1073,13 @@ TEST(RibPolicyTest, RibPolicyRouteMatcherTest) {
   EXPECT_TRUE(communityMatcher.match(entry1));
   EXPECT_FALSE(communityMatcher.match(entry2));
 
-  // Test mixed match
-  // match both the prefix kV4Prefix2 and the community 200:666
-  RibPolicyRouteMatcher mixedMatcher(createTRibRouteMatcher(
-      {kV4Prefix2},
-      {createTCommunityListMatch({createTBgpCommunityMatch(200, 666)})}));
-
-  EXPECT_TRUE(mixedMatcher.match(entry1));
-  EXPECT_TRUE(mixedMatcher.match(entry2));
+  // A matcher must specify either a prefix set or a community list, not both;
+  // "match this prefix OR this community" is expressed as two statements.
+  EXPECT_THROW(
+      RibPolicyRouteMatcher(createTRibRouteMatcher(
+          {kV4Prefix2},
+          {createTCommunityListMatch({createTBgpCommunityMatch(200, 666)})})),
+      BgpError);
 }
 
 TEST(RibPolicyTest, RouteAttributeStatementTest) {
@@ -1282,16 +1281,17 @@ TEST(RibPolicyTest, RouteFilterStatementTest) {
 }
 
 /*
- * Reproduce P1: RibPolicyRouteMatcher::operator== only compares prefixSet_
- * and ignores communityMatch_. Two matchers with same prefixes but different
- * community_list incorrectly compare as equal.
+ * operator== must consider community_list, not just prefixSet_: two community
+ * matchers with different community lists must not compare equal.
  */
 TEST(RibPolicyTest, RibPolicyRouteMatcherCommunityIgnored) {
-  auto commMatch = createTBgpCommunityMatch(65000, 100);
-  auto commList = createTCommunityListMatch({commMatch}, BooleanOperator::OR);
+  auto commMatch1 = createTBgpCommunityMatch(65000, 100);
+  auto commList1 = createTCommunityListMatch({commMatch1}, BooleanOperator::OR);
+  auto commMatch2 = createTBgpCommunityMatch(65000, 200);
+  auto commList2 = createTCommunityListMatch({commMatch2}, BooleanOperator::OR);
 
-  auto tMatcher1 = createTRibRouteMatcher({kV4Prefix1});
-  auto tMatcher2 = createTRibRouteMatcher({kV4Prefix1}, commList);
+  auto tMatcher1 = createTRibRouteMatcher({}, commList1);
+  auto tMatcher2 = createTRibRouteMatcher({}, commList2);
 
   RibPolicyRouteMatcher matcher1(tMatcher1);
   RibPolicyRouteMatcher matcher2(tMatcher2);
