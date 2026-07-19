@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <string_view>
+
 #include <folly/IPAddress.h>
 #include <folly/Portability.h>
 #include <folly/coro/AsyncScope.h>
@@ -428,17 +430,66 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
   void scheduleCoroTasks() noexcept;
 
   /*
-   * EoR-convergence timer policy seam. The base scheduleTimers() arms
-   * eorTimer_ for the configured eor_time_s at startup and treats session
-   * establishment as a no-op (onSessionEstablishedEorHook). Platform
-   * subclasses (e.g. PeerManagerBB) override these to instead measure the EoR
-   * wait from the first established session, with a generous boot-time cap.
-   * scheduleEorTimeout() is the shared, guarded re-arm helper (no-op once
-   * initial path computation has been notified or eorTimer_ has been reset).
+   * EoR-convergence timer policy seam. createAndScheduleTimers() CREATES the
+   * timers (on the evb thread, from run()) and installs the startup policy: the
+   * base creates eorTimer_ + initializedMaxWaitTimer_ and arms eorTimer_ for
+   * the configured eor_time_s (DC/OSS), treating session establishment as a
+   * no-op (onSessionEstablishedEorHook). Platform subclasses (e.g.
+   * PeerManagerBB) override these to instead create + arm their own
+   * boot-relative safety-net timer and defer the eor_time_s wait to the first
+   * established session. createEorTimer()/createInitializedMaxWaitTimer() are
+   * the shared make helpers (single source of the AsyncTimeout wiring);
+   * scheduleTimer() is the shared, guarded arm helper (no-op if the timer is
+   * null) that also logs the timer name + duration, used directly to arm
+   * eorTimer_ (protected), initializedMaxWaitTimer_, and the BB timer.
    */
-  virtual void scheduleTimers() noexcept;
+  virtual void createAndScheduleTimers() noexcept;
   virtual void onSessionEstablishedEorHook() noexcept {}
-  void scheduleEorTimeout(std::chrono::seconds timeout) noexcept;
+  void createEorTimer() noexcept;
+  void createInitializedMaxWaitTimer() noexcept;
+
+  /*
+   * Shared arm helper: schedules `timer` for `duration` (no-op if null, e.g.
+   * reset after convergence-notify / stop(), or not yet created without run()),
+   * logging `name` and the duration. Returns true iff the timer was (re-)armed.
+   */
+  bool scheduleTimer(
+      std::unique_ptr<folly::AsyncTimeout>& timer,
+      std::string_view name,
+      std::chrono::seconds duration) noexcept;
+
+  /*
+   * Shared EoR-convergence timeout handler: force initial RIB path computation
+   * (once) and log the peers whose EoR was still outstanding. Invoked by the
+   * base eorTimer_, and by platform max-wait timers (e.g. PeerManagerBB's
+   * boot-relative RIB-computation timer) so all paths drive the same one-shot
+   * convergence kick-off.
+   */
+  void onEorConvergenceTimeout() noexcept;
+
+  /*
+   * initializedMaxWaitTimer_ callback: publishes the INITIALIZED signal (the
+   * last line of defense) and latches initialized_. Runs when that timer fires.
+   */
+  void onInitializedMaxWaitTimeout() noexcept;
+
+  /*
+   * EoR wait timer: bounds the wait for peers' End-of-RIB before forcing
+   * initial RIB path computation. Protected (not private) because a platform
+   * subclass arms it — PeerManagerBB creates + arms it on the first established
+   * session via createEorTimer() + scheduleTimer(). Created in
+   * createAndScheduleTimers() on the evb thread; callback is
+   * onEorConvergenceTimeout().
+   */
+  std::unique_ptr<folly::AsyncTimeout> eorTimer_;
+
+  /*
+   * Cached EoR wait (eor_time_s) as a duration, read once from config at
+   * construction. Drives the EoR-timer seam above and the initialized-signal
+   * max cap; protected so platform subclasses (e.g. PeerManagerBB) can derive
+   * their timer policy without reaching into the private config.
+   */
+  const std::chrono::seconds eorWaitDuration_;
 
   // Peer session manager
   std::shared_ptr<SessionManager> sessionMgr_;
@@ -1094,11 +1145,8 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
   // Timers
   //
 
-  // counts the hold-down timer
-  std::unique_ptr<folly::AsyncTimeout> eorTimer_;
-
   // max cap count-down to publish initialized signal
-  std::unique_ptr<folly::AsyncTimeout> initializedSignalTimer_;
+  std::unique_ptr<folly::AsyncTimeout> initializedMaxWaitTimer_;
 
   // One-time flag, best-path start signal should only be sent once
   bool ribInitPathComputationNotified_{false};

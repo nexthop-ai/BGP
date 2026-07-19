@@ -130,6 +130,9 @@ PeerManagerBase::PeerManagerBase(
     std::chrono::milliseconds maxSessionRetryDur,
     std::chrono::milliseconds maxSessionDampenDur)
     : BgpModuleBase(kModulePeerManager),
+      eorWaitDuration_(
+          std::chrono::seconds(
+              *configManager->getConfig()->getConfig().eor_time_s())),
       configManager_(configManager),
       policyManager_(policyManager),
       ribInQ_(ribInQ),
@@ -191,73 +194,9 @@ PeerManagerBase::PeerManagerBase(
         processChangeItemCompleteCallback(trackedObject);
       });
 
-  // Read about BGP global config
-  auto config = configManager_->getConfig();
-  auto globalConfig = config->getBgpGlobalConfig();
-
-  // Create a timer to schedule EoR notification
-  // ATTN: this is the max-cap duration of EoR notification
-  eorTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
-    if (ribInitPathComputationNotified_) {
-      return;
-    }
-
-    // Log BGP++ initialization event
-    BgpStats::logInitializationEvent(
-        "PeerManager", BgpInitializationEvent::EOR_TIMER_EXPIRED);
-
-    // Notify RIB since we hit max-cap duration
-    notifyRibInitialPathComputation(/*timerFired=*/true);
-
-    // Log pending peers from initialization sequence
-    std::vector<std::string> pendingStaticPeers{};
-    for (const auto& [peerAddr, eorRcvd] : staticPeerEoRReceived_) {
-      if (!eorRcvd.first) {
-        pendingStaticPeers.emplace_back(peerAddr.str());
-      }
-    }
-
-    XLOGF(
-        ERR,
-        "[Initialization] Still awaits the EoR from static peers: {}",
-        folly::join(", ", pendingStaticPeers));
-
-    std::vector<std::string> pendingDynamicPeers{};
-    for (const auto& [peerId, eorRcvd] : dynamicPeerEoRReceived_) {
-      if (!eorRcvd.first) {
-        pendingDynamicPeers.emplace_back(peerId.str());
-      }
-    }
-
-    XLOGF(
-        ERR,
-        "[Initialization] Still awaits the EoR from dynamic peers: {}",
-        folly::join(", ", pendingDynamicPeers));
-  });
-
-  initializedSignalTimer_ = folly::AsyncTimeout::make(evb_, [this]() noexcept {
-    if (initialized_) {
-      return;
-    }
-
-    BgpStats::setPeerManagerReachesInitializedTimeout(true);
-
-    // Check totalSendPrefixCount
-    if (totalSentPrefixCount == 0) {
-      BgpStats::setNoPrefixSent();
-    }
-
-    // Log BGP++ initialization event
-    BgpStats::logInitializationEvent(
-        "PeerManager", BgpInitializationEvent::INITIALIZED);
-
-    // Mark initialized_ variable for internal access
-    initialized_ = true;
-
-    // Log peers still pending egress EoR. The ingress EoR should have been
-    // caught logged when eorTimer_ expired
-    logEoRPeers(false /* check egressEoR */);
-  });
+  // NOTE: eorTimer_ / initializedMaxWaitTimer_ (and, for BB,
+  // ribComputationMaxWaitTimer_) are created in createAndScheduleTimers() on
+  // the PeerManager EventBase thread when run() starts, not here.
 
   // Get stream subscriber peering parameters
   auto p = getStreamPeeringParams();
@@ -340,7 +279,18 @@ void PeerManagerBase::run() noexcept {
 
   addPeersToSessionMgr();
   scheduleCoroTasks();
-  scheduleTimers();
+
+  /*
+   * Platform EoR-timer policy seam, run once here on the PeerManager EventBase
+   * thread just before the event loop starts. It both CREATES and schedules the
+   * timers, so AsyncTimeouts are always made on this evb thread (not the
+   * constructor). The base creates eorTimer_ + initializedMaxWaitTimer_ and
+   * arms the standard EoR wait (eor_time_s from startup) used by DC and OSS;
+   * platform subclasses override it to install a different startup policy (e.g.
+   * PeerManagerBB creates + arms a boot-relative RIB-computation max-wait timer
+   * and defers creating/arming eorTimer_ until the first session establishes).
+   */
+  createAndScheduleTimers();
 
   XLOG(INFO, "Start PeerManagerBase event-base loop");
   evb_.loop();
@@ -362,26 +312,110 @@ void PeerManagerBase::scheduleCoroTasks() noexcept {
   asyncScope_.add(co_withExecutor(&evb_, periodicEvictFromDeduplicatorLoop()));
 }
 
-void PeerManagerBase::scheduleTimers() noexcept {
-  XLOG(DBG1, "Start EoR Timer.");
-  scheduleEorTimeout(
-      std::chrono::seconds(
-          *configManager_->getConfig()->getConfig().eor_time_s()));
+void PeerManagerBase::createEorTimer() noexcept {
+  /*
+   * Bounds the wait for peers' End-of-RIB before forcing initial RIB path
+   * computation. Made on the evb thread; its callback runs there too.
+   */
+  eorTimer_ = folly::AsyncTimeout::make(
+      evb_, [this]() noexcept { onEorConvergenceTimeout(); });
 }
 
-void PeerManagerBase::scheduleEorTimeout(
-    std::chrono::seconds timeout) noexcept {
+void PeerManagerBase::createInitializedMaxWaitTimer() noexcept {
   /*
-   * No-op if eorTimer_ has been reset. The timer is destroyed once initial
-   * path computation is notified (convergence has been kicked off) and on
-   * stop(); this guards the subclass first-session re-arm against a session
-   * that establishes after convergence/shutdown (e.g. the boot cap already
-   * fired before any session came up).
+   * Last-resort timer that publishes the INITIALIZED signal even if some peers
+   * never send egress EoR. Created here; armed later in
+   * notifyRibInitialPathComputation().
    */
-  if (!eorTimer_) {
+  initializedMaxWaitTimer_ = folly::AsyncTimeout::make(
+      evb_, [this]() noexcept { onInitializedMaxWaitTimeout(); });
+}
+
+void PeerManagerBase::createAndScheduleTimers() noexcept {
+  createEorTimer();
+  createInitializedMaxWaitTimer();
+  scheduleTimer(eorTimer_, "EoR timer", eorWaitDuration_);
+}
+
+bool PeerManagerBase::scheduleTimer(
+    std::unique_ptr<folly::AsyncTimeout>& timer,
+    std::string_view name,
+    std::chrono::seconds duration) noexcept {
+  /*
+   * Shared arm helper. No-op if `timer` has been reset — after
+   * convergence-notify or stop(), or when reached without run() having created
+   * it (e.g. direct unit-test calls). Returns true iff the timer was
+   * (re-)armed.
+   */
+  if (!timer) {
+    return false;
+  }
+  timer->scheduleTimeout(duration);
+
+  XLOGF(DBG1, "Started {} for {}s.", name, duration.count());
+  return true;
+}
+
+void PeerManagerBase::onEorConvergenceTimeout() noexcept {
+  if (ribInitPathComputationNotified_) {
     return;
   }
-  eorTimer_->scheduleTimeout(timeout);
+
+  // Log BGP++ initialization event
+  BgpStats::logInitializationEvent(
+      "PeerManager", BgpInitializationEvent::EOR_TIMER_EXPIRED);
+
+  // Notify RIB since we hit max-cap duration
+  notifyRibInitialPathComputation(/*timerFired=*/true);
+
+  // Log pending peers from initialization sequence
+  std::vector<std::string> pendingStaticPeers{};
+  for (const auto& [peerAddr, eorRcvd] : staticPeerEoRReceived_) {
+    if (!eorRcvd.first) {
+      pendingStaticPeers.emplace_back(peerAddr.str());
+    }
+  }
+
+  XLOGF(
+      ERR,
+      "[Initialization] Still awaits the EoR from static peers: {}",
+      folly::join(", ", pendingStaticPeers));
+
+  std::vector<std::string> pendingDynamicPeers{};
+  for (const auto& [peerId, eorRcvd] : dynamicPeerEoRReceived_) {
+    if (!eorRcvd.first) {
+      pendingDynamicPeers.emplace_back(peerId.str());
+    }
+  }
+
+  XLOGF(
+      ERR,
+      "[Initialization] Still awaits the EoR from dynamic peers: {}",
+      folly::join(", ", pendingDynamicPeers));
+}
+
+void PeerManagerBase::onInitializedMaxWaitTimeout() noexcept {
+  if (initialized_) {
+    return;
+  }
+
+  BgpStats::setPeerManagerReachesInitializedTimeout(true);
+
+  // Check totalSendPrefixCount
+  if (totalSentPrefixCount == 0) {
+    BgpStats::setNoPrefixSent();
+  }
+
+  // Log BGP++ initialization event
+  BgpStats::logInitializationEvent(
+      "PeerManager", BgpInitializationEvent::INITIALIZED);
+
+  // Mark initialized_ variable for internal access
+  initialized_ = true;
+
+  // Log peers still pending egress EoR. The ingress EoR should have been
+  // caught logged when eorTimer_ expired
+  logEoRPeers(false /* check egressEoR */);
 }
 
 void PeerManagerBase::addPeersToSessionMgr() {
@@ -594,7 +628,7 @@ void PeerManagerBase::stop() noexcept {
 
     // reset all of the timers
     eorTimer_.reset();
-    initializedSignalTimer_.reset();
+    initializedMaxWaitTimer_.reset();
 
     for (const auto& [_, adjRib] : adjRibs_) {
       if (adjRib) {
@@ -2424,13 +2458,14 @@ void PeerManagerBase::notifyRibInitialPathComputation(
   // Reset EoR timer since either we 1) received all EoRs, or 2) timed out
   eorTimer_.reset();
 
-  // Start a max-cap counting-down timer for initiailized signal publication
-  // NOTE: this is the last line of defense to publish INITIALIZED signal in
-  // case there are bad peers can't send egressEoR towards.
-  initializedSignalTimer_->scheduleTimeout(
-      kStartupConvergenceMaxWaitMultiplier *
-      std::chrono::seconds(
-          *configManager_->getConfig()->getConfig().eor_time_s()));
+  // Start the max-cap countdown for INITIALIZED signal publication (the last
+  // line of defense in case bad peers never send egressEoR). scheduleTimer()
+  // is a no-op if the timer is null (notify reached without run(), e.g. direct
+  // unit-test calls) where there is no event loop to fire it anyway.
+  scheduleTimer(
+      initializedMaxWaitTimer_,
+      "initialized max-wait timer",
+      kInitializedMaxWaitMultiplier * eorWaitDuration_);
 }
 
 void PeerManagerBase::processPeerEoR(
@@ -2562,7 +2597,7 @@ void PeerManagerBase::maybeMarkInitialized() noexcept {
       "PeerManager", BgpInitializationEvent::INITIALIZED);
 
   // Reset the initializedSignalTimer for max-cap purpose
-  initializedSignalTimer_.reset();
+  initializedMaxWaitTimer_.reset();
 
   // Set convergence time
   int64_t duration = BgpStats::getInitializationDurationMs();

@@ -200,7 +200,7 @@ TEST_F(PeerManagerInitializationTestFixture, InitializedSignalTimeoutTest) {
         facebook::fb303::ThreadCachedServiceData::getShared()->getCounters(
             counters);
 
-        // initializedSignalTimer_ expired and populates INITIALIZED event
+        // initializedMaxWaitTimer_ expired and populates INITIALIZED event
         EXPECT_TRUE(counters.contains(
             fmt::format(
                 kInitEventCounterFormat,

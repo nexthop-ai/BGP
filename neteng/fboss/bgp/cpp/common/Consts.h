@@ -345,11 +345,20 @@ constexpr auto kConsumerStalenessThreshold = std::chrono::minutes(10);
 constexpr auto kBgpcppTag = "bgpcpp";
 
 /*
- * Multiplier on `eor_time_s` for BGP++ convergence max-cap timers. Used as the
- * last-resort `initializedSignalTimer_` window, and (BB) as the boot-time
- * `eorTimer_` max cap that bounds startup before the first session arms the
- * real EoR wait.
+ * Multiplier on `eor_time_s` for the last-resort `initializedMaxWaitTimer_`
+ * window: the outermost deadline (armed once convergence is kicked off) by
+ * which BGP++ publishes the INITIALIZED signal even if some peers never send
+ * egress EoR.
  */
-constexpr uint32_t kStartupConvergenceMaxWaitMultiplier = 5;
+constexpr uint32_t kInitializedMaxWaitMultiplier = 5;
+
+/*
+ * Multiplier on `eor_time_s` for the BB boot-relative RIB-computation max wait,
+ * armed when the PeerManager thread starts so initial RIB path computation is
+ * force-unblocked even if no peer session ever comes up. MUST stay below
+ * kInitializedMaxWaitMultiplier so RIB computation is forced before the
+ * INITIALIZED last line of defense.
+ */
+constexpr uint32_t kRibComputationMaxWaitMultiplier = 3;
 
 } // namespace facebook::bgp
