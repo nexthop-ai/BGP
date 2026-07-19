@@ -364,9 +364,24 @@ void PeerManagerBase::scheduleCoroTasks() noexcept {
 
 void PeerManagerBase::scheduleTimers() noexcept {
   XLOG(DBG1, "Start EoR Timer.");
-  eorTimer_->scheduleTimeout(
+  scheduleEorTimeout(
       std::chrono::seconds(
           *configManager_->getConfig()->getConfig().eor_time_s()));
+}
+
+void PeerManagerBase::scheduleEorTimeout(
+    std::chrono::seconds timeout) noexcept {
+  /*
+   * No-op if eorTimer_ has been reset. The timer is destroyed once initial
+   * path computation is notified (convergence has been kicked off) and on
+   * stop(); this guards the subclass first-session re-arm against a session
+   * that establishes after convergence/shutdown (e.g. the boot cap already
+   * fired before any session came up).
+   */
+  if (!eorTimer_) {
+    return;
+  }
+  eorTimer_->scheduleTimeout(timeout);
 }
 
 void PeerManagerBase::addPeersToSessionMgr() {
@@ -2216,6 +2231,13 @@ folly::coro::Task<void> PeerManagerBase::sessionEstablished(
   adjRib->markStateEstablished();
   runningSessions_ += 1;
   setRunningSessions(runningSessions_);
+
+  /*
+   * Virtual hook: subclasses override to (re-)arm the EoR wait timer on the
+   * first established session.
+   */
+  onSessionEstablishedEorHook();
+
   addSessionStateChanges();
   if (peerInfo->peeringParams.remoteAs == kVipAsn) {
     runningVipSessions_ += 1;

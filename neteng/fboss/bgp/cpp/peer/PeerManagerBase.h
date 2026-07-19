@@ -426,7 +426,19 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
 
  protected:
   void scheduleCoroTasks() noexcept;
-  void scheduleTimers() noexcept;
+
+  /*
+   * EoR-convergence timer policy seam. The base scheduleTimers() arms
+   * eorTimer_ for the configured eor_time_s at startup and treats session
+   * establishment as a no-op (onSessionEstablishedEorHook). Platform
+   * subclasses (e.g. PeerManagerBB) override these to instead measure the EoR
+   * wait from the first established session, with a generous boot-time cap.
+   * scheduleEorTimeout() is the shared, guarded re-arm helper (no-op once
+   * initial path computation has been notified or eorTimer_ has been reset).
+   */
+  virtual void scheduleTimers() noexcept;
+  virtual void onSessionEstablishedEorHook() noexcept {}
+  void scheduleEorTimeout(std::chrono::seconds timeout) noexcept;
 
   // Peer session manager
   std::shared_ptr<SessionManager> sessionMgr_;
