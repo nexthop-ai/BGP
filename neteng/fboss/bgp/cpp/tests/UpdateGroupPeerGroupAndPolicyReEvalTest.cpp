@@ -27,6 +27,7 @@
 
 #define AdjRibOutGroup_TEST_FRIENDS             \
   FRIEND_TEST(SplitToGroup, CopiesGroupFields); \
+  FRIEND_TEST(SplitToGroup, ClonesPackingList); \
   FRIEND_TEST(SplitToGroup, MovesJoinedRunningPeer);
 
 #include <array>
@@ -368,6 +369,84 @@ TEST_F(SplitToGroup, CopiesGroupFields) {
             sharedPrefix,
             sourceGroup->getGroupOwnerKey()),
         nullptr);
+
+    /*
+     * Break the peer<->group and group<->consumer cycles splitToNewGroup
+     * created on the unmanaged target group so it (and its copied entries,
+     * which reference the AdjRibPolicyCache singleton) is destroyed at end of
+     * test instead of leaking past folly Singleton teardown.
+     */
+    targetGroup->unregisterPeer(adjRib0);
+    adjRib0->setUpdateGroup(nullptr);
+    if (auto consumer = targetGroup->getChangeListConsumer()) {
+      consumer->resetBitmap();
+      consumer->terminate();
+      consumer->deregisterFromTracker();
+    }
+    targetGroup->resetChangeListConsumer();
+  });
+
+  tearDown(ctx);
+}
+
+/*
+ * splitToNewGroup deep-copies the group-level packing list onto the new group
+ * (copyGroupFieldsToNewGroup), so the new group resumes packing from the same
+ * state, and the copy is independent of the old group's.
+ */
+TEST_F(SplitToGroup, ClonesPackingList) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  auto peerId0 = makePeerId(0);
+  auto& evb = ctx.peerMgr->getEventBase();
+
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib0 = ctx.adjRibs.at(peerId0);
+    auto sourceGroup = adjRib0->getUpdateGroup();
+    ASSERT_NE(sourceGroup, nullptr);
+
+    /*
+     * Seed a distinctive packing list entry on the source group. The key uses
+     * null attrs -- supported by BgpPathHashWithNull/BgpPathCompareWithNull --
+     * since this test exercises only the map copy, not advertisement.
+     */
+    const folly::CIDRNetwork packedPrefix{folly::IPAddress("200.0.0.0"), 24};
+    BgpPathWithAfi key{};
+    PrefixSet prefixes;
+    prefixes.insert({packedPrefix, 0});
+    sourceGroup->attrToPrefixMap_.clear();
+    sourceGroup->attrToPrefixMap_[key] = prefixes;
+
+    auto targetGroup = std::make_shared<AdjRibOutGroup>(
+        evb,
+        "split_target",
+        sourceGroup->getGroupId() + 1,
+        /*enableUpdateGroup=*/true,
+        sourceGroup->getGroupKey());
+    sourceGroup->splitToNewGroup(targetGroup, {adjRib0});
+
+    /*
+     * The new group holds an equal copy of the packing list; the old group
+     * still holds its own.
+     */
+    ASSERT_EQ(targetGroup->attrToPrefixMap_.size(), 1);
+    auto targetItr = targetGroup->attrToPrefixMap_.find(key);
+    ASSERT_NE(targetItr, targetGroup->attrToPrefixMap_.end());
+    EXPECT_EQ(targetItr->second.count({packedPrefix, 0u}), 1);
+    EXPECT_EQ(sourceGroup->attrToPrefixMap_.size(), 1);
+
+    /*
+     * The copy is independent: clearing the source's packing list leaves the
+     * new group's intact.
+     */
+    sourceGroup->attrToPrefixMap_.clear();
+    EXPECT_EQ(targetGroup->attrToPrefixMap_.size(), 1);
+
+    /*
+     * Drop the new group's synthetic entry before teardown so nothing attempts
+     * to advertise the null-attrs path.
+     */
+    targetGroup->attrToPrefixMap_.clear();
 
     /*
      * Break the peer<->group and group<->consumer cycles splitToNewGroup

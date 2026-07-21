@@ -2990,6 +2990,12 @@ void AdjRibOutGroup::copyGroupFieldsToNewGroup(
   newGroup->updateGroupConfig_ = updateGroupConfig_;
   newGroup->initialDumpCompletionTimeMs_ = initialDumpCompletionTimeMs_;
   /*
+   * Deep-copy the group-level packing list so newGroup resumes packing from the
+   * same CL position this group was at. Copy-assigning the F14 maps clones the
+   * entries by value, matching clonePackingListForPeer.
+   */
+  newGroup->attrToPrefixMap_ = attrToPrefixMap_;
+  /*
    * The split copies this group's RIB-OUT entries into newGroup (see
    * movePeersSharedRibOut*), so newGroup advertises the same prefix set at
    * split time. Seed its egress prefix counts to match, or newGroup's
