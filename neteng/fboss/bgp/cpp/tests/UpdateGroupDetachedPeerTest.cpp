@@ -1002,7 +1002,7 @@ TEST_F(
 
   // Peer entered detached-init-dump state...
   EXPECT_EQ(adjRib->getPeerState(), PeerUpdateState::DETACHED_INIT_DUMP);
-  EXPECT_TRUE(adjRib->isAdjRibFlagSet(AdjRib::DETACHED_INIT_DUMP_PEER));
+  EXPECT_TRUE(adjRib->isAdjRibFlagSet(AdjRib::DETACHED_ON_REGISTRATION));
   EXPECT_TRUE(group_->getDetachedPeers().contains(adjRib));
 
   /*
@@ -1011,6 +1011,14 @@ TEST_F(
    * of short-circuiting.
    */
   EXPECT_EQ(adjRib->getChangeListConsumer(), nullptr);
+
+  /*
+   * Deactivating detached mode processing (e.g. on promotion to sync) clears
+   * the DETACHED_ON_REGISTRATION flag so the peer is no longer treated as
+   * detached-on-registration.
+   */
+  adjRib->deactivateDetachedModeProcessing();
+  EXPECT_FALSE(adjRib->isAdjRibFlagSet(AdjRib::DETACHED_ON_REGISTRATION));
 }
 
 /*
@@ -4662,7 +4670,7 @@ TEST_F(UpdateGroupDetachedPeerTest, DetachDoesNotResendCommittedEgressEoR) {
 
 /*
  * Test: collapseLiteEntry skips detachedRibVersion check for init dump peers
- * (DETACHED_INIT_DUMP_PEER flag) and queues announcements for all
+ * (DETACHED_ON_REGISTRATION flag) and queues announcements for all
  * group-only entries.
  */
 TEST_F(
@@ -4681,7 +4689,7 @@ TEST_F(
 
   /* Set detachedRibVersion=10 — normally ribVersion(5) <= 10 would skip */
   adjRib->setDetachedRibVersion(10);
-  adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
+  adjRib->setAdjRibFlag(AdjRib::DETACHED_ON_REGISTRATION);
   adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
   group_->markPeerDetached(adjRib);
 
@@ -4695,7 +4703,7 @@ TEST_F(
 
 /**
  * Test: collapsePathEntry skips detachedRibVersion check for init dump peers
- * (DETACHED_INIT_DUMP_PEER flag) and queues announcements for all
+ * (DETACHED_ON_REGISTRATION flag) and queues announcements for all
  * group-only entries.
  */
 TEST_F(
@@ -4720,7 +4728,7 @@ TEST_F(
 
   /* Set detachedRibVersion=10 — normally ribVersion(5) <= 10 would skip */
   adjRib->setDetachedRibVersion(10);
-  adjRib->setAdjRibFlag(AdjRib::DETACHED_INIT_DUMP_PEER);
+  adjRib->setAdjRibFlag(AdjRib::DETACHED_ON_REGISTRATION);
   adjRib->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
   group_->markPeerDetached(adjRib);
 

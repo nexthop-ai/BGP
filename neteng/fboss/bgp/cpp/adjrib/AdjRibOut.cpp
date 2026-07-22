@@ -1712,10 +1712,10 @@ bool AdjRib::isDetachedPeer() const {
  * Neither: reschedule packing timers to continue processing.
  */
 void AdjRib::transitionPeerUpdateState() noexcept {
-  // DETACHED_INIT_DUMP peers were never in sync with the group, so they
+  // DETACHED_ON_REGISTRATION peers were never in sync with the group, so they
   // can never be DFP — they must always go through the DSP rejoin path
   // with collapse verification.
-  if (peerState_ != PeerUpdateState::DETACHED_INIT_DUMP && isDFP()) {
+  if (!isAdjRibFlagSet(DETACHED_ON_REGISTRATION) && isDFP()) {
     setAdjRibFlag(IS_DETACHED_FAST_PEER);
     XLOGF(
         DBG1,
@@ -1809,6 +1809,7 @@ void AdjRib::deactivateDetachedModeProcessing() {
     adjRibOutGroup_->decrementPeersDetachedAfterJoin();
   }
   setDetachedRibVersion(0);
+  clearAdjRibFlag(DETACHED_ON_REGISTRATION);
 }
 
 } // namespace facebook::bgp

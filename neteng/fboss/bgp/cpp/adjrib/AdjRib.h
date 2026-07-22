@@ -1112,10 +1112,11 @@ class AdjRib : boost::noncopyable,
    *        the group during collapse, preventing rejoin.
    * IS_DETACHED_FAST_PEER — peer caught up before the group moved on
    *        CL (DFP). No collapse needed on rejoin.
-   * DETACHED_INIT_DUMP_PEER — peer entered the group via initial
-   *        dump (DETACHED_INIT_DUMP), not via detachSlowPeer. During collapse,
+   * DETACHED_ON_REGISTRATION — peer entered the group already detached (
+   *        either via initial dump (DETACHED_INIT_DUMP) or policy re-eval,
+   *        but not via detachSlowPeer. During collapse,
    *        all group-only entries must be announced since the peer has no
-   *        meaningful detachedRibVersion.
+   *        meaningful detachedRibVersion. Such peers cannot use isDFP() check.
    * EGRESS_EOR_PENDING_V4 — the peer still owes an IPv4 egress EoR
    *        marker. Set at RIB-dump intake (or copied from the group on detach);
    *        cleared by clearEgressEoRPendingV4() in sendPendingEoRs once the
@@ -1126,7 +1127,7 @@ class AdjRib : boost::noncopyable,
   enum AdjRibFlag : uint32_t {
     RIB_OUT_DISCREPANCY = 0,
     IS_DETACHED_FAST_PEER,
-    DETACHED_INIT_DUMP_PEER,
+    DETACHED_ON_REGISTRATION,
     EGRESS_EOR_PENDING_V4,
     EGRESS_EOR_PENDING_V6,
   };
