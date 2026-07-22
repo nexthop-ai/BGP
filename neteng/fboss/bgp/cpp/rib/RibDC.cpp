@@ -229,9 +229,20 @@ RibDC::RibDC(
 
   auto cpsRead = readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(
       FLAGS_cps_policy_file);
+  /*
+   * Instrument the startup CPS artifact read so a restart-time read is
+   * observable, mirroring the CRF bootstrap read above. Count kError (file
+   * present but unreadable/corrupt) as a failure. kAbsent (no path configured
+   * or file not present) is the expected state on devices not yet onboarded to
+   * file-mode and is not counted, so the success/failure ratio stays
+   * meaningful.
+   */
   std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact;
   if (cpsRead.hasValue()) {
+    BgpStats::incrCpsArtifactReadSuccess();
     tCpsArtifact = std::move(cpsRead.value());
+  } else if (cpsRead.error() == ArtifactReadError::kError) {
+    BgpStats::incrCpsArtifactReadFailure();
   }
   auto [ribPolicy, cpsFileMode] =
       resolveCpsPolicy(std::move(crfRibPolicy), tCpsArtifact);
@@ -243,6 +254,9 @@ RibDC::RibDC(
                                : "n/a",
       cpsFileMode ? "FILE_MODE" : "THRIFT_MODE");
 
+  // The bootstrap install flows through replacePathSelectionPolicy (via
+  // replaceRibPolicy above), which increments bgpd.cps.policy_applied.success
+  // on the real apply — so no separate bootstrap counter is emitted here.
   replaceRibPolicy(std::move(ribPolicy), /*isBootstrap=*/true);
   setCrfFileModeEnabled(crfFileMode);
   setCpsFileModeEnabled(cpsFileMode);
@@ -283,6 +297,14 @@ bool RibDC::isCpsFileModeEnabled() const {
 
 void RibDC::setCpsFileModeEnabled(bool fileModeActive) {
   setFileModeEnabled(cpsFileModeEnabled_, fileModeActive, "CPS");
+  /*
+   * Keep the fb303 gauge in sync with the real mode so monitoring can
+   * distinguish FILE_MODE (1) from THRIFT_MODE (0). Set unconditionally (not
+   * only on transition) so the gauge is also correct after the initial
+   * bootstrap call. Without this the gauge stays at its init value (0) and can
+   * never reflect FILE_MODE.
+   */
+  BgpStats::setCpsFileModeEnabled(fileModeActive);
 }
 
 void RibDC::createFib() {
@@ -893,10 +915,33 @@ bool RibDC::replacePathSelectionPolicy(
   bool hasUpdate = hasPathSelectionPolicyChange(
       pathSelectionPolicy_.get(), newPolicy.get(), forceUpdate);
 
+  /*
+   * Count the case where forceUpdate actually bypassed the version gate: a
+   * content change whose version regressed, which would NOT have updated
+   * without forceUpdate. Kept out of hasPathSelectionPolicyChange() so that
+   * helper stays a pure predicate.
+   */
+  if (forceUpdate && pathSelectionPolicy_ && newPolicy &&
+      *pathSelectionPolicy_ != *newPolicy &&
+      pathSelectionPolicy_->getVersion() > newPolicy->getVersion()) {
+    BgpStats::incrCpsForceUpdateBypass();
+  }
+
   if (hasUpdate) {
     XLOG(DBG1, "[CPS] Updating PathSelectionPolicy.");
 
     pathSelectionPolicy_ = std::move(newPolicy);
+
+    /*
+     * Count a real CPS policy application here — where hasUpdate is known —
+     * rather than at enqueue time in the Thrift handler: the coalescing queue
+     * can drop superseded refreshes and an identical policy yields no update,
+     * so an enqueue is not an apply. Excludes clears (null policy). Covers
+     * bootstrap, the file-mode RPC, and Thrift-mode sets alike.
+     */
+    if (pathSelectionPolicy_) {
+      BgpStats::incrCpsPolicyAppliedSuccess();
+    }
 
     // Only log and append to history for real policy updates, not bootstrap
     if (!isBootstrap) {

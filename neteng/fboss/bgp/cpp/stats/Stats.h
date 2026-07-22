@@ -485,6 +485,22 @@ void incrCrfPolicyAppliedFailure();
 void incrCrfThriftRpcRejected();
 void incrCrfForceUpdateBypass();
 
+// [CPS File Mode]
+constexpr auto kCpsFileModeEnabled = "bgpd.cps.file_mode_enabled"_fs;
+constexpr auto kCpsArtifactReadSuccess = "bgpd.cps.artifact_read.success"_fs;
+constexpr auto kCpsArtifactReadFailure = "bgpd.cps.artifact_read.failure"_fs;
+constexpr auto kCpsPolicyAppliedSuccess = "bgpd.cps.policy_applied.success"_fs;
+constexpr auto kCpsPolicyAppliedFailure = "bgpd.cps.policy_applied.failure"_fs;
+constexpr auto kCpsThriftRpcRejected = "bgpd.cps.thrift_rpc_rejected"_fs;
+constexpr auto kCpsForceUpdateBypass = "bgpd.cps.force_update_bypass"_fs;
+void setCpsFileModeEnabled(bool enabled);
+void incrCpsArtifactReadSuccess();
+void incrCpsArtifactReadFailure();
+void incrCpsPolicyAppliedSuccess();
+void incrCpsPolicyAppliedFailure();
+void incrCpsThriftRpcRejected();
+void incrCpsForceUpdateBypass();
+
 } // namespace BgpStats
 
 //------------------------ RibStats ------------------------//

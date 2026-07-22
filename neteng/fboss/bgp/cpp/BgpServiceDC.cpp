@@ -308,6 +308,7 @@ BgpServiceDC::co_setPathSelectionPolicy(
       co_await cpsPolicyMutex_.co_scoped_lock_shared();
   if (dcRib_.isCpsFileModeEnabled()) {
     XLOGF(WARN, "[CPS] CPS policy is in FILE_MODE, cannot set via Thrift RPC");
+    BgpStats::incrCpsThriftRpcRejected();
     auto ret = std::make_unique<TResult>();
     ret->success() = false;
     ret->err() = "CPS policy is in FILE_MODE, cannot set via Thrift RPC";
@@ -368,6 +369,7 @@ folly::coro::Task<void> BgpServiceDC::co_clearPathSelectionPolicy() {
       co_await cpsPolicyMutex_.co_scoped_lock_shared();
   if (dcRib_.isCpsFileModeEnabled()) {
     XLOGF(WARN, "[CPS] Cannot clear CPS policy while in FILE_MODE");
+    BgpStats::incrCpsThriftRpcRejected();
     co_return;
   }
   continueExecution(false);
@@ -902,11 +904,22 @@ BgpServiceDC::co_setCpsPolicyFromFile() {
         "[CPS] Failed to read CPS policy artifact file {} (ArtifactReadError={})",
         FLAGS_cps_policy_file,
         static_cast<int>(artifact.error()));
+    /*
+     * Only kError (file present but unreadable/corrupt) is a read failure.
+     * kAbsent (no path configured or file not present) still fails the RPC
+     * below, but is not counted so bgpd.cps.artifact_read.failure keeps one
+     * consistent meaning fleet-wide (genuine read/parse errors only), matching
+     * the startup bootstrap path in RibDC.
+     */
+    if (artifact.error() == ArtifactReadError::kError) {
+      BgpStats::incrCpsArtifactReadFailure();
+    }
     auto ret = std::make_unique<TResult>();
     ret->success() = false;
     ret->err() = "Failed to read CPS policy artifact file";
     co_return ret;
   }
+  BgpStats::incrCpsArtifactReadSuccess();
 
   // Read the file-mode flag once under the lock; it can only change inside this
   // exclusive-locked handler, so a single read is authoritative for both the
@@ -959,6 +972,7 @@ BgpServiceDC::co_setCpsPolicyFromFile() {
     if (!wasFileModeEnabled) {
       dcRib_.setCpsFileModeEnabled(false);
     }
+    BgpStats::incrCpsPolicyAppliedFailure();
     XLOGF(
         ERR,
         "[CPS] Failed to apply file-based CPS policy. Error: {}",
@@ -966,6 +980,9 @@ BgpServiceDC::co_setCpsPolicyFromFile() {
     co_return std::make_unique<TResult>(std::move(result));
   }
 
+  // policy_applied.success is emitted by RibDC::replacePathSelectionPolicy when
+  // the RIB actually applies the policy (hasUpdate), not here at enqueue time —
+  // enqueues can be coalesced away or be no-ops for an identical policy.
   auto ret = std::make_unique<TResult>();
   ret->success() = true;
   ret->err() = "CPS policy applied from file (FILE_MODE)";

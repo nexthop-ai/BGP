@@ -1797,6 +1797,71 @@ CO_TEST_F(
   EXPECT_TRUE(rib_->isCpsFileModeEnabled());
 }
 
+/*
+ * Assert the CPS file-mode ODS SUM counters actually move: a successful
+ * file-mode apply bumps artifact-read + policy-applied success, and a Thrift
+ * setPathSelectionPolicy rejected while in FILE_MODE bumps thrift_rpc_rejected.
+ * SUM stats accumulate process-wide across tests, so we assert deltas.
+ */
+CO_TEST_F(BgpServiceCpsFileModeTestFixture, CpsFileModeOdsCountersIncrement) {
+  BgpStats::initCounters();
+  auto counters = fb303::ThreadCachedServiceData::getShared();
+  // SUM-type timeseries stats are read back with the ".sum" suffix.
+  const std::string kReadSuccessSum =
+      std::string(BgpStats::kCpsArtifactReadSuccess) + ".sum";
+  const std::string kAppliedSuccessSum =
+      std::string(BgpStats::kCpsPolicyAppliedSuccess) + ".sum";
+  const std::string kThriftRejectedSum =
+      std::string(BgpStats::kCpsThriftRpcRejected) + ".sum";
+
+  // A ".sum" key does not exist until its stat is first added, and SUM stats
+  // accumulate across earlier tests in this process, so treat missing as 0 and
+  // compare deltas rather than absolute values.
+  auto sumOr0 = [&](const std::string& key) {
+    return counters->hasCounter(key) ? counters->getCounter(key) : 0;
+  };
+
+  counters->publishStats();
+  const auto readSuccessBefore = sumOr0(kReadSuccessSum);
+  const auto appliedSuccessBefore = sumOr0(kAppliedSuccessSum);
+  const auto thriftRejectedBefore = sumOr0(kThriftRejectedSum);
+
+  writeCpsArtifact(/*dryrun=*/false, /*version=*/7);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // Successful file-mode apply → artifact-read + policy-applied success.
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+  CO_ASSERT_TRUE(*ret->success());
+  rib_->waitForPathSelectionPolicyUpdate();
+
+  // A non-null Thrift set is rejected in FILE_MODE → thrift_rpc_rejected.
+  // (A null policy would short-circuit to "Empty policy" before the gate.)
+  rib_policy::TPathSelectionPolicy tPolicy;
+  tPolicy.version() = 8;
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto rejectRet = co_await service_->co_setPathSelectionPolicy(
+      std::make_unique<rib_policy::TPathSelectionPolicy>(tPolicy));
+  EXPECT_FALSE(*rejectRet->success());
+
+  counters->publishStats();
+  EXPECT_EQ(readSuccessBefore + 1, sumOr0(kReadSuccessSum));
+  EXPECT_EQ(appliedSuccessBefore + 1, sumOr0(kAppliedSuccessSum));
+  EXPECT_EQ(thriftRejectedBefore + 1, sumOr0(kThriftRejectedSum));
+}
+
 // Test co_getPartialDrainStatus — dispatches onto Rib evb, returns empty
 // status when no partial-drain entries exist.
 TEST_F(BgpServiceTestFixture, CoGetPartialDrainStatusTest) {

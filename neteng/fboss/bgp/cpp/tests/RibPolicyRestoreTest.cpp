@@ -1086,6 +1086,34 @@ TEST_F(RibPolicyRestoreTestFixture, CpsFileModeToggle) {
   EXPECT_FALSE(rib_->isCpsFileModeEnabled());
 }
 
+/*
+ * The fb303 gauge bgpd.cps.file_mode_enabled must track the real CPS mode so
+ * monitoring can distinguish FILE_MODE (1) from THRIFT_MODE (0). Mirrors the
+ * CRF gauge regression test (CrfFileModeGaugeFollowsMode).
+ */
+TEST_F(RibPolicyRestoreTestFixture, CpsFileModeGaugeFollowsMode) {
+  auto gauge = [] {
+    auto* serviceData = facebook::fb303::ServiceData::get();
+    return serviceData ? serviceData->getCounter("bgpd.cps.file_mode_enabled")
+                       : 0;
+  };
+
+  rib_->setCpsFileModeEnabled(true);
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+  EXPECT_EQ(1, gauge());
+
+  rib_->setCpsFileModeEnabled(false);
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+  EXPECT_EQ(0, gauge());
+
+  /*
+   * Re-setting the same value keeps the gauge consistent (the gauge is set
+   * unconditionally, not only on transition).
+   */
+  rib_->setCpsFileModeEnabled(false);
+  EXPECT_EQ(0, gauge());
+}
+
 // readCpsPolicyFromArtifact: file does not exist
 TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactNoFile) {
   auto tmpFile = fmt::format("/tmp/cps_test_{}_nonexistent.json", ::getpid());

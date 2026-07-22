@@ -176,6 +176,21 @@ void initCounters() {
   fb303::ThreadCachedServiceData::get()->addStatExportType(
       kCrfForceUpdateBypass, fb303::SUM);
 
+  // [CPS File Mode]
+  fb303::ThreadCachedServiceData::get()->setCounter(kCpsFileModeEnabled, 0);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCpsArtifactReadSuccess, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCpsArtifactReadFailure, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCpsPolicyAppliedSuccess, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCpsPolicyAppliedFailure, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCpsThriftRpcRejected, fb303::SUM);
+  fb303::ThreadCachedServiceData::get()->addStatExportType(
+      kCpsForceUpdateBypass, fb303::SUM);
+
   initEgressBackpressureStats();
   initWellKnownCommunityStats();
 }
@@ -732,6 +747,39 @@ void incrCrfThriftRpcRejected() {
 
 void incrCrfForceUpdateBypass() {
   fb303::ThreadCachedServiceData::get()->addStatValue(kCrfForceUpdateBypass, 1);
+}
+
+void setCpsFileModeEnabled(bool enabled) {
+  fb303::ThreadCachedServiceData::get()->setCounter(
+      kCpsFileModeEnabled, enabled ? 1 : 0);
+}
+
+void incrCpsArtifactReadSuccess() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCpsArtifactReadSuccess, 1);
+}
+
+void incrCpsArtifactReadFailure() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCpsArtifactReadFailure, 1);
+}
+
+void incrCpsPolicyAppliedSuccess() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCpsPolicyAppliedSuccess, 1);
+}
+
+void incrCpsPolicyAppliedFailure() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(
+      kCpsPolicyAppliedFailure, 1);
+}
+
+void incrCpsThriftRpcRejected() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(kCpsThriftRpcRejected, 1);
+}
+
+void incrCpsForceUpdateBypass() {
+  fb303::ThreadCachedServiceData::get()->addStatValue(kCpsForceUpdateBypass, 1);
 }
 
 } // namespace BgpStats
