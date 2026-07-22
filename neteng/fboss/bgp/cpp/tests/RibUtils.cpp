@@ -359,8 +359,9 @@ void MockRib::clearRouteAttributePolicy() {
 }
 
 TResult MockRib::setPathSelectionPolicy(
-    std::unique_ptr<TPathSelectionPolicy> policy) {
-  auto res = RibDC::setPathSelectionPolicy(std::move(policy));
+    std::unique_ptr<TPathSelectionPolicy> policy,
+    bool forceUpdate) {
+  auto res = RibDC::setPathSelectionPolicy(std::move(policy), forceUpdate);
 
   std::map<std::string, int64_t> counters;
   fb303::ThreadCachedServiceData::get()->getCounters(counters);
@@ -510,9 +511,10 @@ bool MockRib::replaceRouteAttributePolicy(
 }
 bool MockRib::replacePathSelectionPolicy(
     std::unique_ptr<PathSelectionPolicy> newPolicy,
-    bool isBootstrap) {
-  auto ret =
-      RibDC::replacePathSelectionPolicy(std::move(newPolicy), isBootstrap);
+    bool isBootstrap,
+    bool forceUpdate) {
+  auto ret = RibDC::replacePathSelectionPolicy(
+      std::move(newPolicy), isBootstrap, forceUpdate);
   fulfillRibPolicyReplacePromise();
   return ret;
 }

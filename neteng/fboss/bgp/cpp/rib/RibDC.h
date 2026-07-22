@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <optional>
+#include <string_view>
 
 #include <folly/logging/xlog.h>
 #include <gflags/gflags.h>
@@ -30,6 +31,7 @@
 DECLARE_bool(publish_rib_to_fsdb);
 DECLARE_bool(publish_partial_drain_state_to_fsdb);
 DECLARE_string(crf_policy_file);
+DECLARE_string(cps_policy_file);
 
 namespace facebook::bgp {
 
@@ -66,7 +68,8 @@ class RibDC : public RibBase {
    * from RibDC.
    */
   virtual neteng::fboss::bgp::thrift::TResult setPathSelectionPolicy(
-      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy);
+      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy,
+      bool forceUpdate = false);
   rib_policy::TPathSelectionPolicy getPathSelectionPolicy();
   int64_t getPathSelectionPolicyVersion() const;
   virtual void clearPathSelectionPolicy();
@@ -96,6 +99,30 @@ class RibDC : public RibBase {
   static CrfResolution resolveCrfPolicy(
       std::unique_ptr<RibPolicy> cachedPolicy,
       const std::optional<rib_policy::CrfPolicyArtifact>& artifact);
+
+  bool isCpsFileModeEnabled() const;
+  void setCpsFileModeEnabled(bool fileModeActive);
+
+  /*
+   * Result of resolving the file-based CPS artifact against the cached
+   * RibPolicy at startup, returned by resolveCpsPolicy(). Bundles the two
+   * outputs the bootstrap path needs together:
+   *   - ribPolicy: the RibPolicy to install. Either the cached policy with
+   *     its path_selection_policy replaced by the artifact's, or (when no
+   *     cached policy exists) a fresh RibPolicy holding only the artifact
+   *     policy. Never null when the artifact applies; falls back to the
+   *     cached policy unchanged when the artifact is absent/dryrun/invalid.
+   *   - cpsFileMode: whether FILE_MODE should be enabled, i.e. the artifact
+   *     was present with dryrun=false and was successfully applied. Used to
+   *     gate out Thrift-based CPS updates once file-mode is active.
+   */
+  struct CpsResolution {
+    std::unique_ptr<RibPolicy> ribPolicy;
+    bool cpsFileMode;
+  };
+  static CpsResolution resolveCpsPolicy(
+      std::unique_ptr<RibPolicy> cachedPolicy,
+      const std::optional<rib_policy::CpsPolicyArtifact>& artifact);
 
   /**
    * [Partial Drain] DC-only device-level accessors.
@@ -218,11 +245,24 @@ class RibDC : public RibBase {
    * @param newPolicy the new PathSelectionPolicy to apply, or nullptr to clear.
    * @param isBootstrap if true, skip saving to disk and appending to
    *        change history (used during constructor restore).
+   * @param forceUpdate if true, bypass the version check (the content-change
+   *        check still applies); used by CPS FILE_MODE delivery.
    * @return hasUpdate — whether the newPolicy contains update.
    */
   virtual bool replacePathSelectionPolicy(
       std::unique_ptr<PathSelectionPolicy> newPolicy,
-      bool isBootstrap = false);
+      bool isBootstrap = false,
+      bool forceUpdate = false);
+
+  /*
+   * Shared helper behind setCrfFileModeEnabled / setCpsFileModeEnabled: flip
+   * the atomic mode flag and log only on an actual transition. policyName
+   * ("CRF" / "CPS") is used purely for the log message.
+   */
+  static void setFileModeEnabled(
+      std::atomic<bool>& flag,
+      bool fileModeActive,
+      std::string_view policyName);
 
  public:
   /*
@@ -340,6 +380,17 @@ class RibDC : public RibBase {
    * of other state.
    */
   std::atomic<bool> crfFileModeEnabled_{false};
+
+  /*
+   * Whether CPS FILE_MODE is active. Atomic because it is accessed from two
+   * threads: written on the Rib/startup thread (via setCpsFileModeEnabled()
+   * during bootstrap) and read on the BgpService Thrift-handler thread (via
+   * isCpsFileModeEnabled()) to gate out Thrift-based CPS updates while
+   * file-mode owns the policy. The atomic prevents a data race between those
+   * accesses; no stronger ordering is required since the flag is independent
+   * of other state.
+   */
+  std::atomic<bool> cpsFileModeEnabled_{false};
 
   friend class RibFixture;
   friend class RibFsdbFixture;

@@ -37,6 +37,11 @@ DEFINE_string(
     "",
     "Path to the CRF Policy artifact file for file-based CRF delivery");
 
+DEFINE_string(
+    cps_policy_file,
+    "",
+    "Path to the CPS Policy artifact file for file-based CPS delivery");
+
 using namespace facebook::neteng::fboss::bgp_attr;
 using namespace facebook::neteng::fboss::bgp::thrift;
 
@@ -84,6 +89,40 @@ RibDC::CrfResolution RibDC::resolveCrfPolicy(
   }
 
   return {std::move(cachedPolicy), crfFileMode};
+}
+
+RibDC::CpsResolution RibDC::resolveCpsPolicy(
+    std::unique_ptr<RibPolicy> cachedPolicy,
+    const std::optional<rib_policy::CpsPolicyArtifact>& artifact) {
+  if (!artifact.has_value()) {
+    return {std::move(cachedPolicy), false};
+  }
+
+  bool cpsFileMode = !*artifact->dryrun();
+  if (!cpsFileMode) {
+    // dryrun: keep the cached policy untouched and stay in THRIFT_MODE.
+    return {std::move(cachedPolicy), false};
+  }
+
+  if (cachedPolicy) {
+    auto tRibPolicy = cachedPolicy->toThrift();
+    tRibPolicy.path_selection_policy() = *artifact->policy();
+    cachedPolicy = std::make_unique<RibPolicy>(tRibPolicy);
+    XLOGF(
+        INFO,
+        "CPS FILE_MODE: replaced cached CPS with artifact policy (version={})",
+        *artifact->policy()->version());
+  } else {
+    rib_policy::TRibPolicy tRibPolicy;
+    tRibPolicy.path_selection_policy() = *artifact->policy();
+    cachedPolicy = std::make_unique<RibPolicy>(tRibPolicy);
+    XLOGF(
+        INFO,
+        "CPS FILE_MODE: no cached policy, creating new with artifact (version={})",
+        *artifact->policy()->version());
+  }
+
+  return {std::move(cachedPolicy), cpsFileMode};
 }
 
 RibDC::RibDC(
@@ -167,7 +206,18 @@ RibDC::RibDC(
   } else if (crfRead.error() == ArtifactReadError::kError) {
     BgpStats::incrCrfArtifactReadFailure();
   }
-  auto [ribPolicy, crfFileMode] =
+
+  /*
+   * Compose the CRF and CPS file-mode resolutions over a single cached
+   * RibPolicy so a device can run either or both sub-policies in file mode:
+   * resolve the cached policy against the CRF artifact first, then feed that
+   * result as the "cached" policy into the CPS resolution. Each resolveX
+   * step only swaps its own sub-policy (route_filter_policy /
+   * path_selection_policy) and leaves the others untouched, so neither
+   * overwrites the other. The single merged RibPolicy is then installed once
+   * via replaceRibPolicy.
+   */
+  auto [crfRibPolicy, crfFileMode] =
       resolveCrfPolicy(readRibPolicyState(), tCrfArtifact);
   XLOGF(
       INFO,
@@ -176,21 +226,47 @@ RibDC::RibDC(
       tCrfArtifact.has_value() ? (*tCrfArtifact->dryrun() ? "true" : "false")
                                : "n/a",
       crfFileMode ? "FILE_MODE" : "THRIFT_MODE");
+
+  auto cpsRead = readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(
+      FLAGS_cps_policy_file);
+  std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact;
+  if (cpsRead.hasValue()) {
+    tCpsArtifact = std::move(cpsRead.value());
+  }
+  auto [ribPolicy, cpsFileMode] =
+      resolveCpsPolicy(std::move(crfRibPolicy), tCpsArtifact);
+  XLOGF(
+      INFO,
+      "CPS startup read: artifact={}, dryrun={}, mode={}",
+      tCpsArtifact.has_value() ? "present" : "absent",
+      tCpsArtifact.has_value() ? (*tCpsArtifact->dryrun() ? "true" : "false")
+                               : "n/a",
+      cpsFileMode ? "FILE_MODE" : "THRIFT_MODE");
+
   replaceRibPolicy(std::move(ribPolicy), /*isBootstrap=*/true);
   setCrfFileModeEnabled(crfFileMode);
+  setCpsFileModeEnabled(cpsFileMode);
 }
 
 bool RibDC::isCrfFileModeEnabled() const {
   return crfFileModeEnabled_;
 }
 
-void RibDC::setCrfFileModeEnabled(bool fileModeActive) {
-  if (crfFileModeEnabled_.exchange(fileModeActive) != fileModeActive) {
+void RibDC::setFileModeEnabled(
+    std::atomic<bool>& flag,
+    bool fileModeActive,
+    std::string_view policyName) {
+  if (flag.exchange(fileModeActive) != fileModeActive) {
     XLOGF(
         INFO,
-        "CRF Policy mode changed: {}",
+        "{} Policy mode changed: {}",
+        policyName,
         fileModeActive ? "FILE_MODE" : "THRIFT_MODE");
   }
+}
+
+void RibDC::setCrfFileModeEnabled(bool fileModeActive) {
+  setFileModeEnabled(crfFileModeEnabled_, fileModeActive, "CRF");
   /*
    * Keep the fb303 gauge in sync with the real mode so monitoring can
    * distinguish FILE_MODE (1) from THRIFT_MODE (0). Set unconditionally (not
@@ -199,6 +275,14 @@ void RibDC::setCrfFileModeEnabled(bool fileModeActive) {
    * never reflect FILE_MODE.
    */
   BgpStats::setCrfFileModeEnabled(fileModeActive);
+}
+
+bool RibDC::isCpsFileModeEnabled() const {
+  return cpsFileModeEnabled_;
+}
+
+void RibDC::setCpsFileModeEnabled(bool fileModeActive) {
+  setFileModeEnabled(cpsFileModeEnabled_, fileModeActive, "CPS");
 }
 
 void RibDC::createFib() {
@@ -404,7 +488,10 @@ void RibDC::handleRouteAttributePolicyTimerMsg() noexcept {
 
 void RibDC::handlePathSelectionPolicySetMsg(
     const PathSelectionPolicySetMsg& msg) noexcept {
-  replacePathSelectionPolicy(std::make_unique<PathSelectionPolicy>(msg.policy));
+  replacePathSelectionPolicy(
+      std::make_unique<PathSelectionPolicy>(msg.policy),
+      /*isBootstrap=*/false,
+      msg.forceUpdate);
 }
 
 void RibDC::handlePathSelectionPolicyClearMsg() noexcept {
@@ -763,32 +850,48 @@ bool RibDC::replaceRouteAttributePolicy(
   return hasUpdate;
 }
 
+namespace {
+/*
+ * Decide whether newPolicy should replace the currently cached path selection
+ * policy. Extracted from replacePathSelectionPolicy for readability.
+ *   - current == nullptr : update iff a new policy is provided
+ *   - newPolicy == nullptr : always update (clearing the policy)
+ *   - identical content : no update
+ *   - forceUpdate : update, bypassing the version check (used by CPS FILE_MODE)
+ *   - otherwise : update iff newPolicy version >= current version
+ */
+bool hasPathSelectionPolicyChange(
+    PathSelectionPolicy* current,
+    PathSelectionPolicy* newPolicy,
+    bool forceUpdate) {
+  if (current == nullptr) {
+    return newPolicy != nullptr;
+  }
+  if (newPolicy == nullptr) {
+    return true;
+  }
+  if (*current == *newPolicy) {
+    return false;
+  }
+  if (forceUpdate) {
+    return true;
+  }
+  return current->getVersion() <= newPolicy->getVersion();
+}
+} // namespace
+
 /* We only replace instead of updating path selection policy.
    Each time the path selection policy is replaced, we also need to save
    path selection policy to disk. After that, when there is delta and not
    in read-only mode, trigger fib programming. */
 bool RibDC::replacePathSelectionPolicy(
     std::unique_ptr<PathSelectionPolicy> newPolicy,
-    bool isBootstrap) {
+    bool isBootstrap,
+    bool forceUpdate) {
   RibStats::STATS_psPolicyRcvd.add(1);
 
-  // hasUpdate is true when newPolicy is different from pathSelectionPolicy_
-  bool hasUpdate;
-
-  if (pathSelectionPolicy_) {
-    /* When pathSelectionPolicy_ has cached one policy, hasUpdate if
-       1. newPolicy == nullptr
-       OR
-       2. cached policy has delta with new one AND newPolicy has larger or
-          equal version */
-    hasUpdate = (newPolicy == nullptr) ||
-        ((*pathSelectionPolicy_ != *newPolicy) &&
-         pathSelectionPolicy_->getVersion() <= newPolicy->getVersion());
-  } else {
-    // pathSelectionPolicy_ does not cache anything, hasUpdate if newPolicy is
-    // not nullptr
-    hasUpdate = (newPolicy != nullptr);
-  }
+  bool hasUpdate = hasPathSelectionPolicyChange(
+      pathSelectionPolicy_.get(), newPolicy.get(), forceUpdate);
 
   if (hasUpdate) {
     XLOG(DBG1, "[CPS] Updating PathSelectionPolicy.");
@@ -1083,7 +1186,8 @@ std::pair<bool, bool> RibDC::selectBestPath(
  * zero references to PathSelectionPolicy.
  */
 neteng::fboss::bgp::thrift::TResult RibDC::setPathSelectionPolicy(
-    std::unique_ptr<rib_policy::TPathSelectionPolicy> policy) {
+    std::unique_ptr<rib_policy::TPathSelectionPolicy> policy,
+    bool forceUpdate) {
   neteng::fboss::bgp::thrift::TResult result;
   try {
     PathSelectionPolicy psPolicy{*policy};
@@ -1096,7 +1200,8 @@ neteng::fboss::bgp::thrift::TResult RibDC::setPathSelectionPolicy(
   }
 
   // push rib policy set message to policy queue
-  enqueueRibPolicyMsg(PathSelectionPolicySetMsg{std::move(*policy)});
+  enqueueRibPolicyMsg(
+      PathSelectionPolicySetMsg{std::move(*policy), forceUpdate});
   result.success() = true;
   return result;
 }

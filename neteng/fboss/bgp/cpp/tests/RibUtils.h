@@ -217,7 +217,8 @@ class MockRib : public RibDC {
   void clearRouteAttributePolicy() override;
 
   neteng::fboss::bgp::thrift::TResult setPathSelectionPolicy(
-      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy) override;
+      std::unique_ptr<rib_policy::TPathSelectionPolicy> policy,
+      bool forceUpdate = false) override;
 
   void clearPathSelectionPolicy() override;
 
@@ -283,7 +284,8 @@ class MockRib : public RibDC {
       std::unique_ptr<RouteAttributePolicy> newPolicy) override;
   bool replacePathSelectionPolicy(
       std::unique_ptr<PathSelectionPolicy> newPolicy,
-      bool isBootstrap = false) override;
+      bool isBootstrap = false,
+      bool forceUpdate = false) override;
   bool replaceRouteFilterPolicy(
       std::unique_ptr<RouteFilterPolicy> newPolicy,
       bool isBootstrap = false,

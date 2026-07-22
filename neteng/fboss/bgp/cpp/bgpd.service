@@ -25,6 +25,7 @@ ExecStart=/etc/packages/neteng-fboss-bgpd/current/cpp/bgpd_cpp \
     # symlink does not exist in non Polestar mode
     --policy /dev/shm/fboss/bgpcpp_startup_policy \
     --crf_policy_file /etc/coop/bgpcpp_crf_policy/current \
+    --cps_policy_file /etc/coop/bgpcpp_cps_policy/current \
     # Default options found
     --vmodule Vip*=2 \
     --logging .=DBG1;default:async=true \
@@ -33,7 +34,7 @@ ExecStart=/etc/packages/neteng-fboss-bgpd/current/cpp/bgpd_cpp \
     # Memory Tweaks pulled from wrapper
     --max_rss_size 5 \
     --bgp_policy_cache_size 40000 \
-    --undefok=policy,disable_rib_policy_scuba_logging,crf_policy_file \
+    --undefok=policy,disable_rib_policy_scuba_logging,crf_policy_file,cps_policy_file \
     $TLSFLAGS
 ExecStartPost=+/bin/bash -c 'echo "$MAINPID" > /run/bgpd.pid'
 ExecStopPost=+/usr/local/bin/fboss-core-copier \

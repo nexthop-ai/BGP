@@ -63,7 +63,28 @@
   FRIEND_TEST(                                                                 \
       RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactDryrunTrue);       \
   FRIEND_TEST(                                                                 \
-      RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfFullIntegration);
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCrfFullIntegration);      \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, CpsFileModeToggle);                 \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactNoFile);   \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactValidFile);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactMalformedJson);    \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsDryrunFalse);  \
+  FRIEND_TEST(RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsDryrunTrue);   \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture,                                             \
+      ReadRibPolicyStateCpsArtifactNoPolicyStore);                             \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactEmptyFile);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsNoCachedPolicy);       \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactDryrunTrue);       \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactEmptyPath);        \
+  FRIEND_TEST(                                                                 \
+      RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsFullIntegration);
 
 /*
  * pathSelectionPolicy_ moved from RibBase to RibDC in diff 9/10. Test that
@@ -1029,6 +1050,348 @@ TEST_F(RibPolicyRestoreTestFixture, ReadCrfPolicyFromArtifactUnreadableFile) {
   EXPECT_EQ(ArtifactReadError::kError, result.error());
 
   boost::filesystem::permissions(tmpFile, boost::filesystem::perms::owner_all);
+  boost::filesystem::remove(tmpFile);
+}
+
+namespace {
+// Build a CPS policy for one prefix with the given version. The shared
+// createTPathSelectionPolicyWithPathSelector helper hardcodes version 1, so we
+// override the version field to drive the artifact-vs-cache selection in the
+// resolveCpsPolicy tests.
+rib_policy::TPathSelectionPolicy makeCpsPolicy(
+    const folly::CIDRNetwork& prefix,
+    int64_t version) {
+  auto policy = createTPathSelectionPolicyWithPathSelector(
+      {prefix}, rib_policy::TPathSelector());
+  policy.version() = version;
+  return policy;
+}
+} // namespace
+
+// setCpsFileModeEnabled / isCpsFileModeEnabled toggle.
+TEST_F(RibPolicyRestoreTestFixture, CpsFileModeToggle) {
+  // default should be false (THRIFT_MODE)
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+
+  // set to FILE_MODE
+  rib_->setCpsFileModeEnabled(true);
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  // set back to THRIFT_MODE
+  rib_->setCpsFileModeEnabled(false);
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+
+  // setting to same value should be a no-op (no crash)
+  rib_->setCpsFileModeEnabled(false);
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+}
+
+// readCpsPolicyFromArtifact: file does not exist
+TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactNoFile) {
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_nonexistent.json", ::getpid());
+  boost::filesystem::remove(tmpFile);
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  EXPECT_FALSE(result.hasValue());
+}
+
+// readCpsPolicyFromArtifact: valid artifact file
+TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactValidFile) {
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_valid.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  rib_policy::TPathSelectionPolicy policy;
+  policy.version() = 42;
+  artifact.policy() = policy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_FALSE(*result->dryrun());
+  EXPECT_EQ(42, *result->policy()->version());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readCpsPolicyFromArtifact: malformed JSON content
+TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactMalformedJson) {
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_malformed.json", ::getpid());
+
+  folly::writeFileAtomic(tmpFile, "this is not valid json");
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  EXPECT_FALSE(result.hasValue());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readCpsPolicyFromArtifact: empty artifact file (0 bytes)
+TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactEmptyFile) {
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_empty.json", ::getpid());
+
+  folly::writeFileAtomic(tmpFile, "");
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  EXPECT_FALSE(result.hasValue());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readCpsPolicyFromArtifact: valid artifact with dryrun=true
+TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactDryrunTrue) {
+  auto tmpFile =
+      fmt::format("/tmp/cps_test_{}_dryrun_true_standalone.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = true;
+  rib_policy::TPathSelectionPolicy policy;
+  policy.version() = 55;
+  artifact.policy() = policy;
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  auto result =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_TRUE(*result->dryrun());
+  EXPECT_EQ(55, *result->policy()->version());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// readThriftArtifactFromFile: empty file path -> kAbsent
+TEST_F(RibPolicyRestoreTestFixture, ReadCpsPolicyFromArtifactEmptyPath) {
+  auto result = readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>("");
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(ArtifactReadError::kAbsent, result.error());
+}
+
+// resolveCpsPolicy with CPS artifact dryrun=false -> FILE_MODE: the artifact
+// policy replaces the cached one.
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsDryrunFalse) {
+  // Write a valid RibPolicyStore with path_selection_policy (version 100)
+  auto tPathSelectionPolicy = makeCpsPolicy(kV4Prefix1, 100);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->path_selection_policy() = tPathSelectionPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Write CPS artifact with dryrun=false (FILE_MODE), version 999
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_dryrun_false.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  artifact.policy() = makeCpsPolicy(kV4Prefix1, 999);
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CPS policy using production helper
+  auto cpsRead =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact;
+  if (cpsRead.hasValue()) {
+    tCpsArtifact = std::move(cpsRead.value());
+  }
+  auto [ribPolicy, cpsFileMode] =
+      RibDC::resolveCpsPolicy(rib_->readRibPolicyState(), tCpsArtifact);
+  EXPECT_NE(nullptr, ribPolicy);
+
+  // Path selection policy should come from artifact (version 999), not cache
+  // (100)
+  EXPECT_EQ(999, ribPolicy->getPathSelectionPolicy()->getVersion());
+
+  rib_->setCpsFileModeEnabled(cpsFileMode);
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// resolveCpsPolicy with CPS artifact dryrun=true -> THRIFT_MODE: the cached
+// policy is kept unchanged.
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsDryrunTrue) {
+  // Write a valid RibPolicyStore with path_selection_policy (version 200)
+  auto tPathSelectionPolicy = makeCpsPolicy(kV4Prefix1, 200);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->path_selection_policy() = tPathSelectionPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Write CPS artifact with dryrun=true (THRIFT_MODE), version 888
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_dryrun_true.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = true;
+  artifact.policy() = makeCpsPolicy(kV4Prefix1, 888);
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CPS policy using production helper
+  auto cpsRead =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact;
+  if (cpsRead.hasValue()) {
+    tCpsArtifact = std::move(cpsRead.value());
+  }
+  auto [ribPolicy, cpsFileMode] =
+      RibDC::resolveCpsPolicy(rib_->readRibPolicyState(), tCpsArtifact);
+  EXPECT_NE(nullptr, ribPolicy);
+
+  // Path selection policy should come from cache (version 200), not artifact
+  EXPECT_EQ(200, ribPolicy->getPathSelectionPolicy()->getVersion());
+
+  rib_->setCpsFileModeEnabled(cpsFileMode);
+  // CPS file mode should NOT be enabled (dryrun=true)
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// CPS artifact exists with dryrun=false but no rib policy store file.
+// readRibPolicyState returns nullptr; resolveCpsPolicy should create a fresh
+// policy holding only the artifact CPS and enable FILE_MODE.
+TEST_F(
+    RibPolicyRestoreTestFixture,
+    ReadRibPolicyStateCpsArtifactNoPolicyStore) {
+  // Ensure no policy store file exists
+  boost::filesystem::remove(FLAGS_rp_state_file);
+
+  // Write CPS artifact with dryrun=false (version 777)
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_no_store.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  artifact.policy() = makeCpsPolicy(kV4Prefix1, 777);
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Read artifact — should succeed
+  auto cpsRead =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  ASSERT_TRUE(cpsRead.hasValue());
+  std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact =
+      std::move(cpsRead.value());
+  EXPECT_FALSE(*tCpsArtifact->dryrun());
+
+  // Resolve CPS policy using production helper
+  auto [ribPolicy, cpsFileMode] =
+      RibDC::resolveCpsPolicy(rib_->readRibPolicyState(), tCpsArtifact);
+
+  ASSERT_NE(nullptr, ribPolicy);
+  EXPECT_TRUE(ribPolicy->hasPathSelectionPolicy());
+  EXPECT_EQ(777, ribPolicy->getPathSelectionPolicy()->getVersion());
+
+  rib_->setCpsFileModeEnabled(cpsFileMode);
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// resolveCpsPolicy with CPS artifact dryrun=false but policy store has no
+// path_selection_policy (only route_filter_policy). The artifact's CPS should
+// be injected while the cached CRF is preserved.
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsNoCachedPolicy) {
+  // Write a valid RibPolicyStore with only route_filter_policy (no CPS)
+  auto prefix = folly::IPAddress::createNetwork("::/0");
+  auto tRouteFilterPolicy =
+      createTRouteFilterPolicy({createTRouteFilterStatement({prefix})}, 100);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->route_filter_policy() = tRouteFilterPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Write CPS artifact with dryrun=false (version 500)
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_no_cached_cps.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  artifact.policy() = makeCpsPolicy(kV4Prefix1, 500);
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CPS policy using production helper
+  auto cpsRead =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact;
+  if (cpsRead.hasValue()) {
+    tCpsArtifact = std::move(cpsRead.value());
+  }
+  auto [ribPolicy, cpsFileMode] =
+      RibDC::resolveCpsPolicy(rib_->readRibPolicyState(), tCpsArtifact);
+
+  // CPS should be injected from artifact (version 500) even though store had no
+  // path_selection_policy
+  EXPECT_TRUE(ribPolicy->hasPathSelectionPolicy());
+  EXPECT_EQ(500, ribPolicy->getPathSelectionPolicy()->getVersion());
+  // Route filter policy from store should still be present
+  EXPECT_TRUE(ribPolicy->hasRouteFilterPolicy());
+
+  rib_->setCpsFileModeEnabled(cpsFileMode);
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  boost::filesystem::remove(tmpFile);
+}
+
+// Full integration test replicating the Rib constructor's CPS startup sequence:
+// read artifact -> readRibPolicyState -> resolveCpsPolicy ->
+// setCpsFileModeEnabled
+TEST_F(RibPolicyRestoreTestFixture, ReadRibPolicyStateCpsFullIntegration) {
+  // Set up policy store with a CPS (version 100)
+  auto tPathSelectionPolicy = makeCpsPolicy(kV4Prefix1, 100);
+
+  TRibPolicyStore tRibPolicyStore;
+  tRibPolicyStore.fileTermination() = kRibPolicyFileTermination;
+  tRibPolicyStore.policy()->path_selection_policy() = tPathSelectionPolicy;
+  rib_->saveTRibPolicyStore(tRibPolicyStore);
+
+  // Set up CPS artifact with dryrun=false (version 300)
+  auto tmpFile = fmt::format("/tmp/cps_test_{}_integration.json", ::getpid());
+
+  rib_policy::CpsPolicyArtifact artifact;
+  artifact.dryrun() = false;
+  artifact.policy() = makeCpsPolicy(kV4Prefix1, 300);
+
+  folly::writeFileAtomic(
+      tmpFile,
+      apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+
+  // Resolve CPS policy using production helper
+  auto cpsRead =
+      readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(tmpFile);
+  std::optional<rib_policy::CpsPolicyArtifact> tCpsArtifact;
+  if (cpsRead.hasValue()) {
+    tCpsArtifact = std::move(cpsRead.value());
+  }
+  auto [ribPolicy, cpsFileMode] =
+      RibDC::resolveCpsPolicy(rib_->readRibPolicyState(), tCpsArtifact);
+
+  rib_->setCpsFileModeEnabled(cpsFileMode);
+
+  // Verify final state
+  ASSERT_NE(nullptr, ribPolicy);
+  EXPECT_EQ(300, ribPolicy->getPathSelectionPolicy()->getVersion());
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
   boost::filesystem::remove(tmpFile);
 }
 

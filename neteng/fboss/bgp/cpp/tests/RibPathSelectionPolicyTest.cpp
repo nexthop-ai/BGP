@@ -36,10 +36,14 @@
       RibFixtureAddPathTestSuite, PathSelectionMinAggLbwbpsMissingLbwTest);    \
   FRIEND_TEST(RibFixtureAddPathTestSuite, AnnouncementTest);                   \
   FRIEND_TEST(RibFixtureAddPathTestSuite, SetGetClearPathSelectionPolicyTest); \
-  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);        \
+  FRIEND_TEST(                                                                 \
+      RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyForceUpdateTest);
 
-#define MockRib_TEST_FRIENDS \
-  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);
+#define MockRib_TEST_FRIENDS                                            \
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest); \
+  FRIEND_TEST(                                                          \
+      RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyForceUpdateTest);
 
 /*
  * pathSelectionPolicy_ moved from RibBase to RibDC in diff 9/10. Tests that
@@ -64,7 +68,9 @@
       RibFixtureAddPathTestSuite, PathSelectionMinAggLbwbpsMissingLbwTest);    \
   FRIEND_TEST(RibFixtureAddPathTestSuite, AnnouncementTest);                   \
   FRIEND_TEST(RibFixtureAddPathTestSuite, SetGetClearPathSelectionPolicyTest); \
-  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);
+  FRIEND_TEST(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest);        \
+  FRIEND_TEST(                                                                 \
+      RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyForceUpdateTest);
 
 #include "configerator/structs/neteng/bgp_policy/thrift/gen-cpp2/rib_policy_types.h"
 #include "fboss/lib/CommonUtils.h"
@@ -1482,6 +1488,100 @@ TEST_P(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyTest) {
     ribFuture.wait();
     EXPECT_EQ(rib_->pathSelectionPolicy_, nullptr);
   }
+}
+
+/*
+ * forceUpdate version matrix for replacePathSelectionPolicy, mirroring the CRF
+ * ReplaceRouteFilterPolicyForceUpdateTest. forceUpdate bypasses the version
+ * check (used by CPS FILE_MODE) but the content-change check still applies, so
+ * an identical policy never updates even with forceUpdate=true.
+ */
+TEST_P(RibFsdbAddPathTestSuite, ReplacePathSelectionPolicyForceUpdateTest) {
+  rib_->setFibBatchTime(std::chrono::milliseconds(2));
+
+  auto tMatcher = createCommunityMatch(200, 666, bgp_policy::Origin::EGP);
+  auto tPathSelector = createTPathSlectorWithOneMatcher(tMatcher);
+
+  // Helper to build a CPS policy with a given prefix (content) and version.
+  auto makePolicy = [&](const folly::CIDRNetwork& prefix, int64_t version) {
+    auto policy =
+        createTPathSelectionPolicyWithPathSelector({prefix}, tPathSelector);
+    policy.version() = version;
+    return policy;
+  };
+
+  sendInitialPathComputation();
+
+  // Set initial policy with version 12345
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV4Prefix1, 12345)));
+  });
+  EXPECT_NE(rib_->pathSelectionPolicy_, nullptr);
+  EXPECT_EQ(12345, rib_->pathSelectionPolicy_->getVersion());
+
+  // Same policy without forceUpdate - should NOT update (hasUpdate=false)
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV4Prefix1, 12345)));
+    EXPECT_FALSE(hasUpdate);
+  });
+
+  // Different content, same version, without forceUpdate - should update
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV6Prefix2, 12345)));
+    EXPECT_TRUE(hasUpdate);
+  });
+
+  // Same content, lower version, without forceUpdate - should NOT update
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV6Prefix2, 100)));
+    EXPECT_FALSE(hasUpdate);
+    EXPECT_EQ(12345, rib_->pathSelectionPolicy_->getVersion());
+  });
+
+  // Different content, lower version, with forceUpdate=true - should update
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV4Prefix1, 100)),
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_TRUE(hasUpdate);
+    EXPECT_EQ(100, rib_->pathSelectionPolicy_->getVersion());
+  });
+
+  // Same content, same version, with forceUpdate=true - should NOT update
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV4Prefix1, 100)),
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_FALSE(hasUpdate);
+  });
+
+  // Same statements, different (lower) version, with forceUpdate=true - the
+  // version is part of policy equality, so this counts as a content change and
+  // forceUpdate bypasses the version-monotonicity check, so it should update.
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        std::make_unique<PathSelectionPolicy>(makePolicy(kV4Prefix1, 50)),
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_TRUE(hasUpdate);
+    EXPECT_EQ(50, rib_->pathSelectionPolicy_->getVersion());
+  });
+
+  // nullptr with forceUpdate=true - clearing should always work
+  rib_->evb_.runInEventBaseThreadAndWait([&]() {
+    auto hasUpdate = rib_->replacePathSelectionPolicy(
+        nullptr,
+        /*isBootstrap=*/false,
+        /*forceUpdate=*/true);
+    EXPECT_TRUE(hasUpdate);
+    EXPECT_EQ(rib_->pathSelectionPolicy_, nullptr);
+  });
 }
 
 TEST_F(RibFixtureCountConfedsInAsPathLen, LongestPathFirstTest) {

@@ -131,9 +131,12 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
 
   struct PathSelectionPolicySetMsg {
     const rib_policy::TPathSelectionPolicy policy;
+    const bool forceUpdate;
 
-    explicit PathSelectionPolicySetMsg(rib_policy::TPathSelectionPolicy policy)
-        : policy(std::move(policy)) {}
+    explicit PathSelectionPolicySetMsg(
+        rib_policy::TPathSelectionPolicy policy,
+        bool forceUpdate = false)
+        : policy(std::move(policy)), forceUpdate(forceUpdate) {}
   };
 
   struct PathSelectionPolicyClearMsg {};
