@@ -286,8 +286,16 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
   std::vector<neteng::fboss::bgp::thrift::TRibEntry> getShadowRibEntries(
       neteng::fboss::bgp_attr::TBgpAfi afi);
 
+  // Get current shadowRibEntries by address family in canonical form
+  neteng::fboss::bgp::thrift::TCanonicalRibState getShadowRibEntriesCanonical(
+      neteng::fboss::bgp_attr::TBgpAfi afi);
+
   // Get current changeList entries by address family
   std::vector<neteng::fboss::bgp::thrift::TRibEntry> getChangeListEntries(
+      neteng::fboss::bgp_attr::TBgpAfi afi);
+
+  // Get current changeList entries by address family in canonical form
+  neteng::fboss::bgp::thrift::TCanonicalRibState getChangeListEntriesCanonical(
       neteng::fboss::bgp_attr::TBgpAfi afi);
 
   /**

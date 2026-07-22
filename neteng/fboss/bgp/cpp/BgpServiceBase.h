@@ -145,10 +145,20 @@ class BgpServiceBase
   co_getChangeListEntries(
       facebook::neteng::fboss::bgp_attr::TBgpAfi afi) override;
 
+  folly::coro::Task<
+      std::unique_ptr<facebook::neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getChangeListEntriesCanonical(
+      facebook::neteng::fboss::bgp_attr::TBgpAfi afi) override;
+
   // shadow RiB
   folly::coro::Task<std::unique_ptr<
       std::vector<facebook::neteng::fboss::bgp::thrift::TRibEntry>>>
   co_getShadowRibEntries(
+      facebook::neteng::fboss::bgp_attr::TBgpAfi afi) override;
+
+  folly::coro::Task<
+      std::unique_ptr<facebook::neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getShadowRibEntriesCanonical(
       facebook::neteng::fboss::bgp_attr::TBgpAfi afi) override;
 
   /* egress stats */

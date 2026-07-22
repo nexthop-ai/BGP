@@ -19,6 +19,7 @@
 #define PeerManager_TEST_FRIENDS                                                \
   FRIEND_TEST(PeerManagerTestFixture, UpdateShadowRibEntryUtil);                \
   FRIEND_TEST(PeerManagerTestFixture, ShadowRibEntryBestpathTest);              \
+  FRIEND_TEST(PeerManagerTestFixture, GetShadowRibEntriesCanonical);            \
   FRIEND_TEST(PeerManagerTestFixture, ShadowRibEntryEmptyAttrTest);             \
   FRIEND_TEST(RibAllocatedPathIdTestFixture, ShadowRibEntryMixpathTest);        \
   FRIEND_TEST(RibAllocatedPathIdTestFixture, ShadowRibEntryMultipathTest);      \
@@ -2956,6 +2957,104 @@ CO_TEST_F(PeerManagerTestFixture, SelectiveMultipathNotificationMixTest) {
   /* Execute any pending work before test cleanup. */
   evb.loopOnce();
   co_return;
+}
+
+/*
+ * getShadowRibEntriesCanonical converts the live shadow RIB to the canonical
+ * deduplicated form: announce two IPv4 bestpath routes and verify both prefixes
+ * appear with a path marked is_best_path, and that AFI filtering excludes IPv6
+ * (none announced) and the unsupported AFI_ALL.
+ */
+TEST_F(PeerManagerTestFixture, GetShadowRibEntriesCanonical) {
+  using neteng::fboss::bgp_attr::TBgpAfi;
+
+  auto config = getConfig(
+      true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
+  auto peerMgr = std::make_shared<PeerManagerBase>(
+      std::make_shared<ConfigManager>(config),
+      nullptr,
+      ribInQ_,
+      ribOutQ_,
+      nbrRouteChangeQ_);
+
+  const auto msg1 = createRibSingleAnnounce(
+      kV4Prefix1,
+      kV4Nexthop1,
+      kLocalRouteAs,
+      false /* EoR */,
+      false /* addpath */);
+  peerMgr->handleShadowRibEntryAnnouncement(std::get<RibOutAnnouncement>(msg1));
+  const auto msg2 = createRibSingleAnnounce(
+      kV4Prefix2,
+      kV4Nexthop2,
+      kLocalRouteAs,
+      false /* EoR */,
+      false /* addpath */);
+  peerMgr->handleShadowRibEntryAnnouncement(std::get<RibOutAnnouncement>(msg2));
+
+  /*
+   * Both announced prefixes convert. The getter does not populate best_path
+   * (FSDB-only); each entry instead carries its best path via is_best_path.
+   */
+  auto state = peerMgr->getShadowRibEntriesCanonical(TBgpAfi::AFI_IPV4);
+  ASSERT_EQ(2, state.rib_entries()->size());
+  for (const auto& [prefixStr, entry] : *state.rib_entries()) {
+    EXPECT_FALSE(entry.best_path().has_value()) << prefixStr;
+    EXPECT_FALSE(entry.paths()->empty()) << prefixStr;
+    bool hasBestPath = false;
+    for (const auto& [group, paths] : *entry.paths()) {
+      for (const auto& path : paths) {
+        hasBestPath |= path.is_best_path().value_or(false);
+      }
+    }
+    EXPECT_TRUE(hasBestPath) << prefixStr;
+  }
+
+  // No IPv6 routes announced, and AFI_ALL is unsupported by this getter.
+  EXPECT_EQ(
+      0,
+      peerMgr->getShadowRibEntriesCanonical(TBgpAfi::AFI_IPV6)
+          .rib_entries()
+          ->size());
+  EXPECT_EQ(
+      0,
+      peerMgr->getShadowRibEntriesCanonical(TBgpAfi::AFI_ALL)
+          .rib_entries()
+          ->size());
+}
+
+/*
+ * getChangeListEntriesCanonical shares its ShadowRibEntry->canonical conversion
+ * with getShadowRibEntriesCanonical (both call
+ * buildCanonicalPathInputsFromShadowEntry, exercised above and in RibTest /
+ * CanonicalRibBuilderTest). Here we verify the getter-specific guards: an
+ * unsupported AFI and an empty (but live) change list both yield an empty
+ * canonical state.
+ */
+TEST_F(PeerManagerTestFixture, GetChangeListEntriesCanonical) {
+  using neteng::fboss::bgp_attr::TBgpAfi;
+
+  auto config = getConfig(
+      true /* includeStaticPeer */, true /* includeDynamicShivPeer */);
+  auto peerMgr = std::make_shared<PeerManagerBase>(
+      std::make_shared<ConfigManager>(config),
+      nullptr,
+      ribInQ_,
+      ribOutQ_,
+      nbrRouteChangeQ_);
+
+  // Unsupported AFI short-circuits before touching the change list.
+  EXPECT_EQ(
+      0,
+      peerMgr->getChangeListEntriesCanonical(TBgpAfi::AFI_ALL)
+          .rib_entries()
+          ->size());
+  // Empty (but live) change list iterates to an empty canonical state.
+  EXPECT_EQ(
+      0,
+      peerMgr->getChangeListEntriesCanonical(TBgpAfi::AFI_IPV4)
+          .rib_entries()
+          ->size());
 }
 
 } // namespace facebook::bgp

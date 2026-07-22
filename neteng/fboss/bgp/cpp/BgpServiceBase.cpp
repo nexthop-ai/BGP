@@ -2191,6 +2191,78 @@ BgpServiceBase::co_getShadowRibEntries(TBgpAfi afi) {
   co_return std::make_unique<std::vector<TRibEntry>>();
 }
 
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceBase::co_getShadowRibEntriesCanonical(TBgpAfi afi) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      peerMgr_.getEventBase(),
+      [this, afi]() { return peerMgr_.getShadowRibEntriesCanonical(afi); },
+      kPeerMgrThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(
+        ERR,
+        "getShadowRibEntriesCanonical timed out, PeerManager evb unresponsive");
+  } else {
+    XLOGF(
+        ERR,
+        "getShadowRibEntriesCanonical failed: {}",
+        result.exception().what());
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceBase::co_getChangeListEntriesCanonical(TBgpAfi afi) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      peerMgr_.getEventBase(),
+      [this, afi]() { return peerMgr_.getChangeListEntriesCanonical(afi); },
+      kPeerMgrThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(
+        ERR,
+        "getChangeListEntriesCanonical timed out, PeerManager evb unresponsive");
+  } else {
+    XLOGF(
+        ERR,
+        "getChangeListEntriesCanonical failed: {}",
+        result.exception().what());
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
 folly::coro::Task<std::unique_ptr<
     std::vector<facebook::neteng::fboss::bgp::thrift::TPeerEgressStats>>>
 BgpServiceBase::co_getPeerEgressStats() {

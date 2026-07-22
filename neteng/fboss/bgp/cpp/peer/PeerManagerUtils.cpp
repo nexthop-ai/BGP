@@ -26,6 +26,7 @@
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/config/ConfigManager.h"
 #include "neteng/fboss/bgp/cpp/peer/PeerManagerBase.h"
+#include "neteng/fboss/bgp/cpp/rib/CanonicalRibBuilder.h"
 #include "neteng/fboss/bgp/cpp/stats/Stats.h"
 #include "neteng/fboss/bgp/if/gen-cpp2/bgp_thrift_types.h"
 
@@ -35,6 +36,58 @@ using namespace facebook::nettools::bgplib;
 using namespace facebook::bgp::BgpStats;
 
 namespace facebook::bgp {
+
+namespace {
+/*
+ * Build CanonicalPathInput vector from a ShadowRibEntry.
+ * Extracts bestpath (if present, flagged in kBestPathGroup) and all multipaths
+ * (in kMultiPathGroup), mirroring the legacy getter's path attribution.
+ */
+std::vector<CanonicalPathInput> buildCanonicalPathInputsFromShadowEntry(
+    const ShadowRibEntry& entry) {
+  std::vector<CanonicalPathInput> inputs;
+  /*
+   * Shadow entries expose only bestpath and multipaths, not all paths.
+   * Build CanonicalPathInput for each available path. Peer attribution
+   * is present in ShadowRibRouteInfo.
+   */
+  if (entry.bestpath) {
+    CanonicalPathInput in;
+    in.path = entry.bestpath->attrs;
+    in.peerAddr = entry.bestpath->peer.addr;
+    in.peerRouterId = entry.bestpath->peer.routerId;
+    in.peerDescription = entry.bestpath->peer.description;
+    /*
+     * Advertised (shadow/changelist) paths carry a pathIdToSend (the TX
+     * path id), not a received path id -- mirror the legacy getter and set
+     * only path_id_to_send. igp_cost / last_modified_time /
+     * bestpath_filter_descr are not available on ShadowRibRouteInfo. The
+     * legacy getter also stamps in_update / in_withdraw from the shadow
+     * flags, but the canonical schema has no field for them and no consumer
+     * renders them, so they are intentionally dropped.
+     */
+    in.pathIdToSend = entry.bestpath->pathIdToSend;
+    in.isBestPath = true;
+    in.group = facebook::bgp::kBestPathGroup;
+    inputs.push_back(std::move(in));
+  }
+  /* Mirror PeerManagerBase::createTRibEntryWithFilter: every multipath goes in
+   * kMultiPathGroup, including the bestpath when it is part of the
+   * multipath set (it also appears, flagged, in kBestPathGroup above).
+   */
+  for (const auto& [pathId, routeinfo] : entry.multipaths) {
+    CanonicalPathInput in;
+    in.path = routeinfo->attrs;
+    in.peerAddr = routeinfo->peer.addr;
+    in.peerRouterId = routeinfo->peer.routerId;
+    in.peerDescription = routeinfo->peer.description;
+    in.pathIdToSend = routeinfo->pathIdToSend;
+    in.group = facebook::bgp::kMultiPathGroup;
+    inputs.push_back(std::move(in));
+  }
+  return inputs;
+}
+} // namespace
 
 /* Get egress statistics on all peers. */
 std::vector<TPeerEgressStats> PeerManagerBase::getPeerEgressStats(
@@ -362,6 +415,35 @@ std::vector<TRibEntry> PeerManagerBase::getShadowRibEntries(TBgpAfi afi) {
   return tRibEntries;
 }
 
+neteng::fboss::bgp::thrift::TCanonicalRibState
+PeerManagerBase::getShadowRibEntriesCanonical(TBgpAfi afi) {
+  CanonicalRibBuilder builder;
+
+  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
+    return builder.build();
+  }
+
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    auto expectIPv4 = afi == TBgpAfi::AFI_IPV4;
+    for (const auto& srEntry : shadowRibEntries_) {
+      const auto& prefix = srEntry.first;
+      auto isIPv4 = prefix.first.family() == AF_INET;
+      if (expectIPv4 != isIPv4) {
+        continue;
+      }
+      const auto& entry = srEntry.second->get();
+      auto inputs = buildCanonicalPathInputsFromShadowEntry(entry);
+      /*
+       * CanonicalPathInput string_views (peerDescription) point into the live
+       * ShadowRibEntry/RouteInfo and must not be hoisted out of the per-prefix
+       * iteration.
+       */
+      builder.addEntry(prefix, entry.ribVersion, inputs);
+    }
+  });
+  return builder.build();
+}
+
 /**
  * @brief  retrieve all the entries currently present in the changeList
  *
@@ -398,6 +480,42 @@ std::vector<TRibEntry> PeerManagerBase::getChangeListEntries(TBgpAfi afi) {
     }
   });
   return tRibEntries;
+}
+
+neteng::fboss::bgp::thrift::TCanonicalRibState
+PeerManagerBase::getChangeListEntriesCanonical(TBgpAfi afi) {
+  CanonicalRibBuilder builder;
+
+  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
+    return builder.build();
+  }
+
+  if (!changeListTracker_) {
+    return builder.build();
+  }
+
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    auto expectIPv4 = afi == TBgpAfi::AFI_IPV4;
+
+    auto changeItem = changeListTracker_->getHead();
+    while (changeItem) {
+      auto& srEntry = changeItem->getTypedObject();
+      changeItem = get_next(changeItem, changeListTracker_->getChangeList());
+      const auto& prefix = srEntry.prefix;
+      auto isIPv4 = prefix.first.family() == AF_INET;
+      if (expectIPv4 != isIPv4) {
+        continue;
+      }
+      auto inputs = buildCanonicalPathInputsFromShadowEntry(srEntry);
+      /*
+       * CanonicalPathInput string_views (peerDescription) point into the live
+       * ShadowRibEntry/RouteInfo and must not be hoisted out of the per-prefix
+       * iteration.
+       */
+      builder.addEntry(prefix, srEntry.ribVersion, inputs);
+    }
+  });
+  return builder.build();
 }
 
 std::vector<TBgpSession> PeerManagerBase::getSessionInfos(
