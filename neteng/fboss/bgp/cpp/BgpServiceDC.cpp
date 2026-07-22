@@ -287,6 +287,10 @@ folly::coro::Task<std::unique_ptr<TResult>>
 BgpServiceDC::co_setPathSelectionPolicy(
     std::unique_ptr<rib_policy::TPathSelectionPolicy> policy) {
   auto log = LOG_THRIFT_CALL(DBG2);
+
+  // Validate the request before taking the lock so a null policy or shutdown
+  // keeps its specific error ("Empty policy" / "Session exits") regardless of
+  // FILE_MODE, and an invalid call never contends on cpsPolicyMutex_.
   if (exitInitiated_ || policy == nullptr) {
     auto errStr = exitInitiated_ ? "Session exits" : "Empty policy";
     XLOGF(
@@ -299,6 +303,17 @@ BgpServiceDC::co_setPathSelectionPolicy(
     ret->err() = errStr;
     co_return ret;
   }
+
+  [[maybe_unused]] auto cpsLock =
+      co_await cpsPolicyMutex_.co_scoped_lock_shared();
+  if (dcRib_.isCpsFileModeEnabled()) {
+    XLOGF(WARN, "[CPS] CPS policy is in FILE_MODE, cannot set via Thrift RPC");
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "CPS policy is in FILE_MODE, cannot set via Thrift RPC";
+    co_return ret;
+  }
+
   continueExecution(false);
   SCOPE_EXIT {
     decrRequestsInExecution();
@@ -344,7 +359,15 @@ BgpServiceDC::co_getPathSelectionPolicy() {
 
 folly::coro::Task<void> BgpServiceDC::co_clearPathSelectionPolicy() {
   auto log = LOG_THRIFT_CALL(DBG2);
+
   if (exitInitiated_) {
+    co_return;
+  }
+
+  [[maybe_unused]] auto cpsLock =
+      co_await cpsPolicyMutex_.co_scoped_lock_shared();
+  if (dcRib_.isCpsFileModeEnabled()) {
+    XLOGF(WARN, "[CPS] Cannot clear CPS policy while in FILE_MODE");
     co_return;
   }
   continueExecution(false);
@@ -841,6 +864,111 @@ BgpServiceDC::co_setCrfPolicyFromFile() {
   auto ret = std::make_unique<TResult>();
   ret->success() = true;
   ret->err() = "CRF policy applied from file (FILE_MODE)";
+  co_return ret;
+}
+
+folly::coro::Task<std::unique_ptr<TResult>>
+BgpServiceDC::co_setCpsPolicyFromFile() {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_) {
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "Session exits";
+    co_return ret;
+  }
+
+  [[maybe_unused]] auto cpsLock = co_await cpsPolicyMutex_.co_scoped_lock();
+
+  if (exitInitiated_) {
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "Session exits";
+    co_return ret;
+  }
+
+  /*
+   * Read the artifact under the exclusive lock so the read and the RIB enqueue
+   * are atomic. COOP can rewrite the artifact file at any time; because
+   * forceUpdate=true bypasses the RIB version gate and the RIB policy queue
+   * coalesces to the last enqueue, reading outside the lock would let an older
+   * artifact read by one refresh be applied after — and so overwrite — a newer
+   * one read by a concurrent refresh.
+   */
+  auto artifact = readThriftArtifactFromFile<rib_policy::CpsPolicyArtifact>(
+      FLAGS_cps_policy_file);
+  if (artifact.hasError()) {
+    XLOGF(
+        ERR,
+        "[CPS] Failed to read CPS policy artifact file {} (ArtifactReadError={})",
+        FLAGS_cps_policy_file,
+        static_cast<int>(artifact.error()));
+    auto ret = std::make_unique<TResult>();
+    ret->success() = false;
+    ret->err() = "Failed to read CPS policy artifact file";
+    co_return ret;
+  }
+
+  // Read the file-mode flag once under the lock; it can only change inside this
+  // exclusive-locked handler, so a single read is authoritative for both the
+  // dryrun no-op guard and the apply-failure rollback below.
+  const bool wasFileModeEnabled = dcRib_.isCpsFileModeEnabled();
+
+  bool fileMode = !*artifact->dryrun();
+
+  if (!fileMode) {
+    /*
+     * Transition to THRIFT_MODE. The previously-applied CPS policy (if any)
+     * remains active in the RIB — only the gating flag changes. Clearing the
+     * policy here would cause unnecessary traffic disruption. Only flip the
+     * flag when it is actually set, so a steady-state dryrun refresh is a true
+     * no-op.
+     */
+    if (wasFileModeEnabled) {
+      dcRib_.setCpsFileModeEnabled(false);
+    }
+    auto ret = std::make_unique<TResult>();
+    ret->success() = true;
+    ret->err() =
+        "CPS artifact dryrun=true, staying in THRIFT_MODE (no policy applied)";
+    co_return ret;
+  }
+
+  auto policy = std::make_unique<rib_policy::TPathSelectionPolicy>(
+      std::move(*artifact->policy()));
+
+  /*
+   * CPS lives entirely in the RIB (no PeerManager involvement) and its
+   * path-selection statements key on community lists rather than peer groups,
+   * so there is no peer-group validation step here — the CRF equivalent.
+   */
+  dcRib_.setCpsFileModeEnabled(true);
+  continueExecution(false);
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  /*
+   * Enqueue on the calling Thrift thread: setPathSelectionPolicy pushes onto
+   * the RIB's thread-safe coalescing policy queue, so there is no RIB evb hop
+   * that could time out or run after this handler (and the lock) has released.
+   */
+  auto result =
+      dcRib_.setPathSelectionPolicy(std::move(policy), /*forceUpdate=*/true);
+
+  if (!*result.success()) {
+    if (!wasFileModeEnabled) {
+      dcRib_.setCpsFileModeEnabled(false);
+    }
+    XLOGF(
+        ERR,
+        "[CPS] Failed to apply file-based CPS policy. Error: {}",
+        *result.err());
+    co_return std::make_unique<TResult>(std::move(result));
+  }
+
+  auto ret = std::make_unique<TResult>();
+  ret->success() = true;
+  ret->err() = "CPS policy applied from file (FILE_MODE)";
   co_return ret;
 }
 

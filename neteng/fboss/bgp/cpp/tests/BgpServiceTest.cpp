@@ -1463,6 +1463,340 @@ CO_TEST_F(
   EXPECT_TRUE(rib_->isCrfFileModeEnabled());
 }
 
+class BgpServiceCpsFileModeTestFixture
+    : public BgpServicePeerGroupValidationTestFixture {
+ public:
+  void SetUp() override {
+    BgpServicePeerGroupValidationTestFixture::SetUp();
+    cpsTmpFile_ =
+        fmt::format("/tmp/bgp_service_cps_test_artifact_{}.json", getpid());
+    FLAGS_cps_policy_file = cpsTmpFile_;
+  }
+
+  void TearDown() override {
+    boost::filesystem::remove(cpsTmpFile_);
+    BgpServicePeerGroupValidationTestFixture::TearDown();
+  }
+
+  void writeCpsArtifact(bool dryrun, int64_t version = 1) {
+    rib_policy::CpsPolicyArtifact artifact;
+    artifact.dryrun() = dryrun;
+    rib_policy::TPathSelectionPolicy policy;
+    policy.version() = version;
+    artifact.policy() = policy;
+
+    folly::writeFileAtomic(
+        cpsTmpFile_,
+        apache::thrift::SimpleJSONSerializer::serialize<std::string>(artifact));
+  }
+
+  std::string cpsTmpFile_;
+};
+
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    SetCpsPolicyFromFileHappyPathDryrunFalse) {
+  writeCpsArtifact(/*dryrun=*/false);
+
+  /*
+   * Remove non-thread-safe TestLogHandler before starting worker threads
+   * to avoid TSAN data races on the handler's message vector.
+   */
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+
+  EXPECT_TRUE(*ret->success());
+  EXPECT_THAT(*ret->err(), HasSubstr("FILE_MODE"));
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+}
+
+/*
+ * Behavioral check: a successful file-mode refresh not only returns success and
+ * flips the mode flag, but the artifact's policy actually reaches the RIB. We
+ * wait for the enqueued policy to drain on the rib evb and assert the installed
+ * path-selection policy version matches the artifact.
+ */
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    SetCpsPolicyFromFileAppliesPolicyToRib) {
+  writeCpsArtifact(/*dryrun=*/false, /*version=*/100);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+  CO_ASSERT_TRUE(*ret->success());
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  // Block until the enqueued policy is consumed and applied on the rib evb,
+  // then assert the installed version is exactly what the artifact carried.
+  rib_->waitForPathSelectionPolicyUpdate();
+  EXPECT_EQ(100, rib_->getPathSelectionPolicyVersion());
+}
+
+/*
+ * A later refresh carrying a newer artifact version re-applies through the file
+ * path and the RIB ends up with the newer version. version is part of policy
+ * equality, so forceUpdate installs it. This exercises the artifact reaching
+ * the RIB across successive refreshes (the read now happens under the lock, so
+ * a concurrent COOP rewrite cannot let an older read win).
+ */
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    SetCpsPolicyFromFileNewerVersionReapplied) {
+  writeCpsArtifact(/*dryrun=*/false, /*version=*/100);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret1 = co_await service_->co_setCpsPolicyFromFile();
+  CO_ASSERT_TRUE(*ret1->success());
+  rib_->waitForPathSelectionPolicyUpdate();
+  EXPECT_EQ(100, rib_->getPathSelectionPolicyVersion());
+
+  writeCpsArtifact(/*dryrun=*/false, /*version=*/200);
+  auto replaceFuture = rib_->getRibPolicyReplaceFuture();
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret2 = co_await service_->co_setCpsPolicyFromFile();
+  CO_ASSERT_TRUE(*ret2->success());
+  replaceFuture.wait();
+  EXPECT_EQ(200, rib_->getPathSelectionPolicyVersion());
+}
+
+CO_TEST_F(BgpServiceCpsFileModeTestFixture, SetCpsPolicyFromFileDryrunTrue) {
+  writeCpsArtifact(/*dryrun=*/true);
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+
+  EXPECT_TRUE(*ret->success());
+  EXPECT_THAT(*ret->err(), HasSubstr("THRIFT_MODE"));
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+}
+
+CO_TEST_F(BgpServiceCpsFileModeTestFixture, SetCpsPolicyFromFileNoArtifact) {
+  FLAGS_cps_policy_file = "/tmp/nonexistent_bgp_service_cps_test_file";
+  boost::filesystem::remove(FLAGS_cps_policy_file);
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+
+  EXPECT_FALSE(*ret->success());
+}
+
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    SetPathSelectionPolicyRejectedInFileMode) {
+  rib_->setCpsFileModeEnabled(true);
+
+  rib_policy::TPathSelectionPolicy tPolicy;
+  tPolicy.version() = 1;
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto res = co_await service_->co_setPathSelectionPolicy(
+      std::make_unique<rib_policy::TPathSelectionPolicy>(tPolicy));
+
+  EXPECT_FALSE(*res->success());
+  EXPECT_THAT(*res->err(), HasSubstr("FILE_MODE"));
+}
+
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    ClearPathSelectionPolicySkippedInFileMode) {
+  // First apply a CPS policy via FILE_MODE
+  writeCpsArtifact(/*dryrun=*/false, /*version=*/42);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+  CO_ASSERT_TRUE(*ret->success());
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  // Wait for the file-mode policy to reach the RIB so the post-clear assertion
+  // below is comparing against a policy that was actually installed.
+  rib_->waitForPathSelectionPolicyUpdate();
+  EXPECT_EQ(42, rib_->getPathSelectionPolicyVersion());
+
+  // Try to clear — should be silently skipped in FILE_MODE
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  co_await service_->co_clearPathSelectionPolicy();
+
+  // Verify FILE_MODE is still active and the installed policy was NOT cleared
+  // (the version still matches the artifact, not the -1 of a cleared policy).
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+  EXPECT_EQ(42, rib_->getPathSelectionPolicyVersion());
+}
+
+// Full lifecycle: enable FILE_MODE → reject Thrift → disable → accept Thrift
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    CpsFileModeCycleEnableRejectDisableAccept) {
+  // Step 1: Enable FILE_MODE via setCpsPolicyFromFile(dryrun=false)
+  writeCpsArtifact(/*dryrun=*/false);
+
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto ret = co_await service_->co_setCpsPolicyFromFile();
+  CO_ASSERT_TRUE(*ret->success());
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+
+  // Step 2: Thrift setPathSelectionPolicy should be rejected
+  rib_policy::TPathSelectionPolicy tPolicy;
+  tPolicy.version() = 99;
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto setRet = co_await service_->co_setPathSelectionPolicy(
+      std::make_unique<rib_policy::TPathSelectionPolicy>(tPolicy));
+  EXPECT_FALSE(*setRet->success());
+  EXPECT_THAT(*setRet->err(), HasSubstr("FILE_MODE"));
+
+  // Step 3: Disable FILE_MODE via setCpsPolicyFromFile(dryrun=true)
+  writeCpsArtifact(/*dryrun=*/true);
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto disableRet = co_await service_->co_setCpsPolicyFromFile();
+  EXPECT_TRUE(*disableRet->success());
+  EXPECT_FALSE(rib_->isCpsFileModeEnabled());
+
+  // Step 4: Thrift setPathSelectionPolicy should now succeed and the new policy
+  // must actually reach the RIB (final source = Thrift, final version = 50).
+  rib_policy::TPathSelectionPolicy tPolicy2;
+  tPolicy2.version() = 50;
+  auto replaceFuture = rib_->getRibPolicyReplaceFuture();
+  // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+  auto acceptRet = co_await service_->co_setPathSelectionPolicy(
+      std::make_unique<rib_policy::TPathSelectionPolicy>(tPolicy2));
+  EXPECT_TRUE(*acceptRet->success());
+  replaceFuture.wait();
+  EXPECT_EQ(50, rib_->getPathSelectionPolicyVersion());
+}
+
+/*
+ * Concurrency: file-mode refreshes racing Thrift CPS updates must be serialized
+ * by cpsPolicyMutex_ (the file API takes the exclusive lock; the Thrift API
+ * takes a shared lock and is gated on FILE_MODE). The fleet of operations runs
+ * in parallel on a multi-threaded executor; the test asserts there is no crash,
+ * deadlock, or data race (under TSAN) and that the service is left in a
+ * consistent state.
+ */
+CO_TEST_F(
+    BgpServiceCpsFileModeTestFixture,
+    CpsFileModeConcurrentThriftAndFileMode) {
+  // dryrun=false → every file-mode refresh enables and applies FILE_MODE.
+  writeCpsArtifact(/*dryrun=*/false);
+
+  /*
+   * Remove non-thread-safe TestLogHandler before starting worker threads to
+   * avoid TSAN data races on the handler's message vector.
+   */
+  folly::LoggerDB::get().getCategory("")->clearHandlers();
+
+  auto peerMgrThread = peerManager_->runInThread();
+  auto sessionMgrThread = sessionMgr_->runInThread();
+  auto ribThread = rib_->runInThread();
+  SCOPE_EXIT {
+    rib_->stop();
+    peerManager_->stop();
+    sessionMgr_->stop();
+    ribThread.join();
+    peerMgrThread.join();
+    sessionMgrThread.join();
+  };
+
+  constexpr int kIters = 25;
+  folly::CPUThreadPoolExecutor exec(4);
+
+  // Interleave file-mode refreshes and Thrift CPS updates so they contend for
+  // cpsPolicyMutex_. Both RPCs return std::unique_ptr<TResult>.
+  std::vector<folly::coro::Task<std::unique_ptr<TResult>>> tasks;
+  tasks.reserve(kIters * 2);
+  for (int i = 0; i < kIters; ++i) {
+    // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+    tasks.push_back(service_->co_setCpsPolicyFromFile());
+
+    rib_policy::TPathSelectionPolicy tPolicy;
+    tPolicy.version() = 1000 + i;
+    // @lint-ignore CLANGTIDY facebook-thrift-handler-direct-call
+    tasks.push_back(service_->co_setPathSelectionPolicy(
+        std::make_unique<rib_policy::TPathSelectionPolicy>(tPolicy)));
+  }
+
+  auto results = co_await folly::coro::co_withExecutor(
+      &exec, folly::coro::collectAllRange(std::move(tasks)));
+
+  // Every operation completed with a well-formed result. A Thrift update either
+  // succeeded (it ran before FILE_MODE took effect) or was gracefully rejected
+  // with a FILE_MODE error — never UB or a partial/garbage result.
+  for (const auto& res : results) {
+    CO_ASSERT_NE(res, nullptr);
+    if (!*res->success()) {
+      EXPECT_THAT(*res->err(), HasSubstr("FILE_MODE"));
+    }
+  }
+
+  // Thrift updates never clear FILE_MODE, so once any refresh has run the
+  // terminal state is deterministically FILE_MODE enabled.
+  EXPECT_TRUE(rib_->isCpsFileModeEnabled());
+}
+
 // Test co_getPartialDrainStatus — dispatches onto Rib evb, returns empty
 // status when no partial-drain entries exist.
 TEST_F(BgpServiceTestFixture, CoGetPartialDrainStatusTest) {

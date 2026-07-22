@@ -68,7 +68,8 @@ class BgpServiceDC : public BgpServiceBase {
   int64_t getGoldenVipsCount() override;
 
   /**
-   * [Path Selection Policy]
+   * [Path Selection Policy — FILE_MODE gating]
+   * Override base to reject Thrift-based CPS updates when FILE_MODE is active.
    */
   folly::coro::Task<std::unique_ptr<neteng::fboss::bgp::thrift::TResult>>
   co_setPathSelectionPolicy(
@@ -78,6 +79,15 @@ class BgpServiceDC : public BgpServiceBase {
   co_getPathSelectionPolicy() override;
 
   folly::coro::Task<void> co_clearPathSelectionPolicy() override;
+
+  /**
+   * [Path Selection Policy — File Mode]
+   * Refresh CPS policy from the local artifact file.
+   * Reads CpsPolicyArtifact, syncs dryrun mode, and applies policy if
+   * dryrun=false (FILE_MODE).
+   */
+  folly::coro::Task<std::unique_ptr<neteng::fboss::bgp::thrift::TResult>>
+  co_setCpsPolicyFromFile() override;
 
   folly::coro::Task<std::unique_ptr<std::vector<rib_policy::TPathSelector>>>
   co_getActivePathSelectionCriteria(
@@ -159,6 +169,15 @@ class BgpServiceDC : public BgpServiceBase {
    */
   RibDC& dcRib_;
   folly::coro::SharedMutex crfPolicyMutex_;
+
+  /*
+   * Serializes CPS FILE_MODE refreshes against Thrift-based CPS updates.
+   * co_setCpsPolicyFromFile() takes the exclusive lock; the Thrift setters
+   * (co_setPathSelectionPolicy / co_clearPathSelectionPolicy) take a shared
+   * lock and are gated on isCpsFileModeEnabled(), so a file-mode refresh and a
+   * Thrift update can never interleave their reads of the file-mode flag.
+   */
+  folly::coro::SharedMutex cpsPolicyMutex_;
 };
 
 } // namespace facebook::bgp
