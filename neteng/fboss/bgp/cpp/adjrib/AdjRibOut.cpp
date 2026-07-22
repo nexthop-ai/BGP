@@ -1644,6 +1644,7 @@ void AdjRib::tryDeleteRibOutEntry(
  */
 bool AdjRib::isDFP() const {
   return attrToPrefixMap_.empty() && adjRibOutGroup_ &&
+      detachedRibVersion_ == lastSeenRibVersion_ &&
       adjRibOutGroup_->getLastSeenRibVersion() == lastSeenRibVersion_ &&
       !adjRibOutGroup_->getAttrToPrefixMap().empty();
 }

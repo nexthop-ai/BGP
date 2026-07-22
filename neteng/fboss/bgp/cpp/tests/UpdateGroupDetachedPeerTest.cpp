@@ -1035,6 +1035,8 @@ TEST_F(UpdateGroupDetachedPeerTest, IsDFPReturnsTrueWhenAllConditionsMet) {
   // Condition 2: group and peer have same lastSeenRibVersion
   group_->setLastSeenRibVersion(42);
   adjRib->setLastSeenRibVersion(42);
+  // Peer hasn't advanced past its detach snapshot (detachedRibVersion_)
+  adjRib->setDetachedRibVersion(42);
   // Peer is detached (not in sync), so getLastSeenRibVersion returns
   // peer's own version
   ASSERT_FALSE(group_->isPeerInSync(0));
@@ -1407,9 +1409,11 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDFPTransitionsViaIsDFPPath) {
   // Set up DFP conditions:
   //   1. PL empty (default)
   //   2. Matching versions between group and peer
-  //   3. Group PL non-empty
+  //   3. Peer hasn't advanced past its detach snapshot (detachedRibVersion_)
+  //   4. Group PL non-empty
   group_->setLastSeenRibVersion(42);
   adjRib->setLastSeenRibVersion(42);
+  adjRib->setDetachedRibVersion(42);
   auto attrs = std::make_shared<BgpPath>(BgpPathFields());
   attrs->setLocalPref(100);
   std::shared_ptr<const BgpPath> constAttrs = attrs;
