@@ -891,6 +891,7 @@ void Config::populateConfigDatabase(
   UpdateGroupConfig updateGroupConfig;
   bool enableEgressQueueBackpressure{false};
   bool enableOptimizedGR{false};
+  bool enableAddPathGrReconcile{false};
   std::vector<std::string> includeInterfaceRegexes{};
 
   if (auto setting = config_.bgp_setting_config()) {
@@ -913,6 +914,9 @@ void Config::populateConfigDatabase(
     }
     if (auto optimizedGRFlag = setting->enable_optimized_GR()) {
       enableOptimizedGR = *optimizedGRFlag;
+    }
+    if (auto addPathGrReconcileFlag = setting->enable_addpath_gr_reconcile()) {
+      enableAddPathGrReconcile = *addPathGrReconcileFlag;
     }
     if (auto ugConfig = setting->update_group_config()) {
       updateGroupConfig.enableSerializeGroupPdu =
@@ -975,7 +979,9 @@ void Config::populateConfigDatabase(
       enableUpdateGroup,
       updateGroupConfig,
       false /* enableRibAllocatedPathId */,
-      enableOptimizedGR);
+      enableOptimizedGR,
+      false /* enablePolicyDefaultAction */,
+      enableAddPathGrReconcile);
 
   // populate peer groups
   if (config_.peer_groups().has_value()) {

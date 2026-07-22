@@ -267,6 +267,40 @@ TEST_F(ConfigTestFixture, globalConfigTest) {
  * thrift::BgpConfig to BgpGlobalConfig with different thrift server field
  * settings, and tests both direct access and getter methods.
  */
+TEST_F(ConfigTestFixture, enableAddPathGrReconcileTest) {
+  thrift::BgpConfig thriftConfig;
+  thriftConfig.router_id() = kLocalAddr1.str();
+
+  // Default: no bgp_setting_config -> flag defaults to false.
+  {
+    Config config(thriftConfig);
+    EXPECT_FALSE(config.getBgpGlobalConfig()->enableAddPathGrReconcile);
+  }
+
+  // bgp_setting_config present but flag unset -> still false.
+  {
+    thriftConfig.bgp_setting_config() = thrift::BgpSettingConfig();
+    Config config(thriftConfig);
+    EXPECT_FALSE(config.getBgpGlobalConfig()->enableAddPathGrReconcile);
+  }
+
+  // Flag set true -> propagates to BgpGlobalConfig.
+  {
+    thriftConfig.bgp_setting_config() = thrift::BgpSettingConfig();
+    thriftConfig.bgp_setting_config()->enable_addpath_gr_reconcile() = true;
+    Config config(thriftConfig);
+    EXPECT_TRUE(config.getBgpGlobalConfig()->enableAddPathGrReconcile);
+  }
+
+  // Flag set false -> false.
+  {
+    thriftConfig.bgp_setting_config() = thrift::BgpSettingConfig();
+    thriftConfig.bgp_setting_config()->enable_addpath_gr_reconcile() = false;
+    Config config(thriftConfig);
+    EXPECT_FALSE(config.getBgpGlobalConfig()->enableAddPathGrReconcile);
+  }
+}
+
 TEST_F(ConfigTestFixture, ThriftServerConfigTest) {
   thrift::BgpConfig bgpConfig;
   bgpConfig.router_id() = kLocalAddr1.str();

@@ -285,6 +285,7 @@ class AdjRib : boost::noncopyable,
         enableUpdateGroup_ = globalConfig->enableUpdateGroup;
         enableRibAllocatedPathId_ = globalConfig->enableRibAllocatedPathId;
         enableOptimizedGR_ = globalConfig->enableOptimizedGR;
+        enableAddPathGrReconcile_ = globalConfig->enableAddPathGrReconcile;
         enableDynamicPolicyEvaluation_ =
             globalConfig->enableDynamicPolicyEvaluation;
       }
@@ -830,6 +831,10 @@ class AdjRib : boost::noncopyable,
 
   void setSafeModeOn() noexcept {
     *isSafeModeOn_ = true;
+  }
+
+  bool enableAddPathGrReconcile() const noexcept {
+    return enableAddPathGrReconcile_;
   }
 
   /**
@@ -2502,6 +2507,13 @@ class AdjRib : boost::noncopyable,
    * stale entries for efficient cleanup.
    */
   bool enableOptimizedGR_{false};
+
+  /**
+   * Enable add-path receive reconciliation across a peer graceful restart
+   * (gated off by default). Consumed by the add-path GR reconcile producer
+   * gate in a later diff; nothing reads it yet.
+   */
+  bool enableAddPathGrReconcile_{false};
 
   /**
    * Counter tracking the number of stale entries.

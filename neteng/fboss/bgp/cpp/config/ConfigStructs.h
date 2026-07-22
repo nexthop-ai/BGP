@@ -132,7 +132,8 @@ struct BgpGlobalConfig {
       const UpdateGroupConfig& updateGroupConfig = {},
       const bool enableRibAllocatedPathId = false,
       const bool enableOptimizedGR = false,
-      const bool enablePolicyDefaultAction = false)
+      const bool enablePolicyDefaultAction = false,
+      const bool enableAddPathGrReconcile = false)
       : localAsn(localAsn),
         routerId(routerId),
         clusterId(clusterId),
@@ -164,7 +165,8 @@ struct BgpGlobalConfig {
         updateGroupConfig(updateGroupConfig),
         enableRibAllocatedPathId(enableRibAllocatedPathId),
         enableOptimizedGR(enableOptimizedGR),
-        enablePolicyDefaultAction(enablePolicyDefaultAction) {}
+        enablePolicyDefaultAction(enablePolicyDefaultAction),
+        enableAddPathGrReconcile(enableAddPathGrReconcile) {}
 
   const uint32_t localAsn;
   const folly::IPAddress routerId;
@@ -290,6 +292,11 @@ struct BgpGlobalConfig {
    * When disabled (default), all unmatched prefixes are denied.
    */
   const bool enablePolicyDefaultAction{false};
+
+  /**
+   * Enable add-path receive reconciliation across a peer graceful restart.
+   */
+  const bool enableAddPathGrReconcile{false};
 };
 
 struct BgpCommonPeerGroupConfig {
