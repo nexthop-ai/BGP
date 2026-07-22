@@ -41,6 +41,23 @@ class BgpServiceDC : public BgpServiceBase {
       std::unique_ptr<neteng::fboss::bgp::thrift::TCanonicalRibState>>
   co_getRibEntriesCanonical(neteng::fboss::bgp_attr::TBgpAfi afi) override;
 
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getRibPrefixCanonical(std::unique_ptr<std::string> prefix) override;
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getRibEntriesForCommunitiesCanonical(
+      neteng::fboss::bgp_attr::TBgpAfi afi,
+      std::unique_ptr<std::vector<std::string>> communities) override;
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getRibEntriesForCommunityCanonical(
+      neteng::fboss::bgp_attr::TBgpAfi afi,
+      std::unique_ptr<std::string> community) override;
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getRibSubprefixesCanonical(std::unique_ptr<std::string> prefix) override;
+
   /**
    * [RibPolicy] aggregate getter/clear
    */

@@ -36,6 +36,7 @@ DECLARE_string(cps_policy_file);
 namespace facebook::bgp {
 
 struct CanonicalPathInput;
+class CanonicalRibBuilder;
 class FsdbSyncer;
 class NeighborWatcher;
 
@@ -82,6 +83,18 @@ class RibDC : public RibBase {
 
   neteng::fboss::bgp::thrift::TCanonicalRibState getRibEntriesCanonical(
       neteng::fboss::bgp_attr::TBgpAfi afi);
+  neteng::fboss::bgp::thrift::TCanonicalRibState getRibPrefixCanonical(
+      std::unique_ptr<std::string> prefix);
+  neteng::fboss::bgp::thrift::TCanonicalRibState
+  getRibEntriesForCommunitiesCanonical(
+      neteng::fboss::bgp_attr::TBgpAfi afi,
+      const std::vector<nettools::bgplib::BgpAttrCommunityC>& communities);
+  neteng::fboss::bgp::thrift::TCanonicalRibState
+  getRibEntriesForCommunityCanonical(
+      neteng::fboss::bgp_attr::TBgpAfi afi,
+      std::unique_ptr<std::string> community);
+  neteng::fboss::bgp::thrift::TCanonicalRibState getRibSubprefixesCanonical(
+      std::unique_ptr<std::string> prefix);
 
   /*
    * Result of resolving the file-based CRF artifact against the cached
@@ -303,6 +316,11 @@ class RibDC : public RibBase {
   rib_policy::TRibPolicy getRibPolicy() override;
   void saveRibPolicyState() noexcept override;
 
+  std::optional<::facebook::bgp::rib_policy::TPathSelector>
+  getCanonicalActiveCpsCriteria(const facebook::bgp::RibEntry& ribEntry) const;
+  bool canonicalFailedCpsNativeCriteria(
+      const facebook::bgp::RibEntry& ribEntry) const;
+
  protected:
   std::optional<neteng::fboss::bgp::thrift::TRibEntry>
   createTRibEntryWithFilter(
@@ -344,7 +362,13 @@ class RibDC : public RibBase {
 
  private:
   std::vector<CanonicalPathInput> buildCanonicalPathInputs(
-      const RibEntry& ribEntry);
+      const RibEntry& ribEntry,
+      folly::FunctionRef<bool(const RouteInfo&)> pathFilter);
+  bool addCanonicalEntry(
+      CanonicalRibBuilder& builder,
+      const folly::CIDRNetwork& prefix,
+      const RibEntry& ribEntry,
+      folly::FunctionRef<bool(const RouteInfo&)> pathFilter);
   /* DC-only CTE message handlers called from processRibPolicyMsgLoop. */
   void handleRouteAttributePolicySetMsg(
       const RouteAttributePolicySetMsg& msg) noexcept;

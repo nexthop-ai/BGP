@@ -21,6 +21,9 @@
   FRIEND_TEST(RibFixture, EorSentInitializationEvent);                         \
   FRIEND_TEST(RibFixture, GetRibEntries);                                      \
   FRIEND_TEST(RibFixture, GetRibEntriesCanonical);                             \
+  FRIEND_TEST(RibFixture, GetRibPrefixCanonical);                              \
+  FRIEND_TEST(RibFixture, GetRibEntriesForCommunitiesCanonical);               \
+  FRIEND_TEST(RibFixture, GetRibSubprefixesCanonical);                         \
   FRIEND_TEST(RibFixture, GetRibEntriesWithCommunityFilter);                   \
   FRIEND_TEST(RibFixture, GetRibEntryForPrefix);                               \
   FRIEND_TEST(RibFixture, GetRibEntryWeightedNexthopsTest);                    \
@@ -8028,6 +8031,216 @@ TEST_F(
     ASSERT_EVENTUALLY_TRUE(isFirstNdpSignalSent());
     ASSERT_EVENTUALLY_NE(nullptr, rib_->getBestPath(kV4Prefix1));
   });
+}
+
+/*
+ * Test getRibPrefixCanonical: fetch a single prefix, test empty RIB,
+ * invalid prefix, and AFI matching.
+ */
+TEST_F(RibFixture, GetRibPrefixCanonical) {
+  auto attrs1 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  attrs1->publish();
+
+  /* Test 1: Invalid prefix returns empty */
+  auto result = rib_->getRibPrefixCanonical(
+      std::make_unique<std::string>("invalid_prefix"));
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 2: Null prefix returns empty */
+  result = rib_->getRibPrefixCanonical(nullptr);
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 3: Missing prefix returns empty */
+  result = rib_->getRibPrefixCanonical(
+      std::make_unique<std::string>(
+          folly::IPAddress::networkToString(kV4Prefix1)));
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 4: Existing prefix returns canonical entry */
+  RibEntry entry1(kV4Prefix1);
+  entry1.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
+  rib_->ribEntries_.emplace(kV4Prefix1, std::move(entry1));
+
+  result = rib_->getRibPrefixCanonical(
+      std::make_unique<std::string>(
+          folly::IPAddress::networkToString(kV4Prefix1)));
+  EXPECT_EQ(result.rib_entries()->size(), 1);
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix1)));
+  EXPECT_EQ(result.deduped_paths()->size(), 1);
+}
+
+/*
+ * Test getRibEntriesForCommunityCanonical and
+ * getRibEntriesForCommunitiesCanonical: community filtering, empty communities,
+ * invalid community, and AFI matching.
+ */
+TEST_F(RibFixture, GetRibEntriesForCommunitiesCanonical) {
+  /* Build attrs with community 100:200 */
+  auto attrs1 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  nettools::bgplib::BgpAttrCommunitiesC comms1;
+  comms1.push_back(nettools::bgplib::BgpAttrCommunityC(100, 200));
+  attrs1->setCommunities(comms1);
+  attrs1->publish();
+
+  /* Build attrs with community 300:400 */
+  auto attrs2 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  nettools::bgplib::BgpAttrCommunitiesC comms2;
+  comms2.push_back(nettools::bgplib::BgpAttrCommunityC(300, 400));
+  attrs2->setCommunities(comms2);
+  attrs2->setNexthop(kV4Nexthop2);
+  attrs2->publish();
+
+  /* Install three entries: two IPv4 with different communities, one IPv6 */
+  RibEntry entry1(kV4Prefix1);
+  entry1.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
+
+  RibEntry entry2(kV4Prefix2);
+  entry2.updatePath(eBgpPeer2_, attrs2, false);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
+
+  RibEntry entry3(kV6Prefix1);
+  entry3.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
+
+  rib_->ribEntries_.emplace(kV4Prefix1, std::move(entry1));
+  rib_->ribEntries_.emplace(kV4Prefix2, std::move(entry2));
+  rib_->ribEntries_.emplace(kV6Prefix1, std::move(entry3));
+
+  /* Test 1: Filter by community 100:200 on IPv4 (matches kV4Prefix1 only) */
+  std::vector<nettools::bgplib::BgpAttrCommunityC> filterComms1{
+      nettools::bgplib::BgpAttrCommunityC(100, 200)};
+  auto result = rib_->getRibEntriesForCommunitiesCanonical(
+      TBgpAfi::AFI_IPV4, filterComms1);
+  EXPECT_EQ(result.rib_entries()->size(), 1);
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix1)));
+
+  /* Test 2: Filter by community 300:400 on IPv4 (matches kV4Prefix2 only) */
+  std::vector<nettools::bgplib::BgpAttrCommunityC> filterComms2{
+      nettools::bgplib::BgpAttrCommunityC(300, 400)};
+  result = rib_->getRibEntriesForCommunitiesCanonical(
+      TBgpAfi::AFI_IPV4, filterComms2);
+  EXPECT_EQ(result.rib_entries()->size(), 1);
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix2)));
+
+  /* Test 3: Filter by community 100:200 on IPv6 (matches kV6Prefix1) */
+  result = rib_->getRibEntriesForCommunitiesCanonical(
+      TBgpAfi::AFI_IPV6, filterComms1);
+  EXPECT_EQ(result.rib_entries()->size(), 1);
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV6Prefix1)));
+
+  /* Test 4: Empty communities list returns empty result */
+  std::vector<nettools::bgplib::BgpAttrCommunityC> emptyComms;
+  result =
+      rib_->getRibEntriesForCommunitiesCanonical(TBgpAfi::AFI_IPV4, emptyComms);
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 5: Non-existent community returns empty */
+  std::vector<nettools::bgplib::BgpAttrCommunityC> filterComms3{
+      nettools::bgplib::BgpAttrCommunityC(999, 999)};
+  result = rib_->getRibEntriesForCommunitiesCanonical(
+      TBgpAfi::AFI_IPV4, filterComms3);
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 6: AFI mismatch returns empty (IPv6 filter on IPv4-only community) */
+  result = rib_->getRibEntriesForCommunitiesCanonical(
+      TBgpAfi::AFI_IPV6, filterComms2);
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 7: Single-community wrapper (invalid community) throws, matching the
+   * legacy co_getRibEntriesForCommunity sibling. */
+  EXPECT_THROW(
+      rib_->getRibEntriesForCommunityCanonical(
+          TBgpAfi::AFI_IPV4,
+          std::make_unique<std::string>("invalid_community")),
+      std::invalid_argument);
+
+  /* Test 8: Single-community wrapper (null community) */
+  result = rib_->getRibEntriesForCommunityCanonical(TBgpAfi::AFI_IPV4, nullptr);
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 9: Single-community wrapper (valid community) */
+  result = rib_->getRibEntriesForCommunityCanonical(
+      TBgpAfi::AFI_IPV4, std::make_unique<std::string>("100:200"));
+  EXPECT_EQ(result.rib_entries()->size(), 1);
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix1)));
+}
+
+/*
+ * Test getRibSubprefixesCanonical: subprefix matching, invalid prefix,
+ * null prefix, and AFI family filtering.
+ */
+TEST_F(RibFixture, GetRibSubprefixesCanonical) {
+  auto attrs1 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  attrs1->publish();
+
+  /*
+   * Install three prefixes:
+   * - kV4Prefix1 (10.0.0.0/24)
+   * - kV4Prefix1Slash25 (10.0.0.0/25, subprefix of kV4Prefix1)
+   * - kV6Prefix1 (different AFI)
+   */
+  RibEntry entry1(kV4Prefix1);
+  entry1.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
+
+  RibEntry entry2(kV4Prefix1Slash25);
+  entry2.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
+
+  RibEntry entry3(kV6Prefix1);
+  entry3.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
+
+  rib_->ribEntries_.emplace(kV4Prefix1, std::move(entry1));
+  rib_->ribEntries_.emplace(kV4Prefix1Slash25, std::move(entry2));
+  rib_->ribEntries_.emplace(kV6Prefix1, std::move(entry3));
+
+  /*
+   * Test 1: Fetch subprefixes of kV4Prefix1
+   * (returns both kV4Prefix1 itself and kV4Prefix1Slash25 per isSubnet
+   * behavior)
+   */
+  auto result = rib_->getRibSubprefixesCanonical(
+      std::make_unique<std::string>(
+          folly::IPAddress::networkToString(kV4Prefix1)));
+  EXPECT_EQ(result.rib_entries()->size(), 2);
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix1)));
+  EXPECT_TRUE(result.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix1Slash25)));
+
+  /* Test 2: Fetch subprefixes of a prefix with no subprefixes */
+  result = rib_->getRibSubprefixesCanonical(
+      std::make_unique<std::string>(
+          folly::IPAddress::networkToString(kV4Prefix2)));
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 3: Invalid prefix returns empty */
+  result = rib_->getRibSubprefixesCanonical(
+      std::make_unique<std::string>("invalid_prefix"));
+  EXPECT_EQ(result.rib_entries()->size(), 0);
+
+  /* Test 4: Null prefix returns empty */
+  result = rib_->getRibSubprefixesCanonical(nullptr);
+  EXPECT_EQ(result.rib_entries()->size(), 0);
 }
 
 } // namespace bgp

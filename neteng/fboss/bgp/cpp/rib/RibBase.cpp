@@ -2305,7 +2305,6 @@ uint64_t RibBase::getNumPrefixes() {
       [&]() { count = ribCounters_.totalPrefixes(); });
   return count;
 }
-
 std::vector<TRibEntry> RibBase::getRibEntriesForCommunities(
     TBgpAfi afi,
     const std::vector<nettools::bgplib::BgpAttrCommunityC>& communities) {

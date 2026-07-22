@@ -21,6 +21,7 @@
 #include <optional>
 #include <vector>
 
+#include <folly/Function.h>
 #include <folly/IPAddress.h>
 #include <folly/IntrusiveList.h>
 #include <folly/container/F14Set.h>

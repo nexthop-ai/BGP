@@ -49,62 +49,245 @@ using namespace facebook::neteng::fboss::bgp::thrift;
 namespace facebook::bgp {
 
 std::vector<CanonicalPathInput> RibDC::buildCanonicalPathInputs(
-    const RibEntry& ribEntry) {
+    const facebook::bgp::RibEntry& ribEntry,
+    folly::FunctionRef<bool(const RouteInfo&)> pathFilter) {
   const auto& bestpath = ribEntry.getBestPath();
-  const auto& multipaths = ribEntry.getMultipaths();
+  const auto& multipathRouteinfos = ribEntry.getMultipaths();
   auto weightedNexthops = ribEntry.getMultipathWeightedNexthops();
+
+  /*
+   * Mirror RibDC grouping logic: demote to default when CPS native criteria
+   * (min_nexthop / min_agg_lbw) is violated.
+   */
+  const bool failedCps = canonicalFailedCpsNativeCriteria(ribEntry);
+
+  const auto& routeinfos = ribEntry.getAllPaths();
   std::vector<CanonicalPathInput> inputs;
-  inputs.reserve(ribEntry.getAllPaths().size());
-  for (const auto& routeinfo : ribEntry.getAllPaths()) {
-    CanonicalPathInput input;
-    input.path = routeinfo->attrs;
-    input.peerAddr = routeinfo->peer.addr;
-    input.peerRouterId = routeinfo->peer.routerId;
-    input.peerDescription = routeinfo->peer.description;
-    input.pathId = routeinfo->receivedPathId;
+  inputs.reserve(routeinfos.size());
+  for (const auto& routeinfo : routeinfos) {
+    if (!pathFilter(*routeinfo)) {
+      continue;
+    }
+    CanonicalPathInput in;
+    in.path = routeinfo->attrs;
+    in.peerAddr = routeinfo->peer.addr;
+    in.peerRouterId = routeinfo->peer.routerId;
+    in.peerDescription = routeinfo->peer.description;
+    in.pathId = routeinfo->receivedPathId;
     if (weightedNexthops) {
-      if (auto it = weightedNexthops->find(routeinfo->peer.addr);
-          it != weightedNexthops->end()) {
-        input.nextHopWeight = it->second;
+      auto it = weightedNexthops->find(routeinfo->peer.addr);
+      if (it != weightedNexthops->end()) {
+        in.nextHopWeight = it->second;
       }
     }
+    /* Per-instance operational fields, mirror createTRibEntryWithFilter */
     if (routeinfo->isNextHopReachable()) {
-      input.igpCost = routeinfo->getIgpCostValue();
+      in.igpCost = routeinfo->getIgpCostValue();
     }
-    input.bestPathFilterDescr = routeinfo->getBestPathFilterDescr();
-    input.lastModifiedTime = routeinfo->lastModifiedTime_;
-    input.pathIdToSend = routeinfo->pathIdToSend;
+    in.bestPathFilterDescr = routeinfo->getBestPathFilterDescr();
+    in.lastModifiedTime = routeinfo->lastModifiedTime_;
+    if (routeinfo->pathIdToSend.has_value()) {
+      in.pathIdToSend = routeinfo->pathIdToSend.value();
+    }
     const bool inMultipath = routeinfo->pathIdToSend.has_value() &&
-        multipaths.contains(*routeinfo->pathIdToSend);
-    input.group = inMultipath ? kBestPathGroup : kDefaultPathGroup;
-    input.isBestPath = inMultipath && bestpath && routeinfo == bestpath;
-    inputs.push_back(std::move(input));
+        multipathRouteinfos.contains(routeinfo->pathIdToSend.value());
+    /*
+     * A scoped pathFilter may drop the bestpath while keeping other multipath
+     * members; those survivors still land in kBestPathGroup but none carries
+     * is_best_path. Consumers must not assume the best group always holds
+     * exactly one is_best_path entry. We do not demote such entries to default.
+     */
+    if (inMultipath && !failedCps) {
+      if (bestpath && routeinfo == bestpath) {
+        in.isBestPath = true;
+      }
+      in.group = facebook::bgp::kBestPathGroup;
+    } else {
+      in.group = facebook::bgp::kDefaultPathGroup;
+    }
+    inputs.push_back(std::move(in));
   }
   return inputs;
 }
 
-TCanonicalRibState RibDC::getRibEntriesCanonical(TBgpAfi afi) {
-  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
-    return {};
+bool RibDC::addCanonicalEntry(
+    CanonicalRibBuilder& builder,
+    const folly::CIDRNetwork& prefix,
+    const facebook::bgp::RibEntry& ribEntry,
+    folly::FunctionRef<bool(const RouteInfo&)> pathFilter) {
+  auto inputs = buildCanonicalPathInputs(ribEntry, pathFilter);
+
+  /* Nothing to export if no paths passed the filter */
+  if (inputs.empty()) {
+    return false;
   }
+
+  /* Build entry-level fields only when we have paths to export */
+  CanonicalEntryFields entryFields;
+  if (ribEntry.needPathSelection()) {
+    entryFields.pathSelectionPending = true;
+  }
+  entryFields.activeCpsCriteria = getCanonicalActiveCpsCriteria(ribEntry);
+  if (routeAttributePolicy_) {
+    auto activeCteUcmpAction =
+        routeAttributePolicy_->getActiveCteUcmpAction(ribEntry.getPrefix());
+    if (activeCteUcmpAction) {
+      entryFields.activeCteUcmpAction = std::move(*activeCteUcmpAction);
+    }
+  }
+
+  builder.addEntry(prefix, ribEntry.getRibVersion(), inputs, entryFields);
+  return true;
+}
+
+/*
+ * Full-RIB canonical export. Routes every entry through the shared
+ * addCanonicalEntry, so it applies the same CPS native-criteria demotion as the
+ * legacy getRibEntries / RibDC::createTRibEntryWithFilter path -- intentional
+ * parity, not a new grouping behavior for the bulk getter.
+ */
+neteng::fboss::bgp::thrift::TCanonicalRibState RibDC::getRibEntriesCanonical(
+    TBgpAfi afi) {
+  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
+    return neteng::fboss::bgp::thrift::TCanonicalRibState{};
+  }
+
   CanonicalRibBuilder builder;
+
   evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
-    const bool expectIPv4 = afi == TBgpAfi::AFI_IPV4;
+    auto expectIPv4 = afi == TBgpAfi::AFI_IPV4;
     for (const auto& [prefix, ribEntry] : ribEntries_) {
-      if (expectIPv4 != prefix.first.isV4()) {
+      auto isIPv4 = prefix.first.family() == AF_INET;
+      if (expectIPv4 != isIPv4) {
         continue;
       }
-      CanonicalEntryFields fields;
-      fields.pathSelectionPending = ribEntry.needPathSelection();
-      if (routeAttributePolicy_) {
-        fields.activeCteUcmpAction =
-            routeAttributePolicy_->getActiveCteUcmpAction(prefix);
+      addCanonicalEntry(
+          builder, prefix, ribEntry, [](const RouteInfo&) { return true; });
+    }
+  });
+  return builder.build();
+}
+
+neteng::fboss::bgp::thrift::TCanonicalRibState RibDC::getRibPrefixCanonical(
+    std::unique_ptr<std::string> prefix) {
+  CanonicalRibBuilder builder;
+  if (!prefix) {
+    return builder.build();
+  }
+
+  folly::CIDRNetwork network;
+  try {
+    network = folly::IPAddress::createNetwork(*prefix);
+  } catch (std::exception const&) {
+    XLOGF(ERR, "Invalid prefix: {}", *prefix);
+    return builder.build();
+  }
+
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    auto entry = ribEntries_.find(network);
+    if (entry != ribEntries_.end()) {
+      addCanonicalEntry(
+          builder, entry->first, entry->second, [](const RouteInfo&) {
+            return true;
+          });
+    }
+  });
+
+  return builder.build();
+}
+
+neteng::fboss::bgp::thrift::TCanonicalRibState
+RibDC::getRibEntriesForCommunitiesCanonical(
+    TBgpAfi afi,
+    const std::vector<nettools::bgplib::BgpAttrCommunityC>& communities) {
+  CanonicalRibBuilder builder;
+
+  if (communities.empty()) {
+    return builder.build();
+  }
+
+  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
+    return builder.build();
+  }
+
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    for (const auto& [prefix, ribEntry] : ribEntries_) {
+      if (((afi == TBgpAfi::AFI_IPV4) && (prefix.first.family() != AF_INET)) ||
+          ((afi == TBgpAfi::AFI_IPV6) && (prefix.first.family() != AF_INET6))) {
+        continue;
       }
-      builder.addEntry(
+      addCanonicalEntry(
+          builder,
           prefix,
-          ribEntry.getRibVersion(),
-          buildCanonicalPathInputs(ribEntry),
-          fields);
+          ribEntry,
+          [&communities](const RouteInfo& path) -> bool {
+            const auto& comms = path.attrs->getCommunities();
+            if (!comms.nullOrEmpty()) {
+              for (const auto& comm : communities) {
+                if (std::find(comms->cbegin(), comms->cend(), comm) !=
+                    comms->cend()) {
+                  return true;
+                }
+              }
+            }
+            return false;
+          });
+    }
+  });
+  return builder.build();
+}
+
+neteng::fboss::bgp::thrift::TCanonicalRibState
+RibDC::getRibEntriesForCommunityCanonical(
+    TBgpAfi afi,
+    std::unique_ptr<std::string> community) {
+  CanonicalRibBuilder builder;
+  if (!community) {
+    XLOG(ERR, "No community is provided");
+    return builder.build();
+  }
+
+  std::optional<nettools::bgplib::BgpAttrCommunityC> comm =
+      nettools::bgplib::BgpAttrCommunityC::createBgpAttrCommunity(*community);
+  if (comm == std::nullopt) {
+    /*
+     * Parity with the legacy community getter: throw on an unparseable
+     * community (the co_* handler propagates it to the client).
+     */
+    throw std::invalid_argument("Invalid Community Value!");
+  }
+  std::vector<nettools::bgplib::BgpAttrCommunityC> communities{*comm};
+
+  return getRibEntriesForCommunitiesCanonical(afi, communities);
+}
+
+neteng::fboss::bgp::thrift::TCanonicalRibState
+RibDC::getRibSubprefixesCanonical(std::unique_ptr<std::string> prefix) {
+  CanonicalRibBuilder builder;
+  if (!prefix) {
+    XLOG(ERR, "No prefix is provided");
+    return builder.build();
+  }
+
+  folly::CIDRNetwork parentPrefix;
+  try {
+    parentPrefix = folly::IPAddress::createNetwork(*prefix);
+  } catch (std::exception const&) {
+    XLOGF(ERR, "Invalid prefix: {}", *prefix);
+    return builder.build();
+  }
+
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    for (const auto& [subPrefix, ribEntry] : ribEntries_) {
+      /*
+       * isSubnet matches the parent prefix itself too, mirroring the legacy
+       * getRibEntriesForSubprefixes (the parent is included in the result).
+       */
+      if (!isSubnet(subPrefix, parentPrefix)) {
+        continue;
+      }
+      addCanonicalEntry(
+          builder, subPrefix, ribEntry, [](const RouteInfo&) { return true; });
     }
   });
   return builder.build();
@@ -1367,6 +1550,36 @@ bool RibDC::computeFailedCpsNativeCriteria(
   auto psPolicyRes =
       pathSelectionPolicy_->getPathSelectionPolicyResult(ribEntry.getPrefix());
   return psPolicyRes && psPolicyRes->isFailedCpsNativeCriteria();
+}
+
+std::optional<::facebook::bgp::rib_policy::TPathSelector>
+RibDC::getCanonicalActiveCpsCriteria(
+    const facebook::bgp::RibEntry& ribEntry) const {
+  if (!pathSelectionPolicy_) {
+    return std::nullopt;
+  }
+  std::vector<std::string> prefixVector = {
+      folly::IPAddress::networkToString(ribEntry.getPrefix())};
+  auto activeCriteriaVector =
+      pathSelectionPolicy_->getActivePathSelectionCriteria(prefixVector);
+  /*
+   * A single-prefix query yields exactly one criteria; any other count means
+   * the policy has no unambiguous answer for this prefix, so report none
+   * rather than aborting this RPC-serving path.
+   */
+  if (activeCriteriaVector.size() != 1) {
+    return std::nullopt;
+  }
+  const auto& activeCriteria = activeCriteriaVector.at(0);
+  if (activeCriteria != rib_policy::TPathSelector()) {
+    return activeCriteria;
+  }
+  return std::nullopt;
+}
+
+bool RibDC::canonicalFailedCpsNativeCriteria(
+    const facebook::bgp::RibEntry& ribEntry) const {
+  return computeFailedCpsNativeCriteria(ribEntry);
 }
 
 /*

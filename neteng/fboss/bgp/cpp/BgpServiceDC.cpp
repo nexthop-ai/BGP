@@ -91,6 +91,207 @@ BgpServiceDC::co_getRibEntriesCanonical(TBgpAfi afi) {
   co_return std::make_unique<TCanonicalRibState>();
 }
 
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceDC::co_getRibPrefixCanonical(std::unique_ptr<std::string> prefix) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_ || prefix == nullptr) {
+    auto errStr = exitInitiated_ ? "Session exits" : "Empty prefix";
+    XLOGF(
+        ERR,
+        "[{}]: Failed to get rib prefix canonical. Error: {}",
+        kExitNullPtrLogPrefix,
+        errStr);
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      dcRib_.getEventBase(),
+      [this, p = std::move(prefix)]() mutable {
+        return dcRib_.getRibPrefixCanonical(std::move(p));
+      },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(ERR, "getRibPrefixCanonical timed out, Rib evb unresponsive");
+  } else {
+    XLOGF(ERR, "getRibPrefixCanonical failed: {}", result.exception().what());
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceDC::co_getRibEntriesForCommunitiesCanonical(
+    TBgpAfi afi,
+    std::unique_ptr<std::vector<std::string>> communities) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_ || communities == nullptr) {
+    auto errStr = exitInitiated_ ? "Session exits" : "Empty communities list";
+    XLOGF(
+        ERR,
+        "[{}]: Failed to get rib entries for communities canonical. Error: {}",
+        kExitNullPtrLogPrefix,
+        errStr);
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  std::vector<nettools::bgplib::BgpAttrCommunityC> comms;
+  for (const auto& community : *communities) {
+    std::optional<nettools::bgplib::BgpAttrCommunityC> comm =
+        nettools::bgplib::BgpAttrCommunityC::createBgpAttrCommunity(community);
+    if (comm == std::nullopt) {
+      /*
+       * Parity with the legacy co_getRibEntriesForCommunities sibling: surface
+       * an unparseable community to the client rather than silently returning
+       * an empty result.
+       */
+      throw std::invalid_argument("Invalid Community Value!");
+    }
+    comms.emplace_back(*comm);
+  }
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      dcRib_.getEventBase(),
+      [this, afi, comms = std::move(comms)]() {
+        return dcRib_.getRibEntriesForCommunitiesCanonical(afi, comms);
+      },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(
+        ERR,
+        "getRibEntriesForCommunitiesCanonical timed out, Rib evb unresponsive, afi={}",
+        static_cast<int>(afi));
+  } else {
+    XLOGF(
+        ERR,
+        "getRibEntriesForCommunitiesCanonical failed: {}, afi={}",
+        result.exception().what(),
+        static_cast<int>(afi));
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceDC::co_getRibEntriesForCommunityCanonical(
+    TBgpAfi afi,
+    std::unique_ptr<std::string> community) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_ || community == nullptr) {
+    auto errStr = exitInitiated_ ? "Session exits" : "Empty community";
+    XLOGF(
+        ERR,
+        "[{}]: Failed to get rib entries for community canonical. Error: {}",
+        kExitNullPtrLogPrefix,
+        errStr);
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      dcRib_.getEventBase(),
+      [this, afi, c = std::move(community)]() mutable {
+        return dcRib_.getRibEntriesForCommunityCanonical(afi, std::move(c));
+      },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<std::invalid_argument>()) {
+    /*
+     * The community parse runs on the RIB evb; propagate its parse failure to
+     * the client, matching the legacy co_getRibEntriesForCommunity sibling.
+     */
+    throw std::invalid_argument("Invalid Community Value!");
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(
+        ERR,
+        "getRibEntriesForCommunityCanonical timed out, Rib evb unresponsive, afi={}",
+        static_cast<int>(afi));
+  } else {
+    XLOGF(
+        ERR,
+        "getRibEntriesForCommunityCanonical failed: {}, afi={}",
+        result.exception().what(),
+        static_cast<int>(afi));
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceDC::co_getRibSubprefixesCanonical(
+    std::unique_ptr<std::string> prefix) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_ || prefix == nullptr) {
+    auto errStr = exitInitiated_ ? "Session exits" : "Empty prefix";
+    XLOGF(
+        ERR,
+        "[{}]: Failed to get rib subprefixes canonical. Error: {}",
+        kExitNullPtrLogPrefix,
+        errStr);
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+
+  if (!continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+
+  auto result = co_await co_runOnEvbWithTimeout(
+      dcRib_.getEventBase(),
+      [this, p = std::move(prefix)]() mutable {
+        return dcRib_.getRibSubprefixesCanonical(std::move(p));
+      },
+      kRibThriftHandlerTimeout);
+
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(ERR, "getRibSubprefixesCanonical timed out, Rib evb unresponsive");
+  } else {
+    XLOGF(
+        ERR,
+        "getRibSubprefixesCanonical failed: {}",
+        result.exception().what());
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
 folly::coro::Task<bool> BgpServiceDC::co_getIsSafeModeOn() {
   auto log = LOG_THRIFT_CALL(DBG2);
   co_return peerMgr_.getIsSafeModeOn();
