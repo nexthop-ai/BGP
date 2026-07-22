@@ -22,6 +22,7 @@
 #include "neteng/fboss/bgp/cpp/common/Consts.h"
 #include "neteng/fboss/bgp/cpp/fsdb/FsdbSyncer.h"
 #include "neteng/fboss/bgp/cpp/peer/NeighborWatcher.h"
+#include "neteng/fboss/bgp/cpp/rib/CanonicalRibBuilder.h"
 #include "neteng/fboss/bgp/cpp/rib/FibDev.h"
 #include "neteng/fboss/bgp/cpp/rib/FibFboss.h"
 #include "neteng/fboss/bgp/cpp/rib/RibDC.h"
@@ -46,6 +47,68 @@ using namespace facebook::neteng::fboss::bgp_attr;
 using namespace facebook::neteng::fboss::bgp::thrift;
 
 namespace facebook::bgp {
+
+std::vector<CanonicalPathInput> RibDC::buildCanonicalPathInputs(
+    const RibEntry& ribEntry) {
+  const auto& bestpath = ribEntry.getBestPath();
+  const auto& multipaths = ribEntry.getMultipaths();
+  auto weightedNexthops = ribEntry.getMultipathWeightedNexthops();
+  std::vector<CanonicalPathInput> inputs;
+  inputs.reserve(ribEntry.getAllPaths().size());
+  for (const auto& routeinfo : ribEntry.getAllPaths()) {
+    CanonicalPathInput input;
+    input.path = routeinfo->attrs;
+    input.peerAddr = routeinfo->peer.addr;
+    input.peerRouterId = routeinfo->peer.routerId;
+    input.peerDescription = routeinfo->peer.description;
+    input.pathId = routeinfo->receivedPathId;
+    if (weightedNexthops) {
+      if (auto it = weightedNexthops->find(routeinfo->peer.addr);
+          it != weightedNexthops->end()) {
+        input.nextHopWeight = it->second;
+      }
+    }
+    if (routeinfo->isNextHopReachable()) {
+      input.igpCost = routeinfo->getIgpCostValue();
+    }
+    input.bestPathFilterDescr = routeinfo->getBestPathFilterDescr();
+    input.lastModifiedTime = routeinfo->lastModifiedTime_;
+    input.pathIdToSend = routeinfo->pathIdToSend;
+    const bool inMultipath = routeinfo->pathIdToSend.has_value() &&
+        multipaths.contains(*routeinfo->pathIdToSend);
+    input.group = inMultipath ? kBestPathGroup : kDefaultPathGroup;
+    input.isBestPath = inMultipath && bestpath && routeinfo == bestpath;
+    inputs.push_back(std::move(input));
+  }
+  return inputs;
+}
+
+TCanonicalRibState RibDC::getRibEntriesCanonical(TBgpAfi afi) {
+  if (afi != TBgpAfi::AFI_IPV4 && afi != TBgpAfi::AFI_IPV6) {
+    return {};
+  }
+  CanonicalRibBuilder builder;
+  evb_.runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    const bool expectIPv4 = afi == TBgpAfi::AFI_IPV4;
+    for (const auto& [prefix, ribEntry] : ribEntries_) {
+      if (expectIPv4 != prefix.first.isV4()) {
+        continue;
+      }
+      CanonicalEntryFields fields;
+      fields.pathSelectionPending = ribEntry.needPathSelection();
+      if (routeAttributePolicy_) {
+        fields.activeCteUcmpAction =
+            routeAttributePolicy_->getActiveCteUcmpAction(prefix);
+      }
+      builder.addEntry(
+          prefix,
+          ribEntry.getRibVersion(),
+          buildCanonicalPathInputs(ribEntry),
+          fields);
+    }
+  });
+  return builder.build();
+}
 
 namespace {
 /*

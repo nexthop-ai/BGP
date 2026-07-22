@@ -20,6 +20,7 @@
 #define RibBase_TEST_FRIENDS                                                   \
   FRIEND_TEST(RibFixture, EorSentInitializationEvent);                         \
   FRIEND_TEST(RibFixture, GetRibEntries);                                      \
+  FRIEND_TEST(RibFixture, GetRibEntriesCanonical);                             \
   FRIEND_TEST(RibFixture, GetRibEntriesWithCommunityFilter);                   \
   FRIEND_TEST(RibFixture, GetRibEntryForPrefix);                               \
   FRIEND_TEST(RibFixture, GetRibEntryWeightedNexthopsTest);                    \
@@ -4069,6 +4070,134 @@ TEST_F(RibFixture, GetRibEntries) {
         *paths[0].next_hop()->prefix_bin(), p1Nexthop.addr()->toStdString());
     EXPECT_THAT(*paths[0].local_pref(), kLocalPref);
   }
+}
+
+/*
+ * getRibEntriesCanonical returns the same logical RIB state as getRibEntries,
+ * but in deduplicated form: paths are interned by address, peers by (addr,
+ * routerId), and list-valued sub-attrs (AS_PATH, communities, etc.) are
+ * factored into a shared dict.
+ */
+TEST_F(RibFixture, GetRibEntriesCanonical) {
+  auto attrs1 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  auto attrs2 =
+      std::make_shared<facebook::bgp::BgpPath>(*buildBgpPathFields(4, 4, 4, 4));
+  attrs2->setNexthop(kV4Nexthop2);
+  attrs2->setLocalPref(kLocalPref2);
+  attrs1->publish();
+  attrs2->publish();
+
+  /* Build the same RIB as the legacy GetRibEntries test */
+  RibEntry entry1(kV4Prefix1);
+  entry1.updatePath(eBgpPeer1_, attrs1, false);
+  RibBase::selectBestPath(
+      entry1, multipathSelector, bestpathSelector, false, 0);
+
+  RibEntry entry2(kV4Prefix2);
+  entry2.updatePath(eBgpPeer1_, attrs1, false);
+  entry2.updatePath(eBgpPeer2_, attrs2, false);
+  RibBase::selectBestPath(
+      entry2, multipathSelector, bestpathSelector, false, 0);
+
+  RibEntry entry3(kV6Prefix1);
+  entry3.updatePath(eBgpPeer1_, attrs1, false);
+  entry3.updatePath(eBgpPeer2_, attrs2, false);
+  RibBase::selectBestPath(
+      entry3, multipathSelector, bestpathSelector, false, 0);
+
+  rib_->ribEntries_.emplace(make_pair(kV4Prefix1, std::move(entry1)));
+  rib_->ribEntries_.emplace(make_pair(kV4Prefix2, std::move(entry2)));
+  rib_->ribEntries_.emplace(make_pair(kV6Prefix1, std::move(entry3)));
+
+  /* Fetch both legacy and canonical */
+  auto legacy = rib_->getRibEntries(TBgpAfi::AFI_IPV4);
+  auto canonical = rib_->getRibEntriesCanonical(TBgpAfi::AFI_IPV4);
+
+  /* Same prefix set */
+  EXPECT_EQ(legacy.size(), 2);
+  EXPECT_EQ(canonical.rib_entries()->size(), 2);
+  EXPECT_TRUE(canonical.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix1)));
+  EXPECT_TRUE(canonical.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV4Prefix2)));
+
+  /*
+   * Deduplication: attrs1 is shared across both prefixes and appears under
+   * two different peers in entry2, so we expect 2 distinct whole-path entries
+   * (different next_hop: attrs1 has kV4Nexthop1, attrs2 has kV4Nexthop2) but
+   * shared AS_PATH / communities.
+   */
+  EXPECT_EQ(canonical.deduped_paths()->size(), 2);
+  EXPECT_EQ(canonical.attr_dict()->as_path_lists()->size(), 1);
+  EXPECT_EQ(canonical.attr_dict()->community_lists()->size(), 1);
+  EXPECT_EQ(canonical.peers()->size(), 2);
+
+  /*
+   * Verify entry1: single best path with kV4Nexthop1, local_pref kLocalPref
+   */
+  const auto& e1 = canonical.rib_entries()->at(
+      folly::IPAddress::networkToString(kV4Prefix1));
+  EXPECT_EQ(
+      *e1.prefix()->prefix_bin(),
+      *network::toBinaryAddress(kV4Prefix1.first).addr());
+  EXPECT_EQ(e1.prefix()->num_bits().value(), kV4Prefix1.second);
+  /*
+   * The get-rib converter leaves the FSDB-only top-level best_path unset; the
+   * selected path is the is_best_path-marked entry in the best-path group.
+   */
+  EXPECT_FALSE(e1.best_path().has_value());
+  const auto& e1Best = e1.paths()->at(std::string(kBestPathGroup));
+  ASSERT_EQ(e1Best.size(), 1);
+  EXPECT_TRUE(e1Best[0].is_best_path().value());
+  auto pathIdx1 = e1Best[0].path_idx().value();
+  const auto& dedupPath1 = canonical.deduped_paths()->at(pathIdx1);
+  EXPECT_EQ(
+      *dedupPath1.next_hop()->prefix_bin(),
+      *network::toBinaryAddress(kV4Nexthop1).addr());
+  EXPECT_EQ(dedupPath1.local_pref().value(), kLocalPref);
+
+  /*
+   * Verify entry2: best path has kV4Nexthop2 (higher local_pref), one default
+   * path with kV4Nexthop1
+   */
+  const auto& e2 = canonical.rib_entries()->at(
+      folly::IPAddress::networkToString(kV4Prefix2));
+  EXPECT_FALSE(e2.best_path().has_value());
+  const auto& bestGroup = e2.paths()->at(std::string(kBestPathGroup));
+  const auto& defaultGroup = e2.paths()->at(std::string(kDefaultPathGroup));
+  EXPECT_EQ(bestGroup.size(), 1);
+  EXPECT_EQ(defaultGroup.size(), 1);
+  EXPECT_TRUE(bestGroup[0].is_best_path().value());
+  auto pathIdx2Best = bestGroup[0].path_idx().value();
+  const auto& dedupPath2Best = canonical.deduped_paths()->at(pathIdx2Best);
+  EXPECT_EQ(
+      *dedupPath2Best.next_hop()->prefix_bin(),
+      *network::toBinaryAddress(kV4Nexthop2).addr());
+  EXPECT_EQ(dedupPath2Best.local_pref().value(), kLocalPref2);
+
+  auto pathIdxDefault = defaultGroup[0].path_idx().value();
+  const auto& dedupPathDefault = canonical.deduped_paths()->at(pathIdxDefault);
+  EXPECT_EQ(
+      *dedupPathDefault.next_hop()->prefix_bin(),
+      *network::toBinaryAddress(kV4Nexthop1).addr());
+  EXPECT_EQ(dedupPathDefault.local_pref().value(), kLocalPref);
+
+  /* Shared sub-attr dedup: both paths point to the same AS_PATH / community idx
+   */
+  EXPECT_EQ(
+      dedupPath1.as_path_idx().value(), dedupPath2Best.as_path_idx().value());
+  EXPECT_EQ(
+      dedupPath1.as_path_idx().value(), dedupPathDefault.as_path_idx().value());
+  EXPECT_EQ(
+      dedupPath1.communities_idx().value(),
+      dedupPath2Best.communities_idx().value());
+
+  /* AFI_IPV6 returns only the v6 entry */
+  auto canonicalV6 = rib_->getRibEntriesCanonical(TBgpAfi::AFI_IPV6);
+  EXPECT_EQ(canonicalV6.rib_entries()->size(), 1);
+  EXPECT_TRUE(canonicalV6.rib_entries()->contains(
+      folly::IPAddress::networkToString(kV6Prefix1)));
 }
 
 /*

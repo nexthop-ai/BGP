@@ -1,0 +1,127 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <folly/IPAddress.h>
+
+#include "neteng/fboss/bgp/cpp/common/BgpPath.h"
+#include "neteng/fboss/bgp/cpp/lib/BgpStructs.h"
+#include "neteng/fboss/bgp/if/gen-cpp2/bgp_route_types_types.h"
+
+/*
+ * Shared canonical-RIB conversion primitives: the per-path input struct plus
+ * the interning-independent projections from a deduplicated BgpPath / its
+ * sub-attributes / a peer to their canonical Thrift form. Used by both the
+ * one-shot CanonicalRibBuilder and the stateful CanonicalRibEncoder. Each
+ * converter layers its own interning and index-lifetime policy on top of these
+ * projections; FSDB batching and publication are handled separately by
+ * CanonicalRibExporter.
+ */
+
+namespace facebook::bgp {
+
+namespace bgp_thrift = ::facebook::neteng::fboss::bgp::thrift;
+
+/*
+ * One per-path input to the canonical converters: the deduplicated BgpPath plus
+ * the per-(prefix, path)-instance fields that TBgpPathCanonical carries.
+ *
+ * group and peerDescription are non-owning views; the storage they reference
+ * (the static path-group constants and the live RouteInfo's peer) must outlive
+ * the build/encode call that consumes them.
+ */
+struct CanonicalPathInput {
+  std::shared_ptr<const BgpPath> path;
+  std::string_view
+      group; // kBestPathGroup / kMultiPathGroup / kDefaultPathGroup
+  bool isBestPath{false};
+  std::optional<int64_t> pathId; // RFC 7911 received path id
+  std::optional<int64_t> nextHopWeight; // UCMP weight
+  folly::IPAddress peerAddr; // advertising peer
+  int64_t peerRouterId{0};
+  std::string_view peerDescription;
+  /* Per-instance operational fields, mirrors TBgpPath */
+  std::optional<int64_t> igpCost;
+  std::optional<int64_t> lastModifiedTime;
+  std::optional<int64_t> pathIdToSend;
+  std::optional<std::string> bestPathFilterDescr;
+  std::optional<std::string> policyName;
+};
+
+/*
+ * Per-entry fields that TRibEntryCanonical carries.
+ */
+struct CanonicalEntryFields {
+  std::optional<bool> pathSelectionPending;
+  std::optional<::facebook::bgp::rib_policy::TPathSelector> activeCpsCriteria;
+  std::optional<::facebook::bgp::rib_policy::TRouteAttributeUcmpAction>
+      activeCteUcmpAction;
+};
+
+/* AS_PATH / COMMUNITIES / CLUSTER_LIST list projections. */
+std::vector<neteng::fboss::bgp_attr::TAsPathSeg> toTAsPathSegList(
+    const nettools::bgplib::BgpAttrAsPathC& asPath);
+std::vector<neteng::fboss::bgp_attr::TBgpCommunity> toTCommunityList(
+    const nettools::bgplib::BgpAttrCommunitiesC& communities);
+std::vector<int64_t> toTClusterList(
+    const nettools::bgplib::BgpAttrClusterListC& clusterList);
+
+/*
+ * EXTENDED COMMUNITIES projection for the canonical form. Only AS-specific
+ * ext-communities are representable today (two_byte_asn); others are skipped
+ * with a warning rather than pushed as an empty union, because
+ * TBgpExtCommUnion.raw_values is not yet available (commented out pending the
+ * thrift union fix). Distinct from createTBgpPath's createTExtCommunities,
+ * which keeps the legacy placeholder behavior.
+ */
+std::vector<neteng::fboss::bgp::thrift::TBgpExtCommunity>
+toCanonicalExtCommunities(
+    const nettools::bgplib::BgpAttrExtCommunitiesC& extCommunities);
+
+/*
+ * Deduplication-identity fields of a canonical deduped path: next_hop plus the
+ * inline scalars (origin, local_pref, med, atomic_aggregate, originator_id,
+ * aggregator, topology_info, weight). The list-valued sub-attribute indices are
+ * left unset for the caller's interning layer to fill.
+ */
+neteng::fboss::bgp::thrift::TBgpDedupedPath toTBgpDedupedPathBase(
+    const BgpPath& path);
+
+/* Canonical peer entry from its attribution. */
+neteng::fboss::bgp::thrift::TCanonicalPeer toTCanonicalPeer(
+    const folly::IPAddress& addr,
+    int64_t routerId,
+    std::string_view description);
+
+/*
+ * Apply the per-(prefix, path)-instance fields carried by CanonicalPathInput to
+ * a TBgpPathCanonical: is_best_path, next_hop_weight, path_id, and the optional
+ * operational fields. path_idx and peer_idx are interning-specific and stay
+ * with each converter.
+ */
+void applyPerPathInstanceFields(
+    bgp_thrift::TBgpPathCanonical& p,
+    const CanonicalPathInput& in);
+
+} // namespace facebook::bgp

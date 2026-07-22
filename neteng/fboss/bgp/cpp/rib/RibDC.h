@@ -35,6 +35,7 @@ DECLARE_string(cps_policy_file);
 
 namespace facebook::bgp {
 
+struct CanonicalPathInput;
 class FsdbSyncer;
 class NeighborWatcher;
 
@@ -78,6 +79,9 @@ class RibDC : public RibBase {
 
   bool isCrfFileModeEnabled() const;
   void setCrfFileModeEnabled(bool fileModeActive);
+
+  neteng::fboss::bgp::thrift::TCanonicalRibState getRibEntriesCanonical(
+      neteng::fboss::bgp_attr::TBgpAfi afi);
 
   /*
    * Result of resolving the file-based CRF artifact against the cached
@@ -339,6 +343,8 @@ class RibDC : public RibBase {
   FsdbSyncer* fsdbSyncer_{nullptr};
 
  private:
+  std::vector<CanonicalPathInput> buildCanonicalPathInputs(
+      const RibEntry& ribEntry);
   /* DC-only CTE message handlers called from processRibPolicyMsgLoop. */
   void handleRouteAttributePolicySetMsg(
       const RouteAttributePolicySetMsg& msg) noexcept;

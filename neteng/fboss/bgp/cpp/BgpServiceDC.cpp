@@ -60,6 +60,37 @@ BgpServiceDC::BgpServiceDC(
       neighborWatcher_(std::move(neighborWatcher)),
       dcRib_(rib) {}
 
+folly::coro::Task<std::unique_ptr<TCanonicalRibState>>
+BgpServiceDC::co_getRibEntriesCanonical(TBgpAfi afi) {
+  auto log = LOG_THRIFT_CALL(DBG2);
+  if (exitInitiated_ || !continueExecution(true)) {
+    co_return std::make_unique<TCanonicalRibState>();
+  }
+  SCOPE_EXIT {
+    decrRequestsInExecution();
+  };
+  auto result = co_await co_runOnEvbWithTimeout(
+      dcRib_.getEventBase(),
+      [this, afi]() { return dcRib_.getRibEntriesCanonical(afi); },
+      kRibThriftHandlerTimeout);
+  if (result.hasValue()) {
+    co_return std::make_unique<TCanonicalRibState>(std::move(result.value()));
+  }
+  if (result.exception().is_compatible_with<folly::FutureTimeout>()) {
+    XLOGF(
+        ERR,
+        "getRibEntriesCanonical timed out, Rib evb unresponsive, afi={}",
+        static_cast<int>(afi));
+  } else {
+    XLOGF(
+        ERR,
+        "getRibEntriesCanonical failed: {}, afi={}",
+        result.exception().what(),
+        static_cast<int>(afi));
+  }
+  co_return std::make_unique<TCanonicalRibState>();
+}
+
 folly::coro::Task<bool> BgpServiceDC::co_getIsSafeModeOn() {
   auto log = LOG_THRIFT_CALL(DBG2);
   co_return peerMgr_.getIsSafeModeOn();

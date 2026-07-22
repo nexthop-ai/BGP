@@ -37,6 +37,10 @@ class BgpServiceDC : public BgpServiceBase {
       bool enable_thrift_protection);
   ~BgpServiceDC() override = default;
 
+  folly::coro::Task<
+      std::unique_ptr<neteng::fboss::bgp::thrift::TCanonicalRibState>>
+  co_getRibEntriesCanonical(neteng::fboss::bgp_attr::TBgpAfi afi) override;
+
   /**
    * [RibPolicy] aggregate getter/clear
    */
