@@ -475,8 +475,9 @@ void AdjRibOutGroup::createChangeListConsumeTimer() noexcept {
           changeListConsumer_->stalenessDuration().count());
       changeListConsumer_->markStalenessLogged();
     }
-    XLOGF(
+    XLOGF_IF(
         DBG2,
+        previousRibVersion != lastSeenRibVersion_,
         "Group {}: Updating cached RIB version from {} to {}",
         groupDescriptor_,
         previousRibVersion,
@@ -791,15 +792,16 @@ void AdjRibOutGroup::reEvaluateSyncPeersEgressPolicy() {
 
   XLOGF(
       INFO,
-      "Group {}: Starting egress policy re-evaluation for sync peers",
+      "Group {}: Starting group RIB walk for egress policy re-evaluation",
       groupDescriptor_);
 
   walkAndProcessShadowRib(false /* sendWithEoR */);
 
   XLOGF(
       INFO,
-      "Group {}: Finished egress policy re-evaluation for sync peers",
-      groupDescriptor_);
+      "Group {}: Finished group RIB walk for egress policy re-evaluation with {} in-sync peers",
+      groupDescriptor_,
+      numInSyncPeers_);
 }
 
 /*
@@ -2518,9 +2520,7 @@ void AdjRibOutGroup::unregisterPeer(
    * TODO: optimize -- this runs synchronously per removal. Skip it when nothing
    * is promotable (no DETACHED_READY_TO_JOIN peers).
    */
-  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
-    handleNoSyncPeers();
-  }
+  recoverIfNoSyncPeers();
 
   XLOGF(
       INFO,
@@ -2856,14 +2856,6 @@ void AdjRibOutGroup::movePeers(
 
     newGroup->detachedPeers_.insert(adjRib);
   }
-
-  /*
-   * Recover this group once, after all moved peers are out. Running it per
-   * removePeer would risk promoting a peer that is still pending its own move.
-   */
-  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
-    handleNoSyncPeers();
-  }
 }
 
 void AdjRibOutGroup::movePeersSharedRibOutPathEntries(
@@ -3109,15 +3101,6 @@ void AdjRibOutGroup::splitToNewGroup(
         newBit,
         newGroup->getAdjRibGroupName(),
         peer->getPeerState());
-  }
-
-  /*
-   * Recover this group once, after all moved peers are out. handleNoSyncPeers
-   * is suppressed per-removePeer above so the bulk move never promotes a peer
-   * that is still pending its move.
-   */
-  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
-    handleNoSyncPeers();
   }
 }
 
@@ -3875,6 +3858,12 @@ void AdjRibOutGroup::handleNoSyncPeers() noexcept {
         INFO,
         "Group {}: Paused group consume timer, waiting for a detached peer ahead of the group to finish draining and promote itself",
         groupDescriptor_);
+  }
+}
+
+void AdjRibOutGroup::recoverIfNoSyncPeers() noexcept {
+  if (getMemberCount() > 0 && numInSyncPeers_ == 0) {
+    handleNoSyncPeers();
   }
 }
 

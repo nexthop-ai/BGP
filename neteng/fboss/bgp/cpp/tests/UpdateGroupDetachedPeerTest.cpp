@@ -3426,8 +3426,13 @@ TEST_F(
 
   setGroupConsumerReady();
 
-  // Move out the last SYNC peer -> immediate promotion sweep runs.
+  /*
+   * Move out the last SYNC peer, then run the caller-side recovery. movePeers
+   * is a pure mover; the orchestrator (PeerManagerBase egress re-eval) runs
+   * recoverIfNoSyncPeers once all moves are complete, which we mirror here.
+   */
   group_->movePeers({syncPeer}, targetGroup);
+  group_->recoverIfNoSyncPeers();
 
   // All 6 detached peers became SYNC.
   EXPECT_EQ(group_->getNumInSyncPeers(), 6);
@@ -3478,6 +3483,7 @@ TEST_F(
   adjRib1->setPeerState(PeerUpdateState::DETACHED_RUNNING);
 
   group_->movePeers({adjRib0}, targetGroup);
+  group_->recoverIfNoSyncPeers();
 
   /*
    * No promotable peer -> group stays frozen with no SYNC peers, adjRib1
@@ -3545,8 +3551,13 @@ TEST_F(
     peerEntries.emplace_back(prefix, e);
   }
 
-  // Move the last SYNC peer out -> removePeer drives the no-sync-peers sweep.
+  /*
+   * Move the last SYNC peer out, then run the caller-side recovery. movePeers
+   * is a pure mover; the orchestrator runs recoverIfNoSyncPeers once all moves
+   * are complete, which we mirror here to drive the no-sync-peers sweep.
+   */
   group_->movePeers({syncPeer}, targetGroup);
+  group_->recoverIfNoSyncPeers();
 
   // DEP-A promoted to SYNC; group adopted its RIB version.
   EXPECT_EQ(depA->getPeerState(), PeerUpdateState::JOINED_RUNNING);

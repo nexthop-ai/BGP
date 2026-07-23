@@ -1135,7 +1135,7 @@ class AdjRib : boost::noncopyable,
    *        the group during collapse, preventing rejoin.
    * IS_DETACHED_FAST_PEER — peer caught up before the group moved on
    *        CL (DFP). No collapse needed on rejoin.
-   * DETACHED_ON_REGISTRATION — peer entered the group already detached (
+   * DETACHED_ON_REGISTRATION — peer entered the group already detached
    *        either via initial dump (DETACHED_INIT_DUMP) or policy re-eval,
    *        but not via detachSlowPeer. During collapse,
    *        all group-only entries must be announced since the peer has no

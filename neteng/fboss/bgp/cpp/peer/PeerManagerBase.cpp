@@ -4046,6 +4046,7 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
       UpdateGroupKeyHash>
       newKeyToSourceGroups;
   folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>> sourceGroups;
+  uint32_t affectedAdjRibs = 0;
   for (const auto& [peerId, adjRib] : adjRibs_) {
     adjRib->buildAndSetUpdateGroupKey();
     const auto& group = adjRib->getUpdateGroup();
@@ -4056,8 +4057,14 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
     if (!(key == group->getGroupKey())) {
       newKeyToSourceGroups[key][group].push_back(adjRib);
       sourceGroups.insert(group);
+      ++affectedAdjRibs;
     }
   }
+  XLOGF(
+      INFO,
+      "Starting processUpdateGroupsEgressPolicyReevaluation for {} adjRibs from {} groups",
+      affectedAdjRibs,
+      sourceGroups.size());
 
   /*
    * 2. Reconcile each target key's new members. The subset of members
@@ -4097,7 +4104,10 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
    *
    * Once we have created a baseGroup, then we reduce the rest of case (2) to
    * case (1).
+   * Each target's surviving group is collected so its no-sync-peer recovery can
+   * run once, after all moves across all targets are complete.
    */
+  folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>> allAffectedGroups;
   for (auto& [newKey, adjRibsToMoveFromSource] : newKeyToSourceGroups) {
     auto targetGroup = updateGroupManager_->getGroup(newKey);
     std::shared_ptr<AdjRibOutGroup> baseGroup;
@@ -4135,6 +4145,7 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
         targetGroup = updateGroupManager_->findOrCreateGroup(newKey);
         baseGroup->splitToNewGroup(targetGroup, adjRibsFromBaseGroup);
       }
+
       /*
        * If the egress policy changed, we need to update the RIB-OUT to
        * the new policy for this set of peers.
@@ -4146,6 +4157,7 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
       if (baseGroupNeedsPolicyReEval) {
         processGroupEgressPolicyReEvaluation(targetGroup);
       }
+      allAffectedGroups.insert(baseGroup);
     }
 
     /* Case (1), and fall-through handling from case (2). */
@@ -4159,6 +4171,8 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
          */
         continue;
       }
+
+      allAffectedGroups.insert(sourceGroup);
 
       /*
        * Detach the peers and move their materialized RIB-OUTs and states
@@ -4192,18 +4206,53 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
         }
       }
     }
+
+    allAffectedGroups.insert(targetGroup);
   }
 
   /*
-   * 3. Destroy any source group emptied by the moves.
+   * Merging or moving peers can leave a group with members but no in-sync peers
+   * (e.g. detached peers merged into a group whose own sync peers are gone, or
+   * a source group left with only detached members after its sync peers moved
+   * out), or drain a source group of all its members. Handle every group that
+   * participated in this re-evaluation once all moves are complete.
+   *
+   * allAffectedGroups is a superset of the source groups -- every source group
+   * a peer moved out of is inserted above, alongside the merged/split targets,
+   * and the targets always keep at least the moved-in peers -- so the emptied
+   * groups to destroy can be collected in this same pass:
+   *   - zero members: fully drained by the moves; collect it for destruction.
+   *   - non-zero members: promote a peer to sync if needed;
+   *     if at least one sync peer exists, restart group timers.
    */
   folly::F14FastSet<std::shared_ptr<AdjRibOutGroup>> emptiedOldGroups;
-  for (const auto& group : sourceGroups) {
+  for (const auto& group : allAffectedGroups) {
     if (group->getMemberCount() == 0) {
       emptiedOldGroups.insert(group);
+      continue;
+    }
+    /* Try immediate promotion in group if no sync peers. */
+    group->recoverIfNoSyncPeers();
+    /*
+     * Fall-through from promotion, if there are any sync peers, reschedule
+     * group packing timer.
+     */
+    if (group->getNumInSyncPeers() > 0) {
+      XLOGF(
+          INFO,
+          "Group {}: Resuming with {} sync peers after policy re-evaluation",
+          group->getGroupDescriptor(),
+          group->getNumInSyncPeers());
+      group->scheduleChangeListConsumeTimer();
     }
   }
   co_await updateGroupManager_->maybeDestroyUpdateGroups(emptiedOldGroups);
+
+  XLOGF_IF(
+      INFO,
+      !emptiedOldGroups.empty(),
+      "Cleaned up {} empty groups",
+      emptiedOldGroups.size());
 
   co_return;
 }
@@ -4290,7 +4339,7 @@ void PeerManagerBase::processGroupEgressPolicyReEvaluation(
   XLOGF(
       INFO,
       "Group {}: Starting group egress policy re-evaluation",
-      group->getAdjRibGroupName());
+      group->getGroupDescriptor());
 
   // Step 1: Group-level re-evaluation (serves all IN_SYNC members)
   group->reEvaluateSyncPeersEgressPolicy();
@@ -4309,7 +4358,7 @@ void PeerManagerBase::processGroupEgressPolicyReEvaluation(
       XLOGF(
           INFO,
           "Group {}: Re-evaluating detached peer {}",
-          group->getAdjRibGroupName(),
+          group->getGroupDescriptor(),
           adjRib->getPeerName());
 
       if (isRibDumpScheduledForAdjRib(adjRib)) {
@@ -4334,7 +4383,7 @@ void PeerManagerBase::processGroupEgressPolicyReEvaluation(
   XLOGF(
       INFO,
       "Group {}: Group egress policy re-evaluation complete",
-      group->getAdjRibGroupName());
+      group->getGroupDescriptor());
 }
 
 folly::coro::Task<void>

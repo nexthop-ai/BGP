@@ -196,7 +196,6 @@ TEST_F(AdjRibGroupTest, RegisterGroupConsumerNoTracker) {
 TEST_F(AdjRibGroupTest, RegisterGroupConsumer) {
   createAdjRibOutGroup("test_group");
   MockChangeListConsumer();
-  auto& messages = subscribeToLogMessages("", folly::LogLevel::DBG2);
 
   // An in-sync peer so the group is not frozen (numInSyncPeers_ > 0).
   auto adjRib = createMinimalAdjRib();
@@ -210,18 +209,6 @@ TEST_F(AdjRibGroupTest, RegisterGroupConsumer) {
   // First loopOnce fires the timer, second runs the coro body
   evb_->loopOnce();
   evb_->loopOnce();
-
-  // Verify the batch-level RIB version log was emitted
-  bool foundRibVersionLog = false;
-  for (const auto& [msg, _] : messages) {
-    if (msg.getMessage().find("Updating cached RIB version") !=
-        std::string::npos) {
-      foundRibVersionLog = true;
-      XLOGF(INFO, "Captured log: {}", msg.getMessage());
-      break;
-    }
-  }
-  EXPECT_TRUE(foundRibVersionLog);
 
   // Deactivate to clean up
   adjRibOutGroup_->deactivateChangeListConsumer();

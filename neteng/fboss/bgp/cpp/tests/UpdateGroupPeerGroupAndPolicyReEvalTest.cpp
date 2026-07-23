@@ -25,10 +25,15 @@
 
 #define AdjRib_TEST_FRIENDS friend class UpdateGroupPolicyReEvalUTBase;
 
-#define AdjRibOutGroup_TEST_FRIENDS             \
-  FRIEND_TEST(SplitToGroup, CopiesGroupFields); \
-  FRIEND_TEST(SplitToGroup, ClonesPackingList); \
-  FRIEND_TEST(SplitToGroup, MovesJoinedRunningPeer);
+#define AdjRibOutGroup_TEST_FRIENDS                                           \
+  FRIEND_TEST(SplitToGroup, CopiesGroupFields);                               \
+  FRIEND_TEST(SplitToGroup, ClonesPackingList);                               \
+  FRIEND_TEST(SplitToGroup, MovesJoinedRunningPeer);                          \
+  FRIEND_TEST(UpdateGroupsEgressReEvalTest, SchedulesConsumeTimerAfterSplit); \
+  FRIEND_TEST(SplitToGroup, CopiesGroupFields);                               \
+  FRIEND_TEST(SplitToGroup, ClonesPackingList);                               \
+  FRIEND_TEST(SplitToGroup, MovesJoinedRunningPeer);                          \
+  FRIEND_TEST(SplitToGroup, SplitBlockedPeerDrainNoInSyncPeerDoesNotReschedule);
 
 #include <array>
 #include <tuple>
@@ -36,6 +41,13 @@
 #include "neteng/fboss/bgp/cpp/tests/UpdateGroupPolicyReEvalUTCommon.h"
 
 namespace facebook::bgp {
+
+/*
+ * Event-base turns to pump when asserting that a coroutine stays parked. Larger
+ * than any bounded coroutine's suspension chain, so the parked-state assertions
+ * hold only because the coroutine is genuinely blocked, not merely un-run yet.
+ */
+constexpr int kEvbPumpTurns = 50;
 
 class UpdateGroupPeerGroupAndPolicyReEvalTest
     : public UpdateGroupPolicyReEvalUTBase {};
@@ -658,6 +670,110 @@ TEST_F(SplitToGroup, MovesJoinedBlockedPeer) {
 }
 
 /*
+ * Companion to the reschedule case: if the group is left without an in-sync
+ * peer while the carried-over push wait is in flight (the blocked peer
+ * detaches), the wait still completes -- detachPeer clears the blocked bit, so
+ * the drain never deadlocks -- and it finishes without rescheduling the consume
+ * timer (guarded on numInSyncPeers_).
+ */
+TEST_F(SplitToGroup, SplitBlockedPeerDrainNoInSyncPeerDoesNotReschedule) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  auto peerId1 = makePeerId(1);
+  expectEventualStateOnEvb(ctx, peerId1, PeerUpdateState::JOINED_RUNNING);
+
+  blockGroupViaPeerOnEvb(ctx, peerId1);
+  publishRouteUpdates(ctx, /*isInitialDump=*/false);
+  expectEventualStateOnEvb(ctx, peerId1, PeerUpdateState::JOINED_BLOCKED);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  std::shared_ptr<AdjRibOutGroup> targetGroup;
+
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId1);
+    auto sourceGroup = adjRib->getUpdateGroup();
+
+    targetGroup = std::make_shared<AdjRibOutGroup>(
+        evb,
+        "split_target",
+        sourceGroup->getGroupId() + 1,
+        /*enableUpdateGroup=*/true,
+        sourceGroup->getGroupKey());
+    sourceGroup->splitToNewGroup(targetGroup, {adjRib});
+
+    ASSERT_TRUE(targetGroup->hasBlockedPeers());
+    ASSERT_EQ(targetGroup->getNumInSyncPeers(), 1);
+
+    targetGroup->attrToPrefixMap_.clear();
+    auto fields = buildBgpPathFields(1, 0, 0, 0);
+    auto attrs = std::make_shared<BgpPath>(*fields);
+    attrs->publish();
+    std::shared_ptr<const BgpPath> constAttrs = attrs;
+    const folly::CIDRNetwork packedPrefix{folly::IPAddress("200.0.0.0"), 24};
+    targetGroup->tryUpdateAttrToPrefixMapForGroup(
+        std::make_pair(packedPrefix, kDefaultPathID), nullptr, constAttrs);
+    ASSERT_FALSE(targetGroup->getAttrToPrefixMap().empty());
+
+    targetGroup->asyncScope_.add(
+        folly::coro::co_withExecutor(
+            &evb,
+            targetGroup->buildAndSendGroupBgpMessages(/*sendWithEoR=*/false)));
+  });
+
+  /* Let the drain reach its parked state on the carried-over push. */
+  for (int i = 0; i < kEvbPumpTurns; ++i) {
+    evb.runInEventBaseThreadAndWait([]() {});
+  }
+  evb.runInEventBaseThreadAndWait(
+      [&]() { EXPECT_TRUE(targetGroup->hasBlockedPeers()); });
+
+  /*
+   * Detach the only in-sync peer. detachPeer clears the blocked bit (releasing
+   * the wait) and the sync bit, leaving the group with no in-sync peer.
+   */
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId1);
+    targetGroup->detachPeer(adjRib, AdjRibOutGroup::DetachReason::Policy);
+    EXPECT_EQ(targetGroup->getNumInSyncPeers(), 0);
+    EXPECT_FALSE(targetGroup->hasBlockedPeers());
+  });
+
+  /*
+   * The wait completes and the drain finishes -- the seeded packing-list entry
+   * is consumed (distributed to zero in-sync peers), proving no deadlock -- and
+   * because the group has no in-sync peer the guard skips the consume-timer
+   * reschedule, so the drained list stays empty.
+   */
+  WITH_RETRIES({
+    auto completedNoReschedule =
+        folly::via(&evb, [&]() {
+          return targetGroup->getAttrToPrefixMap().empty() &&
+              targetGroup->getNumInSyncPeers() == 0 &&
+              !(targetGroup->changeListConsumeTimer_ &&
+                targetGroup->changeListConsumeTimer_->isScheduled());
+        }).get();
+    EXPECT_EVENTUALLY_TRUE(completedNoReschedule);
+  });
+
+  evb.runInEventBaseThreadAndWait(
+      [&]() { targetGroup->resetChangeListConsumeTimer(); });
+  folly::coro::blockingWait(targetGroup->drainAsyncScope());
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId1);
+    targetGroup->unregisterPeer(adjRib);
+    adjRib->setUpdateGroup(nullptr);
+    if (auto consumer = targetGroup->getChangeListConsumer()) {
+      consumer->resetBitmap();
+      consumer->terminate();
+      consumer->deregisterFromTracker();
+    }
+    targetGroup->resetChangeListConsumer();
+  });
+
+  tearDown(ctx);
+}
+
+/*
  * A DETACHED_BLOCKED peer is out of sync: the split keeps it detached and out
  * of sync in the new group, and its RIB-OUT (per-peer + shared) is preserved
  * entry-for-entry -- a detached peer keeps its detached RIB version across the
@@ -1231,6 +1347,73 @@ TEST_F(GroupEgressPolicyReEvalExecution, CancelsDetachedPeerScheduledRibDump) {
  * converge on one key (e.g. a partial-override group reset) are merged.
  */
 class UpdateGroupsEgressReEvalTest : public UpdateGroupPolicyReEvalUTBase {};
+
+/*
+ * When processUpdateGroupsEgressPolicyReevaluation splits part of a group into
+ * a newly created group (splitToNewGroup), the post-reconciliation recovery
+ * pass restarts the change-list consume timer for every affected group that
+ * still has an in-sync peer -- the split-off target group and the source group
+ * the peer left behind.
+ */
+TEST_F(UpdateGroupsEgressReEvalTest, SchedulesConsumeTimerAfterSplit) {
+  constexpr int kN = 2;
+  const std::string kPg = "PEERGROUP_1";
+  const std::string kPolicy0 = kPNameMatchNoAdvtDeny;
+  const std::string kPolicy1 = kPNameMatchModifyAppend;
+
+  auto ctx = setUpGroups({{kPg, kN}}, true, kPolicy0);
+  sendInitialRibDump(ctx);
+  auto peer = [](int i) { return makePeerId(i); };
+  expectEventualStateOnEvb(ctx, peer(0), PeerUpdateState::JOINED_RUNNING);
+  expectEventualStateOnEvb(ctx, peer(1), PeerUpdateState::JOINED_RUNNING);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  auto groupOf = [&](const BgpPeerId& id) {
+    return folly::via(
+               &evb, [&]() { return ctx.adjRibs.at(id)->getUpdateGroup(); })
+        .get();
+  };
+  auto isConsumeTimerScheduled =
+      [&](const std::shared_ptr<AdjRibOutGroup>& group) {
+        return folly::via(
+                   &evb,
+                   [&]() {
+                     return group->changeListConsumeTimer_ != nullptr &&
+                         group->changeListConsumeTimer_->isScheduled();
+                   })
+            .get();
+      };
+
+  // Both peers converge into a single source group.
+  auto sourceGroup = groupOf(peer(0));
+  ASSERT_EQ(sourceGroup, groupOf(peer(1)));
+
+  /*
+   * Override peer 0 only. Its update group key diverges while peer 1's stays,
+   * so the reconciliation moves only part of the source group -- taking the
+   * splitToNewGroup path into a brand-new target group.
+   */
+  disableAsyncEgressReEvalOnEvb(ctx);
+  updatePeerEgressPolicyOnEvb(ctx, peer(0), kPolicy1);
+  markEgressPolicyUpdateRequiredOnEvb(ctx, {peer(0), peer(1)});
+  runProcessUpdateGroupsEgressPolicyReevaluationOnEvb(ctx);
+
+  auto targetGroup = groupOf(peer(0));
+  // Peer 0 split off into a distinct new group; peer 1 stayed behind.
+  ASSERT_NE(targetGroup, sourceGroup);
+  ASSERT_EQ(groupOf(peer(1)), sourceGroup);
+  ASSERT_EQ(targetGroup->getNumInSyncPeers(), 1);
+  ASSERT_EQ(sourceGroup->getNumInSyncPeers(), 1);
+
+  /*
+   * The recovery pass restarts the consume timer on both groups that retain an
+   * in-sync peer: the split-off target and the source left behind.
+   */
+  EXPECT_TRUE(isConsumeTimerScheduled(targetGroup));
+  EXPECT_TRUE(isConsumeTimerScheduled(sourceGroup));
+
+  tearDown(ctx);
+}
 
 /*
  * G1: a peer-group change plus a per-peer override on EVERY member makes the

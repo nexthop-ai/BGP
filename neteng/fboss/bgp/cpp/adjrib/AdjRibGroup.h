@@ -894,6 +894,16 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
   void handleNoSyncPeers() noexcept;
 
   /*
+   * Recover this group after a membership change (peer move/removal) if it was
+   * left with members but no in-sync peers. This is the caller-side recovery
+   * step: movePeers()/removePeer() stay pure so a bulk re-home never promotes a
+   * peer still pending its own move; the orchestrator (e.g. PeerManagerBase
+   * egress-policy re-evaluation) runs this once per affected group after all
+   * moves complete. No-op if the group still has a SYNC peer or no members.
+   */
+  void recoverIfNoSyncPeers() noexcept;
+
+  /*
    * Promote a detached peer (ahead of / caught up with the frozen group) to
    * SYNC: move its RIB-OUT entries to the group owner key, re-create the
    * group's change list consumer joined at the peer's CL position, adopt the
