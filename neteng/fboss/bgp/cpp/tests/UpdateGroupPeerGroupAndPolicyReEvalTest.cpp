@@ -33,6 +33,8 @@
   FRIEND_TEST(SplitToGroup, CopiesGroupFields);                               \
   FRIEND_TEST(SplitToGroup, ClonesPackingList);                               \
   FRIEND_TEST(SplitToGroup, MovesJoinedRunningPeer);                          \
+  FRIEND_TEST(                                                                \
+      SplitToGroup, SplitBlockedPeerDrainWaitsInBuildAndSendGroupMessages);   \
   FRIEND_TEST(SplitToGroup, SplitBlockedPeerDrainNoInSyncPeerDoesNotReschedule);
 
 #include <array>
@@ -665,6 +667,128 @@ TEST_F(SplitToGroup, MovesJoinedBlockedPeer) {
 
   EXPECT_NE(ribOutBefore, "Path{}, Lite{}");
   EXPECT_EQ(ribOutAfter, ribOutBefore);
+
+  tearDown(ctx);
+}
+
+/*
+ * Regression: splitToNewGroup can hand a group an in-sync peer that still has a
+ * deferred push in flight from its previous group (its carried-over bit in
+ * adjRibBlockedBitmap_). That push has not yet reached the peer's queue and the
+ * packing list cloned into the new group holds only the items that follow it,
+ * so buildAndSendGroupBgpMessages must wait for the carried-over push to drain
+ * before packing -- otherwise it could enqueue a later UPDATE ahead of the
+ * in-flight one. Once the push completes the drain proceeds and the consume
+ * timer is rescheduled for the still-in-sync group.
+ */
+TEST_F(SplitToGroup, SplitBlockedPeerDrainWaitsInBuildAndSendGroupMessages) {
+  auto ctx = setUp(2);
+  sendInitialRibDump(ctx);
+  auto peerId1 = makePeerId(1);
+  expectEventualStateOnEvb(ctx, peerId1, PeerUpdateState::JOINED_RUNNING);
+
+  /* Block peer1 so a real deferred push is left in flight (blocked bit set). */
+  blockGroupViaPeerOnEvb(ctx, peerId1);
+  publishRouteUpdates(ctx, /*isInitialDump=*/false);
+  expectEventualStateOnEvb(ctx, peerId1, PeerUpdateState::JOINED_BLOCKED);
+
+  auto& evb = ctx.peerMgr->getEventBase();
+  std::shared_ptr<AdjRibOutGroup> targetGroup;
+
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId1);
+    auto sourceGroup = adjRib->getUpdateGroup();
+
+    targetGroup = std::make_shared<AdjRibOutGroup>(
+        evb,
+        "split_target",
+        sourceGroup->getGroupId() + 1,
+        /*enableUpdateGroup=*/true,
+        sourceGroup->getGroupKey());
+    sourceGroup->splitToNewGroup(targetGroup, {adjRib});
+
+    /*
+     * The moved peer is in-sync AND blocked: its carried-over push is tracked
+     * on the new group, so the drain must wait for it before packing.
+     */
+    ASSERT_TRUE(targetGroup->hasBlockedPeers());
+    ASSERT_EQ(targetGroup->getNumInSyncPeers(), 1);
+
+    /*
+     * Replace the cloned packing list with a single announcement so the drain
+     * distributes exactly one message that fits peer1's queue once it drains,
+     * letting buildAndSendGroupBgpMessages complete and reach its guard.
+     */
+    targetGroup->attrToPrefixMap_.clear();
+    auto fields = buildBgpPathFields(1, 0, 0, 0);
+    auto attrs = std::make_shared<BgpPath>(*fields);
+    attrs->publish();
+    std::shared_ptr<const BgpPath> constAttrs = attrs;
+    const folly::CIDRNetwork packedPrefix{folly::IPAddress("200.0.0.0"), 24};
+    targetGroup->tryUpdateAttrToPrefixMapForGroup(
+        std::make_pair(packedPrefix, kDefaultPathID), nullptr, constAttrs);
+    ASSERT_FALSE(targetGroup->getAttrToPrefixMap().empty());
+
+    /* Start the new group's drain; it must park on waitForAllPendingPushes. */
+    targetGroup->asyncScope_.add(
+        folly::coro::co_withExecutor(
+            &evb,
+            targetGroup->buildAndSendGroupBgpMessages(/*sendWithEoR=*/false)));
+  });
+
+  /*
+   * While the carried-over push is still in flight the drain stays parked
+   * before its guard, so the group has not resumed: the consume timer is not
+   * scheduled (buildAndSendGroupBgpMessages cancels it on entry and only
+   * reschedules from the guard after the drain completes).
+   */
+  for (int i = 0; i < kEvbPumpTurns; ++i) {
+    evb.runInEventBaseThreadAndWait([]() {});
+  }
+  evb.runInEventBaseThreadAndWait([&]() {
+    EXPECT_TRUE(targetGroup->hasBlockedPeers());
+    EXPECT_FALSE(
+        targetGroup->changeListConsumeTimer_ &&
+        targetGroup->changeListConsumeTimer_->isScheduled());
+  });
+
+  /*
+   * Complete the carried-over push: draining peer1's queue frees space so the
+   * in-flight deferredPushToPeer resolves and clears the blocked bit.
+   */
+  drainQueue(ctx, peerId1);
+
+  /*
+   * The wait completes, the drain finishes, and the group resumes: the guard
+   * reschedules the consume timer for the still-in-sync group.
+   */
+  WITH_RETRIES({
+    auto resumed = folly::via(&evb, [&]() {
+                     return targetGroup->changeListConsumeTimer_ &&
+                         targetGroup->changeListConsumeTimer_->isScheduled();
+                   }).get();
+    EXPECT_EVENTUALLY_TRUE(resumed);
+  });
+
+  /*
+   * Tear down the unmanaged target group. Null the consume timer first so a
+   * completing drain can't reschedule it, then cancel + join the drain
+   * coroutine on the group's async scope before breaking the remaining cycles.
+   */
+  evb.runInEventBaseThreadAndWait(
+      [&]() { targetGroup->resetChangeListConsumeTimer(); });
+  folly::coro::blockingWait(targetGroup->drainAsyncScope());
+  evb.runInEventBaseThreadAndWait([&]() {
+    auto& adjRib = ctx.adjRibs.at(peerId1);
+    targetGroup->unregisterPeer(adjRib);
+    adjRib->setUpdateGroup(nullptr);
+    if (auto consumer = targetGroup->getChangeListConsumer()) {
+      consumer->resetBitmap();
+      consumer->terminate();
+      consumer->deregisterFromTracker();
+    }
+    targetGroup->resetChangeListConsumer();
+  });
 
   tearDown(ctx);
 }

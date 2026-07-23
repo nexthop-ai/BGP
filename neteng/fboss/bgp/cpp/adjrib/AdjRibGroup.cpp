@@ -1875,6 +1875,30 @@ folly::coro::Task<void> AdjRibOutGroup::buildAndSendGroupBgpMessages(
     }
   });
 
+  if (checkForBlockedPeers_) {
+    checkForBlockedPeers_ = false;
+    if (hasBlockedPeers()) {
+      /*
+       * Rare edge case: a split (splitToNewGroup) can hand this group in-sync
+       * peers that were still BLOCKED, with a deferred push in flight from
+       * their previous group, tracked by their carried-over bit in
+       * adjRibBlockedBitmap_. Only then does splitToNewGroup set
+       * checkForBlockedPeers_, so the common path (no blocked peers ever moved
+       * in) skips the hasBlockedPeers() scan entirely. That earlier push has
+       * not yet reached the peer's queue, and the packing list cloned into this
+       * group holds only the items that follow it. Draining now could enqueue a
+       * later item ahead of that in-flight one and reorder BGP UPDATEs, so wait
+       * for the carried-over pushes to drain first, then clear the flag.
+       */
+      XLOGF(
+          DBG2,
+          "Group {}: waiting for carried-over pending pushes to drain before "
+          "packing (preserves UPDATE ordering after a split)",
+          groupDescriptor_);
+      co_await waitForAllPendingPushes();
+    }
+  }
+
   // Return early if nothing to announce/withdraw and no EoR pending.
   if (attrToPrefixMap_.empty() && !sendWithEoR) {
     co_return;
@@ -3084,6 +3108,12 @@ void AdjRibOutGroup::splitToNewGroup(
        */
       if (wasBlocked) {
         BitmapUtils::setBit(newGroup->adjRibBlockedBitmap_, newBit);
+        /*
+         * A carried-over blocked peer has an in-flight push from its previous
+         * group; flag newGroup so buildAndSendGroupBgpMessages drains it before
+         * packing to preserve BGP UPDATE ordering.
+         */
+        newGroup->checkForBlockedPeers_ = true;
       }
     } else {
       newGroup->detachedPeers_.insert(peer);

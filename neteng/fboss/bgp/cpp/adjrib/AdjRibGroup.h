@@ -1507,6 +1507,17 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
   bool packingInProgress_{false};
 
   /**
+   * Guards a rare edge case: splitToNewGroup re-homed one or more in-sync peers
+   * into this group that were still BLOCKED (an in-flight push carried over)
+   * from their previous group. Only in that case does this group need to drain
+   * those carried-over pushes before packing, so this flag gates the
+   * hasBlockedPeers() drain in buildAndSendGroupBgpMessages -- avoiding that
+   * check on the common path where no blocked peers were ever moved in -- and
+   * is cleared once the carried-over pushes have drained.
+   */
+  bool checkForBlockedPeers_{false};
+
+  /**
    * Stats associated to this AdjRibOutGroup
    * Tracks sent update messages, announcements, and withdrawals for the group
    * Uses groupName as the identifier for ODS
