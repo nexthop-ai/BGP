@@ -3237,7 +3237,16 @@ folly::coro::Task<void> PeerManagerBase::updatePeerCounters() {
     auto it = adjRibs_.find(bgpPeerId);
     if (it != adjRibs_.end()) {
       const auto stats = it->second->getStats();
-      if (stats.getPreInPrefixCount() + stats.getPostOutPrefixCount() > 0) {
+      /*
+       * A peer is exchanging routes if it received prefixes (ingress) or is
+       * being advertised prefixes (egress). getEffectivePostOutPrefixCount()
+       * hides the update-group split: it returns the group-level advertised
+       * count for an in-sync group member (whose per-peer count is cleared by
+       * markPeerInSync) and the per-peer count otherwise, so this check is
+       * correct whether or not update-group is enabled.
+       */
+      if (stats.getPreInPrefixCount() > 0 ||
+          it->second->getEffectivePostOutPrefixCount() > 0) {
         continue;
       }
       // VIP injector sessions can be in established state without any

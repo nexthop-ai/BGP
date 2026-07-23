@@ -198,6 +198,7 @@
   FRIEND_TEST(                                                                 \
       PeerManagerDynamicPolicyEvaluationFixture,                               \
       UpdateIngressEgressPolicyNamesScopePeerTest);                            \
+  FRIEND_TEST(PeerManagerTestFixture, GetEffectivePostOutPrefixCountTest);     \
   FRIEND_TEST(                                                                 \
       PeerManagerDynamicPolicyEvaluationFixture,                               \
       UpdateIngressEgressPolicyNamesScopePeerGroupTest);
@@ -211,6 +212,9 @@
 #define StreamSubscriber_TEST_FRIENDS   \
   friend class StreamSubscriberFixture; \
   FRIEND_TEST(StreamSubscriberFixture, ExceedsStreamSubscriberLimitTest);
+
+#define AdjRibOutGroup_TEST_FRIENDS \
+  FRIEND_TEST(PeerManagerTestFixture, GetEffectivePostOutPrefixCountTest);
 
 #include <algorithm>
 
@@ -7084,6 +7088,149 @@ TEST_F(PeerManagerTestFixture, AddPeersTest) {
   }
   auto result3 = folly::coro::blockingWait(peerMgr->addPeers(multiplePeers));
   EXPECT_TRUE(result3.hasValue());
+
+  peerMgr->markDaemonShutdown();
+  sessionMgr->stop();
+  peerMgr->stop();
+  peerMgrThread.join();
+  sessionMgrThread.join();
+  SUCCEED();
+}
+
+/*
+ * Test AdjRib::getEffectivePostOutPrefixCount() — the accessor that returns
+ * the correct post-out count whether the peer is in an update-group or not.
+ * This prevents the bug where an in-sync UG peer (per-peer post-out cleared
+ * to 0, count lives on the group) was wrongly seen as "no routes advertised."
+ */
+TEST_F(PeerManagerTestFixture, GetEffectivePostOutPrefixCountTest) {
+  auto config = getConfig(
+      true,
+      true,
+      false,
+      false,
+      false,
+      true /*enableVipService*/,
+      0,
+      false,
+      false,
+      false,
+      {"enable_vip_server_limit"} /* bgp_setting_config */);
+  auto globalConfig = config->getBgpGlobalConfig();
+
+  auto configManager = std::make_shared<ConfigManager>(config);
+  auto peerMgr = std::make_shared<MockPeerManager>(
+      configManager, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
+
+  auto sessionMgr = std::make_shared<MockSessionManager>(*globalConfig, false);
+  peerMgr->setSessionManager(sessionMgr);
+
+  auto peerMgrThread = peerMgr->runInThread();
+  auto sessionMgrThread = sessionMgr->runInThread();
+
+  folly::EventBase evb;
+  auto& fm = folly::fibers::getFiberManager(evb, options_);
+
+  fm.addTask([&] {
+    /*
+     * Case 1: In-sync update-group peer (per-peer=0, group>0).
+     * The accessor should return the group count, not 0.
+     */
+    auto adjRib1 = setupAdjRib(
+        evb,
+        peerMgr->getChangeListTracker(),
+        kPeerId1,
+        AsNum(kAsn1),
+        sessionTerminateBaton_,
+        config);
+
+    /* Attach an update-group. */
+    adjRib1->adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(evb, "Group");
+
+    /* Bump group post-out count to 100 (IPv4). */
+    for (uint32_t i = 0; i < 100; ++i) {
+      adjRib1->adjRibOutGroup_->stats_.incrementPostOutPrefixCount(
+          /*isIpv4=*/true);
+    }
+
+    /*
+     * Per-peer post-out is 0 (an in-sync peer's count was cleared when it
+     * joined the group). Verify the accessor returns the group count, NOT 0.
+     */
+    EXPECT_EQ(0, adjRib1->stats_.getPostOutPrefixCount());
+    EXPECT_EQ(
+        100, adjRib1->adjRibOutGroup_->getStats().getPostOutPrefixCount());
+    EXPECT_EQ(100, adjRib1->getEffectivePostOutPrefixCount());
+
+    /*
+     * Case 2: No update-group (update-group disabled or peer detached).
+     * The accessor should return the per-peer count.
+     */
+    auto adjRib2 = setupAdjRib(
+        evb,
+        peerMgr->getChangeListTracker(),
+        kPeerId2,
+        AsNum(kAsn1),
+        sessionTerminateBaton_,
+        config);
+
+    /*
+     * Detach the group to simulate update-group disabled.
+     * setupAdjRib always creates a group, so we null it out manually.
+     */
+    adjRib2->adjRibOutGroup_ = nullptr;
+
+    /* Bump per-peer post-out count to 50 (IPv4). */
+    for (uint32_t i = 0; i < 50; ++i) {
+      adjRib2->incrementPostOutPrefixCount(/*isIpv4=*/true);
+    }
+
+    EXPECT_EQ(50, adjRib2->stats_.getPostOutPrefixCount());
+    EXPECT_EQ(50, adjRib2->getEffectivePostOutPrefixCount());
+
+    /*
+     * Case 3: Detached peer (both group and per-peer counts set, per-peer
+     * count is higher). The accessor should return the max.
+     */
+    auto adjRib3 = setupAdjRib(
+        evb,
+        peerMgr->getChangeListTracker(),
+        kPeerId3,
+        AsNum(kAsn1),
+        sessionTerminateBaton_,
+        config);
+
+    /* Attach an update-group with a count of 20. */
+    adjRib3->adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(evb, "Group");
+    for (uint32_t i = 0; i < 20; ++i) {
+      adjRib3->adjRibOutGroup_->stats_.incrementPostOutPrefixCount(
+          /*isIpv4=*/true);
+    }
+
+    /*
+     * Per-peer count is 30 (higher than the group count).
+     * This mimics a detached peer diverging from the group.
+     */
+    for (uint32_t i = 0; i < 30; ++i) {
+      adjRib3->incrementPostOutPrefixCount(/*isIpv4=*/true);
+    }
+
+    EXPECT_EQ(30, adjRib3->stats_.getPostOutPrefixCount());
+    EXPECT_EQ(20, adjRib3->adjRibOutGroup_->getStats().getPostOutPrefixCount());
+    EXPECT_EQ(30, adjRib3->getEffectivePostOutPrefixCount());
+
+    /*
+     * These ribs are local (not owned by peerMgr->adjRibs_), so break the
+     * AdjRib <-> changeListConsumer reference cycle explicitly before they go
+     * out of scope; otherwise the ribs outlive the test and LeakSanitizer
+     * fails the run.
+     */
+    adjRib1->resetChangeListConsumer();
+    adjRib2->resetChangeListConsumer();
+    adjRib3->resetChangeListConsumer();
+  });
+
+  fm.loopUntilNoReady();
 
   peerMgr->markDaemonShutdown();
   sessionMgr->stop();

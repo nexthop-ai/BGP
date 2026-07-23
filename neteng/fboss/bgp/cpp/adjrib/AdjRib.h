@@ -967,6 +967,29 @@ class AdjRib : boost::noncopyable,
     return adjRibOutGroup_->getStats().getPostOutPrefixCount();
   }
 
+  /**
+   * @brief  Effective advertised (egress / post-out) prefix count for this
+   *         peer, independent of whether update-group is enabled.
+   *
+   * Egress accounting lives in two places depending on update-group state: an
+   * in-sync group member's advertisements are counted on the shared
+   * AdjRibOutGroup (its own per-peer stats_.postOutPrefixCount is cleared by
+   * AdjRibGroup::markPeerInSync), whereas a peer with no group (update-group
+   * disabled) or a detached/diverged member counts on its own per-peer stats_.
+   * Return the larger of the two so callers get the peer's true egress without
+   * having to know which accounting is currently active. (Ingress needs no such
+   * accessor -- adj-rib-in is inherently per-peer.)
+   */
+  uint32_t getEffectivePostOutPrefixCount() const {
+    const uint32_t perPeerPostOut = stats_.getPostOutPrefixCount();
+    if (!adjRibOutGroup_) {
+      return perPeerPostOut;
+    }
+    const uint32_t groupPostOut =
+        adjRibOutGroup_->getStats().getPostOutPrefixCount();
+    return groupPostOut > perPeerPostOut ? groupPostOut : perPeerPostOut;
+  }
+
   void processShadowRibEntryChange(ShadowRibEntry& srEntry) noexcept;
 
   /*
