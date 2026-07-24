@@ -1012,6 +1012,8 @@ folly::coro::Task<void> PeerManagerBase::processRibDumpReqCoro(
  * for update-group peers. The rib dump is tracked by the AdjRib's cancellation
  * source so it can be superseded by a newer dump or cancelled on session
  * teardown.
+ *
+ * This coroutine is ONLY executed when update group is enabled.
  */
 folly::coro::Task<void> PeerManagerBase::processRibDumpReqWithCancellationCoro(
     std::shared_ptr<AdjRib> adjRib) {
@@ -1063,6 +1065,19 @@ folly::coro::Task<void> PeerManagerBase::processRibDumpReqWithCancellationCoro(
   };
 
   processRibDumpReq(adjRib, adjRib->sendAddPath(), /*sendWithEoR=*/true);
+
+  /*
+   * With update group enabled, register and activate the detached peer's
+   * changelist consumer after its dump completes. registerDetachedConsumer uses
+   * bounded consumption up until the group's position (unlike
+   * activateChangeListConsumer, which consumes to the end of the changelist and
+   * carries out-delay logic that does not apply under update groups).
+   */
+  if (adjRib->isDetachedPeer()) {
+    adjRib->registerDetachedConsumer(
+        changeListTracker_, addPathConsumerBitmap_, nonAddPathConsumerBitmap_);
+    adjRib->activateDetachedModeProcessing();
+  }
   co_return;
 }
 
@@ -1178,31 +1193,15 @@ void PeerManagerBase::processRibDumpReq(
   /*
    * changeList consumers are to be registered to the tracker
    * library only after initial dump with EoR flag is sent to
-   * adjRibOut.
+   * adjRibOut, right away as soon EoR flag is sent so as to not
+   * miss any further incremental changes to routes.
    *
-   * Consumers must be registered right away as soon EoR flag
-   * is sent so as to not miss any further incremental changes
-   * to routes. When update group is enabled, only detached
-   * peers would execute this method.
-   *
-   * With update group enabled, we activate the changelist
-   * consumer using registerDetachedConsumer; disabled uses
-   * activateChangeListConsumer. The difference is due to two
-   * types of logic:
-   *
-   *  - activateChangeListConsumer has logic for out-delay which
-   *    is not applicable in update group
-   *
-   *  - registerDetachedConsumer uses bounded consumption up until
-   *    the group's position; activateChangeListConsumer will
-   *    consume all the way to the end of changelist every time.
+   * When update group is disabled we activate the changelist
+   * consumer here via activateChangeListConsumer (which carries
+   * out-delay logic).
    */
   if (!enableUpdateGroup_) {
     adjRib->activateChangeListConsumer();
-  } else if (adjRib->isDetachedPeer()) {
-    adjRib->registerDetachedConsumer(
-        changeListTracker_, addPathConsumerBitmap_, nonAddPathConsumerBitmap_);
-    adjRib->activateDetachedModeProcessing();
   }
 
   XLOGF(
@@ -4202,6 +4201,16 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
               adjRib,
               adjRib->sendAddPath(),
               adjRib->egressEoRsPending() /* sendWithEoR */);
+          /*
+           * The detached consumer was registered when the peer detached
+           * (detachPeer); processRibDumpReq only refreshes RIB-OUT. Kick off
+           * detached-mode processing so the peer drains and rejoins, unless it
+           * is blocked -- a blocked peer resumes via markPeerUnblocked once its
+           * queue drains.
+           */
+          if (adjRib->getPeerState() != PeerUpdateState::DETACHED_BLOCKED) {
+            adjRib->activateDetachedModeProcessing();
+          }
           adjRib->clearPendingEgressPolicyUpdate();
         }
       }
@@ -4374,6 +4383,16 @@ void PeerManagerBase::processGroupEgressPolicyReEvaluation(
           adjRib,
           adjRib->sendAddPath(),
           adjRib->egressEoRsPending() /* sendWithEoR */);
+      /*
+       * The detached consumer was registered when the peer detached
+       * (detachPeer); processRibDumpReq only refreshes RIB-OUT. Kick off
+       * detached-mode processing so the peer drains and rejoins, unless it is
+       * blocked -- a blocked peer resumes via markPeerUnblocked once its queue
+       * drains.
+       */
+      if (adjRib->getPeerState() != PeerUpdateState::DETACHED_BLOCKED) {
+        adjRib->activateDetachedModeProcessing();
+      }
     }
 
     /* This flag needs to be cleared for all peers in the group. */

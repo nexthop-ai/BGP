@@ -500,8 +500,12 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
    * Steps:
    *   1. Set all peers in the group to JOINED_RUNNING with sync bitmap
    *   2. Configure slow peer thresholds based on useBlockFrequency
-   *   3. Replace the target peer's bounded queue with a small one and fill it
-   *   4. markPeerBlocked → threshold hit → detachSlowPeer → DETACHED_BLOCKED
+   *   3. Shrink only the target's bounded queue so it backpressures first
+   *   4. Publish a small route batch: the normal group send path
+   *      (buildAndSendGroupBgpMessages -> tryPushToPeer) backpressures the
+   *      target, which schedules its deferredPushToPeer and marks it blocked;
+   *      the slow-peer criteria then detach it to DETACHED_BLOCKED -- leaving a
+   *      live deferredPushToPeer so it can recover when its queue drains.
    */
   void triggerDetachedBlockedFromJoinedOnEvb(
       TestContext& ctx,
@@ -537,32 +541,33 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
       group->setUpdateGroupConfigForTesting(cfg);
 
       /*
-       * Tiny queue pre-filled past its high-watermark to force the blocked
-       * state: push kFillQueueHighWm messages into a kFillQueueCapacity queue.
+       * Shrink only the target's queue so it is the first (and only) peer to
+       * backpressure on the next distribution; the other members keep their
+       * larger queues, stay JOINED_RUNNING, and keep the group unfrozen.
        */
-      auto smallQueue = std::make_shared<AdjRib::BoundedAdjRibOutQueueT>(
-          kFillQueueCapacity, kFillQueueHighWm, kFillQueueLowWm);
-      targetAdjRib->boundedAdjRibOutQueue_ = smallQueue;
-
-      nettools::bgplib::FiberBgpPeer::InputMessageT dummyMsg{
-          nettools::bgplib::BgpEndOfRib{}};
-      for (size_t i = 0; i < kFillQueueHighWm; ++i) {
-        smallQueue->push(
-            std::optional<nettools::bgplib::FiberBgpPeer::InputMessageT>(
-                dummyMsg));
-      }
-      ASSERT_TRUE(smallQueue->isBlocked());
-
-      group->markPeerBlocked(targetAdjRib);
-
-      EXPECT_EQ(
-          targetAdjRib->getPeerState(), PeerUpdateState::DETACHED_BLOCKED);
-      XLOGF(
-          INFO,
-          "Peer {} successfully detached from JOINED via {}",
-          targetPeerId.peerAddr.str(),
-          useBlockFrequency ? "frequency" : "duration");
+      resizePeerQueue(
+          targetAdjRib,
+          kBlockingOutQueueCapacity,
+          kReadyToJoinTargetHighWm,
+          kReadyToJoinLowWm);
     });
+
+    /*
+     * Drive a real distribution: buildAndSendGroupBgpMessages pushes to the
+     * target, whose small queue backpressures. tryPushToPeer then marks it
+     * blocked AND schedules a deferredPushToPeer, and the slow-peer criteria
+     * detach it to DETACHED_BLOCKED -- leaving that deferredPushToPeer live so
+     * the peer recovers once its queue drains (markPeerUnblocked). The block
+     * emerges from the normal send path; no internal state is forced.
+     */
+    publishRouteUpdates(ctx, /*isInitialDump=*/false, [](int i) {
+      return i < kDetachTriggerBatch;
+    });
+    expectEventualStateOnEvb(
+        ctx, targetPeerId, PeerUpdateState::DETACHED_BLOCKED);
+    XLOG(INFO) << "Peer " << targetPeerId.peerAddr.str()
+               << " detached from JOINED via "
+               << (useBlockFrequency ? "frequency" : "duration");
   }
 
   /*

@@ -2439,8 +2439,9 @@ void AdjRibOutGroup::registerPeer(const std::shared_ptr<AdjRib>& adjRib) {
      * mirroring the INIT branch above. It was never
      * registered with the ChangeTracker, so leaving it in place makes
      * registerDetachedConsumer() short-circuit on its `if
-     * (changeListConsumer_)` guard when PeerManagerBase::processRibDumpReq
-     * registers this detached peer. That skips creation of
+     * (changeListConsumer_)` guard when
+     * PeerManagerBase::processRibDumpReqWithCancellationCoro registers this
+     * detached peer. That skips creation of
      * changeListConsumeTimer_, so detached CL consumption would never start for
      * a peer entering a running group.
      */
