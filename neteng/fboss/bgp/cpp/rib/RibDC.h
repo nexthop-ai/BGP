@@ -183,14 +183,13 @@ class RibDC : public RibBase {
       bool oldIsPartialDrain,
       bool newIsPartialDrain);
 
-  void enqueueRibUpdateToFsdb() override;
   /*
    * DC-only end-of-pass hook. Overrides the generic
-   * RibBase::onPrepareFibProgrammingComplete; publishes the partial-drain
-   * state once per pass while partialDrainPublishPending_ is set, clearing the
-   * bit only once the publish lands.
+   * RibBase::onPrepareFibProgrammingComplete. It retains pending partial-drain
+   * state and, after the initial full-RIB computation, starts FsdbSyncer so its
+   * first snapshot includes that retained state.
    */
-  void onPrepareFibProgrammingComplete() noexcept override;
+  void onPrepareFibProgrammingComplete(bool fullSync) noexcept override;
   /*
    * Publish the current partial-drain state. DC-only, called only from
    * onPrepareFibProgrammingComplete() — never via RibBase&, so it is not a
@@ -330,22 +329,11 @@ class RibDC : public RibBase {
   /*
    * Whether CPS native criteria (e.g. bgp_native_path_selection_min_nexthop /
    * min_agg_lbw) are violated for this prefix -- when true, no path is "best
-   * path". Shared by createTRibEntryWithFilter and createBestPathOnlyTRibEntry.
+   * path". Shared by canonical and legacy RIB entry construction.
    */
   bool computeFailedCpsNativeCriteria(
       const facebook::bgp::RibEntry& ribEntry) const;
 
-  /*
-   * Minimal TRibEntry builder for the FSDB publish path: returns an entry with
-   * only prefix + best_path when a publishable best path exists (in the
-   * selected multipath set and CPS native criteria not violated), or
-   * std::nullopt otherwise so the caller withdraws the prefix instead of
-   * publishing a prefix-only entry the FSDB best-path consumer would ignore.
-   */
-  std::optional<neteng::fboss::bgp::thrift::TRibEntry>
-  createBestPathOnlyTRibEntry(
-      const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>&
-          entry);
   std::unique_ptr<RibPolicyLogger> ribPolicyLogger_{nullptr};
 
   /*
@@ -354,8 +342,6 @@ class RibDC : public RibBase {
    * PathSelectionPolicy reads.
    */
   std::unique_ptr<PathSelectionPolicy> pathSelectionPolicy_{nullptr};
-
-  void maybeStartFsdbSyncer();
 
   /* Raw pointer owned by Main.cpp; lifetime managed externally. */
   FsdbSyncer* fsdbSyncer_{nullptr};

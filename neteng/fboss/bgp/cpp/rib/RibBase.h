@@ -449,7 +449,6 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
       uint32_t pathId,
       uint64_t ribVersion);
 
-  virtual void enqueueRibUpdateToFsdb() {}
   /*
    * Generic hook invoked once at the end of each prepareFibProgramming pass
    * (after path selection and route-attribute overwrite, before the
@@ -457,7 +456,7 @@ class RibBase : public BgpModuleBase, public MonitoredModule {
    * platform-specific end-of-pass work. RibBase performs no such work itself,
    * keeping the base class free of platform-domain logic.
    */
-  virtual void onPrepareFibProgrammingComplete() noexcept {}
+  virtual void onPrepareFibProgrammingComplete(bool /*fullSync*/) noexcept {}
   virtual void postRouteFilterPolicyReplaced() {}
 
   /*

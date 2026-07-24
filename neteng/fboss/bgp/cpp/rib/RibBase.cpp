@@ -1780,15 +1780,12 @@ void RibBase::prepareFibProgramming(bool fullSync) noexcept {
    * platform-specific end-of-pass work. RibBase neither knows nor performs
    * any such work itself.
    */
-  onPrepareFibProgrammingComplete();
+  onPrepareFibProgrammingComplete(fullSync);
 
   // If no entry in fib update list and not full sync, skip fib programming
   if (fibBatchList_.empty() && !fullSync) {
     return;
   }
-
-  /* Virtual hook: subclasses override to publish RIB updates externally. */
-  enqueueRibUpdateToFsdb();
 
   RibStats::addFibBatchListSize(fibBatchList_.size());
   toFibMessageQ_.push(TriggerFibProgMessage(fullSync));

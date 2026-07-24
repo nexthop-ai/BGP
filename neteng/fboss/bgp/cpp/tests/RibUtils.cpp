@@ -812,35 +812,13 @@ void RibFixture::setUpFsdb() {
   FLAGS_fsdb_max_backoff_reconnect_ms = 100;
   fsdbSubscriber_ = std::make_unique<FsdbTestSubscriber>("test-subscriber");
   fsdbSyncer_ = std::make_unique<FsdbSyncer>();
-  // fsdbSyncer is started by Rib thread on first FIB programming
-  // (see RibBase::prepareFibProgramming)
-}
-
-void RibFixture::clearRibFsdbSyncer() {
   rib_->evb_.runInEventBaseThreadAndWait(
-      [this]() { rib_->fsdbSyncer_ = nullptr; });
+      [this]() { rib_->fsdbSyncer_ = fsdbSyncer_.get(); });
 }
 
-void RibFixture::resetRibFsdbSyncer() {
-  rib_->evb_.runInEventBaseThreadAndWait([this]() {
-    rib_->fsdbSyncer_ = fsdbSyncer_.get();
-    rib_->fsdbSyncerStarted_ = false;
-  });
-}
-
-void RibFixture::resetFsdbSyncerState() {
-  fsdbSyncer_->stop();
-  auto newSyncer = std::make_unique<FsdbSyncer>();
-  FsdbSyncer* newSyncerPtr = newSyncer.get();
-  // Dispatch rib_ field writes to the rib evb thread to avoid data races with
-  // maybeStartFsdbSyncer(), which reads these fields on that thread.
-  // Update the raw pointer before transferring unique_ptr ownership to prevent
-  // a use-after-free window. Same pattern as resetRibFsdbSyncer().
-  rib_->evb_.runInEventBaseThreadAndWait([this, newSyncerPtr]() {
-    rib_->fsdbSyncer_ = newSyncerPtr;
-    rib_->fsdbSyncerStarted_ = false;
-  });
-  fsdbSyncer_ = std::move(newSyncer);
+void RibFixture::completeFibProgrammingPass(bool fullSync) {
+  rib_->evb_.runInEventBaseThreadAndWait(
+      [this, fullSync]() { rib_->onPrepareFibProgrammingComplete(fullSync); });
 }
 
 bool RibFixture::isFsdbSyncerStarted() const {
@@ -862,37 +840,6 @@ void RibFixture::waitForFsdbPublisherConnected() {
     auto metadata = fsdbServer_->getPublisherRootMetadata("bgp", false);
     ASSERT_EVENTUALLY_TRUE(metadata.has_value());
   });
-}
-
-std::unique_ptr<RibFixture::GrSubscriberHandle> RibFixture::setupGrSubscriber(
-    uint32_t grHoldTimeSec) {
-  auto handle = std::make_unique<GrSubscriberHandle>();
-  handle->pubSubMgr =
-      std::make_unique<fboss::fsdb::FsdbPubSubManager>("test-gr-subscriber");
-  fboss::fsdb::SubscriptionOptions opts{
-      handle->pubSubMgr->getClientId(), false, grHoldTimeSec};
-  auto* subState = &handle->subscriptionState;
-  auto* subRibMap = &handle->subscribedRibMap;
-  handle->pubSubMgr->addStatePathSubscription(
-      std::move(opts),
-      std::vector<std::string>{"bgp", "ribMap"},
-      [subState](
-          fboss::fsdb::SubscriptionState /*oldState*/,
-          fboss::fsdb::SubscriptionState newState,
-          std::optional<bool> /*initialSyncHasData*/) {
-        *subState->wlock() = newState;
-      },
-      [subRibMap](fboss::fsdb::OperState state) {
-        if (auto contents = state.contents()) {
-          auto ribMap = apache::thrift::BinarySerializer::deserialize<
-              std::map<std::string, bgp_thrift::TRibEntry>>(*contents);
-          *subRibMap->wlock() = ribMap;
-        } else {
-          *subRibMap->wlock() = std::nullopt;
-        }
-      },
-      fboss::utils::ConnectionOptions("::1", fsdbServer_->getFsdbPort()));
-  return handle;
 }
 
 TResult RibFixture::sendRouteAttributePolicySet(TRouteAttributePolicy policy) {

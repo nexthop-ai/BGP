@@ -418,29 +418,7 @@ class RibFixture : public testing::Test {
   void updateCacheAndNotifyRib(const std::vector<NexthopStatus>& updates);
 
   void setUpFsdb();
-  // Nullify rib_->fsdbSyncer_ on the rib's EventBase thread. Must be called
-  // before destroying the old fsdbSyncer_ to prevent a dangling pointer window
-  // where the rib thread could access the destroyed object.
-  void clearRibFsdbSyncer();
-  // Reset fsdbSyncer in Rib to use the fixture's new fsdbSyncer instance
-  // and mark it as not started so Rib will start it on next FIB programming.
-  // Runs on the rib's EventBase thread to prevent data races with
-  // enqueueRibUpdateToFsdb().
-  void resetRibFsdbSyncer();
-
-  struct GrSubscriberHandle {
-    folly::Synchronized<fboss::fsdb::SubscriptionState> subscriptionState{
-        fboss::fsdb::SubscriptionState::DISCONNECTED};
-    folly::Synchronized<std::optional<
-        std::map<std::string, neteng::fboss::bgp::thrift::TRibEntry>>>
-        subscribedRibMap;
-    std::unique_ptr<fboss::fsdb::FsdbPubSubManager> pubSubMgr;
-  };
-  std::unique_ptr<GrSubscriberHandle> setupGrSubscriber(uint32_t grHoldTimeSec);
-  // Stop the current FsdbSyncer, swap in a fresh instance, and reset Rib's
-  // pointer/start flags on the rib evb thread (avoiding a UAF and a data race
-  // with maybeStartFsdbSyncer()).
-  void resetFsdbSyncerState();
+  void completeFibProgrammingPass(bool fullSync);
   bool isFsdbSyncerStarted() const;
   // True after RibBase::processNexthopResolutionUpdate has pushed the
   // RibOutNexthopResolutionReceived signal to PeerManagerBase (one-shot per

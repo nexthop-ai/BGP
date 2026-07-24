@@ -44,13 +44,6 @@ class FsdbSyncer {
   void setPartialDrainState(
       std::optional<bgp_thrift::TPartialDrainState>&& partialDrainState);
 
-  // setRibMap() must be called before start() for initial sync of RibMap to
-  // FSDB.
-  void setRibMap(std::map<std::string, bgp_thrift::TRibEntry> rib);
-  // updateRibMap() is called after start() to publish RIB updates to FSDB.
-  void updateRibMap(
-      std::map<std::string, std::optional<bgp_thrift::TRibEntry>> ribUpdate);
-
   void start();
   void stop();
 

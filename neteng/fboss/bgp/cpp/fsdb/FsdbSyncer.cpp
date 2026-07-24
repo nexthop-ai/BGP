@@ -138,39 +138,4 @@ void FsdbSyncer::setPartialDrainState(
   });
 }
 
-void FsdbSyncer::setRibMap(std::map<std::string, bgp_thrift::TRibEntry> rib) {
-  if (!FLAGS_publish_rib_to_fsdb) {
-    return;
-  }
-  stateSyncer_->updateState([rib =
-                                 std::move(rib)](const auto& oldState) mutable {
-    auto newState = oldState->clone();
-    newState->template modify<k_fsdb_model::ribMap>();
-    newState->template ref<k_fsdb_model::ribMap>()->fromThrift(std::move(rib));
-    return std::move(newState);
-  });
-}
-
-void FsdbSyncer::updateRibMap(
-    std::map<std::string, std::optional<bgp_thrift::TRibEntry>> ribUpdate) {
-  if (!FLAGS_publish_rib_to_fsdb) {
-    return;
-  }
-  stateSyncer_->updateState(
-      [ribUpdates = std::move(ribUpdate)](const auto& oldState) mutable {
-        auto newState = oldState->clone();
-        newState->template modify<k_fsdb_model::ribMap>();
-        auto& ribMap = newState->template ref<k_fsdb_model::ribMap>();
-        for (auto& [prefix, ribEntry] : ribUpdates) {
-          if (ribEntry.has_value()) {
-            ribMap->modify(prefix);
-            ribMap->ref(prefix)->fromThrift(std::move(ribEntry.value()));
-          } else {
-            ribMap->remove(prefix);
-          }
-        }
-        return std::move(newState);
-      });
-}
-
 } // namespace facebook::bgp

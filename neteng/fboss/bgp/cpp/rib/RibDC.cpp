@@ -563,43 +563,6 @@ void RibDC::createFib() {
   }
 }
 
-void RibDC::maybeStartFsdbSyncer() {
-  if (!fsdbSyncer_ || fsdbSyncerStarted_) {
-    return;
-  }
-  if (!ribEoRReceived_) {
-    return;
-  }
-  XLOG(INFO, "Starting FsdbSyncer in Rib thread");
-  fsdbSyncer_->start();
-  fsdbSyncerStarted_ = true;
-}
-
-void RibDC::enqueueRibUpdateToFsdb() {
-  if (!fsdbSyncer_) {
-    return;
-  }
-
-  if (FLAGS_publish_rib_to_fsdb) {
-    std::map<std::string, std::optional<bgp_thrift::TRibEntry>> ribUpdateToFsdb;
-    for (const auto& updatedRoute : fibBatchList_) {
-      const auto& routePrefix = updatedRoute.getPrefix();
-      auto prefix = folly::IPAddress::networkToString(routePrefix);
-      auto ribEntry = ribEntries_.find(routePrefix);
-      std::optional<bgp_thrift::TRibEntry> tRibEntry;
-      if (ribEntry != ribEntries_.end()) {
-        tRibEntry = createBestPathOnlyTRibEntry(*ribEntry);
-      }
-      // nullopt (prefix gone, or no publishable best path) -> withdraw.
-      ribUpdateToFsdb.emplace(std::move(prefix), std::move(tRibEntry));
-    }
-
-    fsdbSyncer_->updateRibMap(std::move(ribUpdateToFsdb));
-  }
-
-  maybeStartFsdbSyncer();
-}
-
 void RibDC::processNexthopResolutionUpdate(
     const NexthopResolutionUpdate& nexthopResolutionUpdate) noexcept {
   /*
@@ -1341,21 +1304,20 @@ std::pair<bool, bool> RibDC::runBestPathSelection(RibEntry& entry) noexcept {
   return result;
 }
 
-void RibDC::onPrepareFibProgrammingComplete() noexcept {
+void RibDC::onPrepareFibProgrammingComplete(bool fullSync) noexcept {
   /*
-   * Publish the device partial-drain state whenever it is pending: once at
-   * startup (partialDrainPublishPending_ is constructed true, so the baseline
-   * is published on the first completed pass — a never-drained device reports a
-   * positive is_partially_drained=false instead of leaving the subtree absent)
-   * and thereafter on each drain transition. The first pass runs before the
-   * syncer starts, but the write is buffered in the syncer's state tree and
-   * flushed by its initial sync on connect, so no separate post-start seed is
-   * needed. Clear the pending bit only once a publish actually lands —
-   * publishPartialDrainState() no-ops when the feature gflag is off or no
-   * syncer is wired, so a disabled feature never consumes the pending publish.
+   * The initial pending value publishes an explicit not-drained baseline
+   * instead of leaving the subtree absent. FsdbSyncer buffers this update
+   * before start(), then includes it in the first atomic /bgp snapshot.
    */
   if (partialDrainPublishPending_ && publishPartialDrainState()) {
     partialDrainPublishPending_ = false;
+  }
+
+  if (fullSync && fsdbSyncer_ && !fsdbSyncerStarted_) {
+    XLOG(INFO, "Starting FsdbSyncer after initial full RIB computation");
+    fsdbSyncer_->start();
+    fsdbSyncerStarted_ = true;
   }
 }
 
@@ -1674,32 +1636,6 @@ RibDC::createTRibEntryWithFilter(
   }
   tRibEntry.rib_version() = ribEntry.getRibVersion();
 
-  return tRibEntry;
-}
-
-std::optional<TRibEntry> RibDC::createBestPathOnlyTRibEntry(
-    const std::pair<const folly::CIDRNetwork, facebook::bgp::RibEntry>& entry) {
-  const auto& ribEntry = entry.second;
-
-  /*
-   * Publish best_path iff the best path exists, is in the selected multipath
-   * set, and CPS native criteria are not violated -- matching exactly when the
-   * full builder sets best_path in createTRibEntryWithFilter. Otherwise return
-   * nullopt so the caller withdraws the prefix rather than publishing a
-   * prefix-only entry the FSDB best-path consumer would treat as a withdraw.
-   */
-  const auto& bestpath = ribEntry.getBestPath();
-  if (!bestpath || !bestpath->pathIdToSend.has_value() ||
-      !ribEntry.getMultipaths().contains(bestpath->pathIdToSend.value()) ||
-      computeFailedCpsNativeCriteria(ribEntry)) {
-    return std::nullopt;
-  }
-
-  TRibEntry tRibEntry;
-  tRibEntry.prefix() = buildTPrefix(entry.first);
-  auto tPath = toTBgpPath(bestpath, ribEntry.getMultipathWeightedNexthops());
-  tPath.is_best_path() = true;
-  tRibEntry.best_path() = std::move(tPath);
   return tRibEntry;
 }
 
