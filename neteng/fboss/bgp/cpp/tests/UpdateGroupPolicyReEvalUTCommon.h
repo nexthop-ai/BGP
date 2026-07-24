@@ -167,6 +167,11 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
         pgIt->second.egress_policy_name().has_value()) {
       egressPolicyName = *pgIt->second.egress_policy_name();
     }
+    // A per-peer egress override takes precedence over the peer group's policy.
+    auto peerConfig = config->getConfigOfAPeer(peerId.peerAddr);
+    if (peerConfig && peerConfig->egressPolicyName.has_value()) {
+      egressPolicyName = peerConfig->egressPolicyName;
+    }
 
     auto adjRibOutGroup = std::make_shared<AdjRibOutGroup>(evb, peerGroupName);
     auto adjRib = std::make_shared<AdjRib>(
@@ -412,7 +417,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   void drainOne(TestContext& ctx, const BgpPeerId& peerId) {
     auto queue = ctx.adjRibs.at(peerId)->boundedAdjRibOutQueue_;
     XLOGF(
-        INFO,
+        DBG5,
         "drainOne for peer {}: queue size={}",
         peerId.peerAddr.str(),
         queue->size());
@@ -426,7 +431,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
             folly::coro::timeout(queue->pop(), std::chrono::seconds(2))));
     if (result.hasException()) {
       XLOGF(
-          INFO,
+          DBG5,
           "drainOne for peer {}: timed out, nothing to pop",
           peerId.peerAddr.str());
     }
@@ -441,7 +446,7 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
       ++popped;
     }
     XLOGF(
-        INFO,
+        DBG5,
         "drainQueue for peer {}: initial size={}, popped={}",
         peerId.peerAddr.str(),
         initialSize,
@@ -1221,6 +1226,19 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   }
 
   /*
+   * Run PeerManager::processDetachedPeerEgressPolicyReEvaluation (private) for
+   * a single peer to completion on the evb.
+   */
+  void processDetachedPeerEgressPolicyReEvaluationOnEvb(
+      TestContext& ctx,
+      const std::shared_ptr<AdjRib>& adjRib) {
+    auto& evb = ctx.peerMgr->getEventBase();
+    evb.runInEventBaseThreadAndWait([&]() {
+      ctx.peerMgr->processDetachedPeerEgressPolicyReEvaluation(adjRib);
+    });
+  }
+
+  /*
    * Drain all peers and poll until every change-list consumer for the group has
    * reached the end of the change list (null marker): the group consumer (which
    * serves the in-sync peers) and each detached peer's own consumer. Draining
@@ -1547,7 +1565,8 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
   TestContext setUpGroups(
       const std::vector<std::pair<std::string, int>>& groupSpecs,
       bool initialDumpCompleted = true,
-      const std::string& egressPolicy = kPNameMatchNoAdvtDeny) {
+      const std::string& egressPolicy = kPNameMatchNoAdvtDeny,
+      const std::map<int, std::string>& perPeerEgressOverride = {}) {
     auto policies = buildPolicies();
 
     auto config = getConfig(
@@ -1585,6 +1604,10 @@ class UpdateGroupPolicyReEvalUTBase : public PeerManagerTestFixture {
         peer.next_hop6() = kV6Nexthop1.str();
         peer.remote_as_4_byte() = kAsn1;
         peer.peer_group_name() = peerGroupName;
+        auto ovrIt = perPeerEgressOverride.find(idx);
+        if (ovrIt != perPeerEgressOverride.end()) {
+          peer.egress_policy_name() = ovrIt->second;
+        }
         thriftConfig.peers()->push_back(std::move(peer));
         peerAssignments.emplace_back(idx, peerGroupName);
       }

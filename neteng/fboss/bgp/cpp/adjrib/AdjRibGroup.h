@@ -425,6 +425,19 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
       const std::shared_ptr<const BgpPath>& oldPath,
       const std::shared_ptr<const BgpPath>& newPath,
       bool isNexthopSetByPolicy = false) {
+    /*
+     * The packing list is the group's send queue for its in-sync peers.
+     *
+     * This is still reached with zero in-sync peers: a group can have members
+     * but nobody in sync (all detached or blocked) and yet still process
+     * shadow-RIB entries -- e.g. an egress policy re-evaluation walk, or
+     * consuming its change list -- to keep the group's RIB-OUT and consumer
+     * marker current so detached peers can catch up against it. With no in-sync
+     * peer to send to, skip updating the packing list.
+     */
+    if (numInSyncPeers_ == 0) {
+      return;
+    }
     tryUpdateAttrToPrefixMapImpl(
         prefixPathId,
         oldPath,
@@ -758,13 +771,21 @@ class AdjRibOutGroup : public std::enable_shared_from_this<AdjRibOutGroup> {
   /*
    * High-level method that transfers per-peer RIB-OUT entries for a set of
    * peers to the new group, cleans up this group's bitmaps and tracking state,
-   * and registers each peer with the new group.
-   * Change list consumer deactivation/activation is handled outside of
-   * movePeers by the caller.
+   * and registers each peer with the new group as a detached peer.
+   *
+   * movePeers itself schedules no coroutines -- it is a pure state/RIB-OUT
+   * move, so synchronous callers (unit tests) can pass no callback and move
+   * peers without spawning work. Reactivating a moved peer (so it drains and
+   * rejoins the new group) is the caller's responsibility, injected via the
+   * optional onPeerMoved hook: it runs once per moved peer after the whole
+   * batch is re-homed. The egress re-eval sweep passes a hook that re-evaluates
+   * (policy changed) or reactivates (policy unchanged) each moved peer.
    */
   void movePeers(
       const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
-      const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept;
+      const std::shared_ptr<AdjRibOutGroup>& newGroup,
+      const std::function<void(const std::shared_ptr<AdjRib>&)>& onPeerMoved =
+          {}) noexcept;
 
   /*
    * COPY this group's group-owned entries to newGroup's group owner key (they

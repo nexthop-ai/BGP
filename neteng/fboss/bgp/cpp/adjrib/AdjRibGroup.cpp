@@ -797,6 +797,26 @@ void AdjRibOutGroup::reEvaluateSyncPeersEgressPolicy() {
 
   walkAndProcessShadowRib(false /* sendWithEoR */);
 
+  /*
+   * Consume the change list to the tail after the full walk so the group's
+   * RIB-OUT reflects the latest shadow RIB and the consumer marker is advanced
+   * to the end. A detached peer bounded by the group marker can then catch up
+   * to the tail too.
+   *
+   * These change-list entries are not routes that arrived during the walk --
+   * the walk is uninterrupted, so nothing is added mid-walk. They are entries
+   * that were already pending on this group's consumer before the
+   * re-evaluation. The walk reads the shadow RIB directly and does not advance
+   * the consumer marker, so those already-present entries -- whose latest state
+   * the walk has already applied -- remain on the list and are drained here
+   * purely to move the marker to the tail.
+   */
+  if (changeListConsumer_) {
+    changeListConsumer_->iterateChanges();
+  }
+
+  /* At this point, the group RIB-OUT is completely up to date with the new
+   * policy. */
   XLOGF(
       INFO,
       "Group {}: Finished group RIB walk for egress policy re-evaluation with {} in-sync peers",
@@ -2818,7 +2838,9 @@ void AdjRibOutGroup::movePeerMaterializedRibOutLiteEntries(
 
 void AdjRibOutGroup::movePeers(
     const std::vector<std::shared_ptr<AdjRib>>& peersToMove,
-    const std::shared_ptr<AdjRibOutGroup>& newGroup) noexcept {
+    const std::shared_ptr<AdjRibOutGroup>& newGroup,
+    const std::function<void(const std::shared_ptr<AdjRib>&)>&
+        onPeerMoved) noexcept {
   XLOGF(
       INFO,
       "Group {}: Moving {} peer(s) to group {}",
@@ -2880,6 +2902,10 @@ void AdjRibOutGroup::movePeers(
     adjRib->setAdjRibFlag(AdjRib::DETACHED_ON_REGISTRATION);
 
     newGroup->detachedPeers_.insert(adjRib);
+
+    if (onPeerMoved) {
+      onPeerMoved(adjRib);
+    }
   }
 }
 

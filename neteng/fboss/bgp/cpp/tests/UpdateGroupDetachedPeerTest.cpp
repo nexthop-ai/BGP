@@ -326,6 +326,16 @@ class UpdateGroupDetachedPeerTest : public ::testing::Test {
     return adjRib;
   }
 
+  /*
+   * Register a real in-sync peer at the given bit so the group's packing list
+   * accepts entries (the group only queues when it has an in-sync peer).
+   */
+  std::shared_ptr<AdjRib> addInSyncPeer(uint64_t bit) {
+    auto adjRib = createAndRegisterPeer(bit);
+    group_->markPeerInSync(adjRib);
+    return adjRib;
+  }
+
   std::unique_ptr<folly::EventBase> evb_;
   std::shared_ptr<AdjRibOutGroup> group_;
   std::vector<std::shared_ptr<AdjRib>> peers_;
@@ -447,6 +457,9 @@ TEST_F(UpdateGroupDetachedPeerTest, MarkPeerInSyncSetsSyncBit) {
 TEST_F(UpdateGroupDetachedPeerTest, ClonePackingListCreatesDeepCopy) {
   auto adjRib = createAndRegisterPeer(0);
 
+  // The group only queues to its packing list when it has an in-sync peer.
+  addInSyncPeer(1);
+
   // Populate group's packing list with one entry
   auto attrs = std::make_shared<BgpPath>(BgpPathFields());
   attrs->setLocalPref(100);
@@ -501,6 +514,9 @@ TEST_F(UpdateGroupDetachedPeerTest, ClonePackingListCreatesDeepCopy) {
 
 TEST_F(UpdateGroupDetachedPeerTest, ClonedPackingListContainsAllEntries) {
   auto adjRib = createAndRegisterPeer(0);
+
+  // The group only queues to its packing list when it has an in-sync peer.
+  addInSyncPeer(1);
 
   // Populate group's packing list with multiple attr groups
   auto attrs1 = std::make_shared<BgpPath>(BgpPathFields());
@@ -1050,7 +1066,10 @@ TEST_F(UpdateGroupDetachedPeerTest, IsDFPReturnsTrueWhenAllConditionsMet) {
           fmt::format(
               PeerStats::kPeerTableVersion, kEbbPlatform, kBgpcppTag, "")));
 
-  // Condition 3: group's packing list is non-empty
+  // Condition 3: group's packing list is non-empty. The group only queues to
+  // its packing list when it has an in-sync peer, so add one (the peer under
+  // test at bit 0 stays detached).
+  addInSyncPeer(1);
   auto attrs = std::make_shared<BgpPath>(BgpPathFields());
   attrs->setLocalPref(100);
   std::shared_ptr<const BgpPath> constAttrs = attrs;
@@ -1070,7 +1089,8 @@ TEST_F(UpdateGroupDetachedPeerTest, IsDFPReturnsFalseWhenPLNotEmpty) {
   group_->setLastSeenRibVersion(42);
   adjRib->setLastSeenRibVersion(42);
 
-  // Non-empty group PL
+  // Non-empty group PL (requires an in-sync peer to queue to the packing list).
+  addInSyncPeer(1);
   auto attrs = std::make_shared<BgpPath>(BgpPathFields());
   std::shared_ptr<const BgpPath> constAttrs = attrs;
   const folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
@@ -1204,7 +1224,8 @@ TEST_F(
   adjRib->registerDetachedConsumerAtGroupPosition(
       changeTracker, groupConsumer, addPathBitmap, nonAddPathBitmap);
 
-  // Non-empty detached PL
+  // Non-empty detached PL (requires an in-sync peer to queue to the group PL).
+  addInSyncPeer(1);
   auto attrs = std::make_shared<BgpPath>(BgpPathFields());
   std::shared_ptr<const BgpPath> constAttrs = attrs;
   const folly::CIDRNetwork prefix{folly::IPAddress("10.0.0.0"), 24};
@@ -1414,6 +1435,9 @@ TEST_F(UpdateGroupDetachedPeerTest, ActivateDFPTransitionsViaIsDFPPath) {
   group_->setLastSeenRibVersion(42);
   adjRib->setLastSeenRibVersion(42);
   adjRib->setDetachedRibVersion(42);
+  // The group only queues to its packing list when it has an in-sync peer (the
+  // peer under test at bit 0 stays detached).
+  addInSyncPeer(1);
   auto attrs = std::make_shared<BgpPath>(BgpPathFields());
   attrs->setLocalPref(100);
   std::shared_ptr<const BgpPath> constAttrs = attrs;

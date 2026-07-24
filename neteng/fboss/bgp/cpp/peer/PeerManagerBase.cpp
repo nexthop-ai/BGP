@@ -4174,46 +4174,52 @@ PeerManagerBase::processUpdateGroupsEgressPolicyReevaluation() {
       allAffectedGroups.insert(sourceGroup);
 
       /*
-       * Detach the peers and move their materialized RIB-OUTs and states
-       * to the targetGroup.
+       * Detach the peers and move their materialized RIB-OUTs and states to the
+       * targetGroup. movePeers is a pure move; it does not arm the detached
+       * consume timer, so each moved peer would otherwise be stranded in
+       * DETACHED_INIT_DUMP with no way to resume consuming or rejoin. Pass an
+       * onPeerMoved hook that reactivates each peer once the batch is re-homed:
+       *   - egress policy changed: full per-peer re-evaluation (walk the shadow
+       *     RIB under the new policy, consume the CL to the end); this also
+       *     activates detached mode processing.
+       *   - egress policy unchanged: no re-walk needed (movePeers already
+       *     carried over the materialized RIB-OUT), just re-activate detached
+       *     mode processing so the peer resumes in the target group.
+       *
+       * A peer movePeers left DETACHED_BLOCKED is intentionally NOT activated:
+       * its queue is full, so it must not send until it unblocks; its in-flight
+       * push re-activates it via markPeerUnblocked once the queue drains.
        */
       sourceGroup->detachPeers(
           adjRibsToMove, AdjRibOutGroup::DetachReason::Policy);
-      sourceGroup->movePeers(adjRibsToMove, targetGroup);
-
-      /*
-       * Check if this set of peers needs policy re-evaluation and trigger
-       * re-evaluation (i.e. updating the RIB-OUT with the new policy for
-       * items not on the changelist).
-       */
-      if (sourceGroup->getGroupKey().egressPolicyName !=
-          newKey.egressPolicyName) {
-        /* Trigger policy re-evaluation if needed on this set of AdjRibs. */
-        for (const auto& adjRib : adjRibsToMove) {
-          if (isRibDumpScheduledForAdjRib(adjRib)) {
-            XLOGF(
-                DBG1,
-                "Peer {}: cancelling scheduled rib dump before policy re-eval dump",
-                adjRib->getPeerName());
-            cancelRibDumpForAdjRib(adjRib);
-          }
-          processRibDumpReq(
-              adjRib,
-              adjRib->sendAddPath(),
-              adjRib->egressEoRsPending() /* sendWithEoR */);
-          /*
-           * The detached consumer was registered when the peer detached
-           * (detachPeer); processRibDumpReq only refreshes RIB-OUT. Kick off
-           * detached-mode processing so the peer drains and rejoins, unless it
-           * is blocked -- a blocked peer resumes via markPeerUnblocked once its
-           * queue drains.
-           */
-          if (adjRib->getPeerState() != PeerUpdateState::DETACHED_BLOCKED) {
-            adjRib->activateDetachedModeProcessing();
-          }
-          adjRib->clearPendingEgressPolicyUpdate();
-        }
-      }
+      const bool peersNeedPolicyReEval =
+          sourceGroup->getGroupKey().egressPolicyName !=
+          newKey.egressPolicyName;
+      sourceGroup->movePeers(
+          adjRibsToMove,
+          targetGroup,
+          [this, peersNeedPolicyReEval](const std::shared_ptr<AdjRib>& adjRib) {
+            /*
+             * Policy changed: re-evaluate (walk the shadow RIB under the new
+             * policy, consume the CL to the end). This only refreshes RIB-OUT;
+             * it does not activate, so control falls through to the activation
+             * below.
+             */
+            if (peersNeedPolicyReEval) {
+              processDetachedPeerEgressPolicyReEvaluation(adjRib);
+            }
+            /*
+             * Activate every moved peer so it drains and rejoins the target
+             * group, whether it was re-evaluated (policy changed) or carried
+             * over (policy unchanged). A DETACHED_BLOCKED peer is excluded: its
+             * queue is full, so it must not send until markPeerUnblocked
+             * re-activates it once the in-flight push drains.
+             */
+            if (adjRib->getPeerState() != PeerUpdateState::DETACHED_BLOCKED) {
+              adjRib->activateDetachedModeProcessing();
+            }
+            adjRib->clearPendingEgressPolicyUpdate();
+          });
     }
 
     allAffectedGroups.insert(targetGroup);
@@ -4340,6 +4346,37 @@ folly::coro::Task<void> PeerManagerBase::processRibDumpReqForEgressPolicyUpdate(
   adjRib->clearPendingEgressPolicyUpdate(); // Clear flag after completion
 }
 
+void PeerManagerBase::processDetachedPeerEgressPolicyReEvaluation(
+    const std::shared_ptr<AdjRib>& adjRib) {
+  /*
+   * Cancel any rib dump already scheduled for the peer and run the
+   * re-evaluation dump inline so it completes within this event-loop turn -- a
+   * deferred walk leaves a window where the peer could rejoin with stale
+   * (old-policy) entries and surface discrepancies during the collapse.
+   */
+  if (isRibDumpScheduledForAdjRib(adjRib)) {
+    XLOGF(
+        INFO,
+        "Peer {}: cancelling scheduled rib dump to run egress policy "
+        "re-evaluation inline",
+        adjRib->getPeerName());
+    cancelRibDumpForAdjRib(adjRib);
+  }
+  processRibDumpReq(
+      adjRib,
+      adjRib->sendAddPath(),
+      adjRib->egressEoRsPending() /* sendWithEoR */);
+
+  /*
+   * Consume the peer's change list to the tail so its RIB-OUT reflects the full
+   * shadow RIB plus every pending change, completing the re-evaluation in this
+   * turn rather than leaving items for the async consume timer.
+   */
+  if (auto consumer = adjRib->getChangeListConsumer()) {
+    consumer->iterateChanges();
+  }
+}
+
 void PeerManagerBase::processGroupEgressPolicyReEvaluation(
     std::shared_ptr<AdjRibOutGroup> group) {
   [[maybe_unused]] ScopedProfile profile(
@@ -4369,26 +4406,13 @@ void PeerManagerBase::processGroupEgressPolicyReEvaluation(
           "Group {}: Re-evaluating detached peer {}",
           group->getGroupDescriptor(),
           adjRib->getPeerName());
-
-      if (isRibDumpScheduledForAdjRib(adjRib)) {
-        XLOGF(
-            INFO,
-            "Group {}: Cancelling scheduled rib dump for peer {} to run egress "
-            "policy re-evaluation inline",
-            group->getAdjRibGroupName(),
-            adjRib->getPeerName());
-        cancelRibDumpForAdjRib(adjRib);
-      }
-      processRibDumpReq(
-          adjRib,
-          adjRib->sendAddPath(),
-          adjRib->egressEoRsPending() /* sendWithEoR */);
+      processDetachedPeerEgressPolicyReEvaluation(adjRib);
       /*
-       * The detached consumer was registered when the peer detached
-       * (detachPeer); processRibDumpReq only refreshes RIB-OUT. Kick off
-       * detached-mode processing so the peer drains and rejoins, unless it is
-       * blocked -- a blocked peer resumes via markPeerUnblocked once its queue
-       * drains.
+       * Activate detached mode processing so the peer schedules coroutine to
+       * sends its updates and eventually rejoins.
+       * A DETACHED_BLOCKED peer is intentionally left alone: its queue is full,
+       * so it must not send until it unblocks, at which point markPeerUnblocked
+       * re-activates it.
        */
       if (adjRib->getPeerState() != PeerUpdateState::DETACHED_BLOCKED) {
         adjRib->activateDetachedModeProcessing();

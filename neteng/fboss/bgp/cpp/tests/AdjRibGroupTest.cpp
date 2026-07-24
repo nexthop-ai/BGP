@@ -120,6 +120,17 @@ class AdjRibGroupTest : public ::testing::Test {
         std::make_shared<std::atomic<bool>>(false));
   }
 
+  /*
+   * Register a real in-sync peer at the given bit so the group's packing list
+   * accepts entries (the group only queues when it has an in-sync peer).
+   */
+  std::shared_ptr<AdjRib> addInSyncPeer(uint64_t bit = 0) {
+    auto adjRib = createMinimalAdjRib(static_cast<uint8_t>(bit + 1));
+    adjRibOutGroup_->setBitToAdjRibForTesting(bit, adjRib);
+    adjRibOutGroup_->markPeerInSync(adjRib);
+    return adjRib;
+  }
+
   std::unique_ptr<folly::EventBase> evb_;
   std::shared_ptr<ChangeTracker<ShadowRibEntry>> changeListTracker_;
   std::shared_ptr<AdjRibOutGroup> adjRibOutGroup_;
@@ -764,6 +775,18 @@ class AdjRibGroupPackingFixture : public AdjRibGroupTest {
     auto attrs2 = std::make_shared<BgpPath>(BgpPathFields());
     attrs2->setLocalPref(200);
     announcementAttrs2_ = attrs2;
+  }
+
+  /*
+   * Packing tests exercise the group packing list, which only accepts entries
+   * when the group has an in-sync peer. Add one on every group creation.
+   */
+  void createAdjRibOutGroup(
+      const std::string& groupName,
+      uint64_t groupId = 0,
+      const UpdateGroupKey& groupKey = UpdateGroupKey{}) {
+    AdjRibGroupTest::createAdjRibOutGroup(groupName, groupId, groupKey);
+    adjRibOutGroup_->setSyncBitForTesting(0);
   }
 
   std::shared_ptr<const BgpPath> withdrawalAttrs_{nullptr};
@@ -1413,6 +1436,8 @@ class AdjRibGroupWithdrawalFixture : public AdjRibGroupTest {
   void SetUp() override {
     AdjRibGroupTest::SetUp();
     createAdjRibOutGroup("test_group", 42);
+    // The group only queues to its packing list when it has an in-sync peer.
+    addInSyncPeer();
 
     // Create test attributes
     auto attrs = std::make_shared<BgpPath>(BgpPathFields());
@@ -2065,6 +2090,8 @@ class AdjRibGroupDistributionFixture : public AdjRibGroupTest {
   void SetUp() override {
     AdjRibGroupTest::SetUp();
     createAdjRibOutGroup("test_group", 42, createDefaultGroupKey());
+    // The group only queues to its packing list when it has an in-sync peer.
+    addInSyncPeer();
   }
 };
 
@@ -2787,8 +2814,7 @@ TEST_F(
   key.afiIpv4Negotiated = true;
   key.afiIpv6Negotiated = false;
 
-  adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
-      *evb_, "test_group", 1, true /* enableUpdateGroup */, key);
+  createAdjRibOutGroup("test_group", 1, key);
 
   // Create IPv4 announcement entry (supported AFI)
   RibOutAnnouncementEntry entryV4(
@@ -2833,8 +2859,7 @@ TEST_F(
   key.afiIpv4Negotiated = true;
   key.afiIpv6Negotiated = true;
 
-  adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
-      *evb_, "test_group", 1, true /* enableUpdateGroup */, key);
+  createAdjRibOutGroup("test_group", 1, key);
 
   // Create IPv4 and IPv6 announcement entries
   RibOutAnnouncementEntry entryV4(
@@ -2896,8 +2921,7 @@ TEST_F(
   key.afiIpv4Negotiated = false;
   key.afiIpv6Negotiated = true;
 
-  adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(
-      *evb_, "test_group", 1, true /* enableUpdateGroup */, key);
+  createAdjRibOutGroup("test_group", 1, key);
 
   // Create IPv4 announcement entry (unsupported AFI)
   RibOutAnnouncementEntry entryV4(

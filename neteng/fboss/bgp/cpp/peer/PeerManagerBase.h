@@ -642,6 +642,15 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
   void processGroupEgressPolicyReEvaluation(
       std::shared_ptr<AdjRibOutGroup> group);
 
+  /*
+   * Re-evaluate a single peer's egress policy inline: cancel any scheduled rib
+   * dump, walk the shadow RIB, then consume the peer's change list to the end
+   * so its RIB-OUT is fully rebuilt within this event-loop turn. Does NOT clear
+   * the peer's pending-egress-policy flag -- callers do that.
+   */
+  void processDetachedPeerEgressPolicyReEvaluation(
+      const std::shared_ptr<AdjRib>& adjRib);
+
   /* Helper method to distribute RibOutAnnouncement to all adjRibs */
   void distributeRibOutAnnouncementToAdjRibs(
       const RibOutAnnouncement& announcement);
