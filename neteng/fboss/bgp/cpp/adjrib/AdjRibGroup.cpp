@@ -3735,7 +3735,17 @@ std::vector<std::shared_ptr<AdjRib>> AdjRibOutGroup::tryAcceptPeersToGroup(
        * the next collapse attempt only flags entries newer than this point.
        * Without this, the same group-only entries keep being detected as
        * discrepancies on every rejoin attempt (infinite loop).
+       *
+       * If the peer had no non-zero version yet (a never-in-sync peer that was
+       * not counted in numPeersDetachedAfterJoin_), giving it one makes it a
+       * counted detached-after-join peer, so increment now to stay balanced
+       * against the decrement its eventual rejoin/teardown will perform (both
+       * are guarded on detachedRibVersion > 0). Skipped when it already had a
+       * version -- it was already counted.
        */
+      if (peer->getDetachedRibVersion() == 0) {
+        incrementPeersDetachedAfterJoin();
+      }
       peer->setDetachedRibVersion(lastSeenRibVersion_);
       peer->reschedulePackingTimers();
       peer->clearAdjRibFlag(AdjRib::RIB_OUT_DISCREPANCY);

@@ -3180,9 +3180,15 @@ TEST_F(
    * the group), all erased on collapse.
    */
   auto dspFull = createAndRegisterPeer(4);
+  /*
+   * Establish a detached-after-join peer via the production path: detachPeer
+   * marks it detached AND counts it in numPeersDetachedAfterJoin_ (balanced
+   * against the decrement its rejoin performs), setting detachedRibVersion to
+   * the group's version. Then present it as a ready-to-rejoin DSP.
+   */
+  group_->markPeerInSync(dspFull);
+  group_->detachPeer(dspFull, AdjRibOutGroup::DetachReason::Blocking);
   dspFull->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
-  dspFull->setDetachedRibVersion(42);
-  group_->markPeerDetached(dspFull);
   setUpReadyPeerConsumer(dspFull);
   for (const auto& prefix : prefixes) {
     group_
@@ -3197,13 +3203,16 @@ TEST_F(
 
   /*
    * 2 DSPs needing a PARTIAL collapse: one per-peer copy (kV4Prefix1) plus two
-   * already-shared group entries (ribVersion 10 <= detachedRibVersion 42).
+   * already-shared group entries (ribVersion 10 <= the peer's
+   * detachedRibVersion, which detachPeer set to the group's version).
    */
   for (uint64_t bit : {5, 6}) {
     auto dsp = createAndRegisterPeer(bit);
+    // Detached-after-join via the production path (detachPeer counts it), then
+    // presented as a ready-to-rejoin DSP.
+    group_->markPeerInSync(dsp);
+    group_->detachPeer(dsp, AdjRibOutGroup::DetachReason::Blocking);
     dsp->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
-    dsp->setDetachedRibVersion(42);
-    group_->markPeerDetached(dsp);
     setUpReadyPeerConsumer(dsp);
     group_
         ->addToLiteTree(
@@ -3413,9 +3422,15 @@ TEST_F(
    * the group), all erased on collapse.
    */
   auto dspFull = createAndRegisterPeer(4);
+  /*
+   * Establish a detached-after-join peer via the production path: detachPeer
+   * marks it detached AND counts it in numPeersDetachedAfterJoin_ (balanced
+   * against the decrement its rejoin performs), setting detachedRibVersion to
+   * the group's version. Then present it as a ready-to-rejoin DSP.
+   */
+  group_->markPeerInSync(dspFull);
+  group_->detachPeer(dspFull, AdjRibOutGroup::DetachReason::Blocking);
   dspFull->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
-  dspFull->setDetachedRibVersion(42);
-  group_->markPeerDetached(dspFull);
   setUpReadyPeerConsumer(dspFull);
   for (const auto& prefix : prefixes) {
     group_
@@ -3430,13 +3445,16 @@ TEST_F(
 
   /*
    * 2 DSPs needing a PARTIAL collapse: one per-peer copy (kV4Prefix1) plus two
-   * already-shared group entries (ribVersion 10 <= detachedRibVersion 42).
+   * already-shared group entries (ribVersion 10 <= the peer's
+   * detachedRibVersion, which detachPeer set to the group's version).
    */
   for (uint64_t bit : {5, 6}) {
     auto dsp = createAndRegisterPeer(bit);
+    // Detached-after-join via the production path (detachPeer counts it), then
+    // presented as a ready-to-rejoin DSP.
+    group_->markPeerInSync(dsp);
+    group_->detachPeer(dsp, AdjRibOutGroup::DetachReason::Blocking);
     dsp->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
-    dsp->setDetachedRibVersion(42);
-    group_->markPeerDetached(dsp);
     setUpReadyPeerConsumer(dsp);
     group_
         ->addToLiteTree(
@@ -4094,6 +4112,51 @@ TEST_F(
 
   // Packing timers rescheduled
   EXPECT_TRUE(adjRib0->changeListConsumeTimer_->isScheduled());
+}
+
+/*
+ * A never-in-sync DSP (DETACHED_ON_REGISTRATION, detachedRibVersion 0, so not
+ * yet counted in numPeersDetachedAfterJoin_) whose rejoin collapse hits a
+ * discrepancy is given a non-zero detachedRibVersion. It must be counted at
+ * that moment: otherwise the decrement on its eventual rejoin/teardown (guarded
+ * on detachedRibVersion > 0) would underflow the counter.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    RejoinDiscrepancyCountsPreviouslyUncountedPeer) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  setUpJoinedRunningPeer(adjRib1, 1);
+  group_->setLastSeenRibVersion(100);
+
+  // Never-in-sync peer: DETACHED_ON_REGISTRATION with detachedRibVersion 0,
+  // caught up (ready to rejoin).
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_READY_TO_JOIN);
+  adjRib0->setAdjRibFlag(AdjRib::DETACHED_ON_REGISTRATION);
+  group_->markPeerDetached(adjRib0);
+  setUpReadyPeerConsumer(adjRib0);
+  ASSERT_EQ(adjRib0->getDetachedRibVersion(), 0);
+
+  // A group-only entry the peer never saw -> collapse flags a discrepancy.
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+  auto* entry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+  entry->setPostAttr(attrs);
+  entry->setRibVersion(15);
+
+  ASSERT_EQ(group_->getNumPeersDetachedAfterJoin(), 0);
+
+  auto acceptedPeers = group_->tryAcceptPeersToGroup({adjRib0});
+
+  // Discrepancy: not accepted, kept DETACHED_RUNNING, version bumped to
+  // group's.
+  EXPECT_TRUE(acceptedPeers.empty());
+  EXPECT_EQ(adjRib0->getPeerState(), PeerUpdateState::DETACHED_RUNNING);
+  EXPECT_EQ(adjRib0->getDetachedRibVersion(), group_->getLastSeenRibVersion());
+
+  // The previously-uncounted peer is now counted (increment on discrepancy).
+  EXPECT_EQ(group_->getNumPeersDetachedAfterJoin(), 1);
 }
 
 /*
