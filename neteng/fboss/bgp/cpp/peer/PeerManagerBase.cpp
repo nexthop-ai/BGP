@@ -3497,7 +3497,8 @@ GrLoadResult PeerManagerBase::readGrState() const noexcept {
 
 void PeerManagerBase::applyRouteFilterPolicy(
     std::unique_ptr<RouteFilterPolicy> policy,
-    bool forceUpdate) noexcept {
+    bool forceUpdate,
+    bool applyGoldenPrefixPolicy) noexcept {
   if (!forceUpdate && routeFilterPolicy_ && policy &&
       routeFilterPolicy_->getVersion() > policy->getVersion()) {
     XLOGF(
@@ -3543,7 +3544,13 @@ void PeerManagerBase::applyRouteFilterPolicy(
     if (adjRib->isEgressPolicyUpdateRequired()) {
       egressAffectedCount++;
     }
-    setGoldenPrefixPolicy(adjRib);
+    /*
+     * clearIngressEgressRouteFiltersPolicy reuses this method to clear route
+     * filters but must not touch the golden prefix policy, so it opts out.
+     */
+    if (applyGoldenPrefixPolicy) {
+      setGoldenPrefixPolicy(adjRib);
+    }
   }
 
   // Record stats for number of peers affected by the route filter policy
@@ -3579,8 +3586,36 @@ void PeerManagerBase::setRouteFilterPolicy(
       });
 }
 
+/*
+ * Clears every peer's ingress and egress route-filter statements.
+ *
+ * Non-update-group case:
+ *   - Clear each adjRib's statement directly, then issue a per-peer rib dump
+ *     (processRibDumpReqCoro) for peers past initial announcement.
+ *   - routeFilterPolicy_ is left intact.
+ *
+ * Update-group case:
+ *   - Route through applyRouteFilterPolicy (directly, since we are already on
+ *     the evb thread) to use the update-group-aware re-eval instead of a raw
+ *     per-peer rib dump, which would corrupt the group's shared accounting.
+ *     applyGoldenPrefixPolicy=false so this only clears route filters and, like
+ *     the non-update-group case, leaves the golden prefix policy untouched.
+ *
+ * Difference:
+ *   - Non-UG: any clear issues a rib dump.
+ *   - UG: a rib dump / group egress re-eval runs only when an egress filter is
+ *     cleared; an ingress-only clear runs just the ingress re-eval, no dump.
+ *   - Non-UG leaves the global routeFilterPolicy_ intact; UG nulls it, so the
+ *     clear persists for peers that connect afterwards.
+ */
 void PeerManagerBase::clearIngressEgressRouteFiltersPolicy() noexcept {
   evb_.runInEventBaseThread([this]() mutable {
+    if (enableUpdateGroup_) {
+      applyRouteFilterPolicy(
+          nullptr, /*forceUpdate=*/false, /*applyGoldenPrefixPolicy=*/false);
+      return;
+    }
+
     std::vector<BgpPeerId> affectedAdjRibs;
     affectedAdjRibs.reserve(adjRibs_.size());
     for (auto& [peerId, adjRib] : adjRibs_) {

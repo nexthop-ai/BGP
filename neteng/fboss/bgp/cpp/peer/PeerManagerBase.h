@@ -969,7 +969,8 @@ class PeerManagerBase : public BgpModuleBase, public MonitoredModule {
    */
   void applyRouteFilterPolicy(
       std::unique_ptr<RouteFilterPolicy> policy,
-      bool forceUpdate) noexcept;
+      bool forceUpdate,
+      bool applyGoldenPrefixPolicy = true) noexcept;
 
   std::tuple<bool, bool> setRouteFilterStatement(
       std::shared_ptr<AdjRib> adjRib) noexcept;

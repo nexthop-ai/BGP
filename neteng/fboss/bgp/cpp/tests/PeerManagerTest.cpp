@@ -65,7 +65,10 @@
   FRIEND_TEST(                                                                 \
       PeerManagerTestFixture, GoldenPrefixesPolicyStatusTestSwitchLimitUnset); \
   FRIEND_TEST(                                                                 \
-      PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest);       \
+      ClearRouteFiltersFixture, ClearIngressEgressRouteFiltersPolicyTest);     \
+  FRIEND_TEST(                                                                 \
+      ClearRouteFiltersWithStmtFixture,                                        \
+      ClearRouteFilterStatementUpdatesAdjRibAndKey);                           \
   FRIEND_TEST(PeerManagerTestFixture, ClearGoldenPrefixesPolicyTest);          \
   FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyVersionCheckTest);   \
   FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyForceUpdateTest);    \
@@ -176,7 +179,10 @@
   FRIEND_TEST(                                                                 \
       PeerManagerTestFixture, GoldenPrefixesPolicyStatusTestSwitchLimitUnset); \
   FRIEND_TEST(                                                                 \
-      PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest);       \
+      ClearRouteFiltersFixture, ClearIngressEgressRouteFiltersPolicyTest);     \
+  FRIEND_TEST(                                                                 \
+      ClearRouteFiltersWithStmtFixture,                                        \
+      ClearRouteFilterStatementUpdatesAdjRibAndKey);                           \
   FRIEND_TEST(PeerManagerTestFixture, ClearGoldenPrefixesPolicyTest);          \
   FRIEND_TEST(PeerManagerTestFixture, SetRouteFilterPolicyVersionCheckTest);   \
   FRIEND_TEST(PeerManagerTestFixture, DisableScubaLoggingTest);                \
@@ -4946,10 +4952,30 @@ INSTANTIATE_TEST_SUITE_P(
     SafeModeTestFixture,
     testing::Bool() /* isSafeModeOn */);
 
+// Parameterized on whether update groups are enabled. The non-update-group path
+// clears each statement and issues per-peer rib dumps directly; the
+// update-group path routes through applyRouteFilterPolicy instead.
+class ClearRouteFiltersFixture : public PeerManagerTestFixture,
+                                 public testing::WithParamInterface<bool> {};
+
 // Verify that PeerManagerBase clear the Ingress Egress Route Filter statements
 // in each adjrib, and trigger RIB Dump
-TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
-  auto config = getConfig(true, true);
+TEST_P(ClearRouteFiltersFixture, ClearIngressEgressRouteFiltersPolicyTest) {
+  const bool enableUpdateGroup = GetParam();
+  auto config = getConfig(
+      /*includeStaticPeer=*/true,
+      /*includeDynamicShivPeer=*/true,
+      /*includeDynamicMonitorPeer=*/false,
+      /*includeDynamicVipInjectorPeer=*/false,
+      /*enableStatefulHa=*/false,
+      /*enableVipServer=*/true,
+      kDefaultEorTimeS,
+      /*enableSubscriberLimit=*/false,
+      /*enableSwitchLimit=*/false,
+      /*applyGoldenPrefixPolicy=*/false,
+      /*bgpFeatures=*/{},
+      /*enableDynamicPolicyEvaluation=*/false,
+      /*enableUpdateGroup=*/enableUpdateGroup);
   auto configManager = std::make_shared<ConfigManager>(config);
   auto peerMgr = std::make_shared<PeerManagerBase>(
       configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
@@ -4982,6 +5008,13 @@ TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
   adjRib2->isSafeModeOn_ = std::make_shared<std::atomic<bool>>(false);
   adjRib2->adjRibOutGroup_ = std::make_shared<AdjRibOutGroup>(evb, "Group2");
 
+  // A golden prefix policy is set on each adjRib; clearing the route filters
+  // must leave it untouched.
+  adjRib1->goldenPrefixPolicy_ = std::make_shared<GoldenPrefixPolicy>(
+      createTGoldenPrefixPolicy({kV4Prefix1}, 2 /* maxSubnets */, {32}));
+  adjRib2->goldenPrefixPolicy_ = std::make_shared<GoldenPrefixPolicy>(
+      createTGoldenPrefixPolicy({kV4Prefix1}, 2 /* maxSubnets */, {32}));
+
   peerMgr->adjRibs_[kPeerId1] = adjRib1;
   peerMgr->adjRibs_[kPeerId2] = adjRib2;
 
@@ -5005,6 +5038,12 @@ TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
     });
   }
 
+  // The route filter clear must not touch the golden prefix policy.
+  evb.runInEventBaseThreadAndWait([&]() {
+    EXPECT_NE(nullptr, adjRib1->goldenPrefixPolicy_);
+    EXPECT_NE(nullptr, adjRib2->goldenPrefixPolicy_);
+  });
+
   peerMgr->markDaemonShutdown();
   sessionMgr->stop();
   peerMgr->stop();
@@ -5012,6 +5051,114 @@ TEST_F(PeerManagerTestFixture, ClearIngressEgressRouteFiltersPolicyTest) {
   sessionMgrThread.join();
   SUCCEED();
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    ClearRouteFiltersFixture,
+    ClearRouteFiltersFixture,
+    testing::Bool() /* enableUpdateGroup */);
+
+// Set a non-null route filter statement, then clear it. Verify the adjRib's
+// statement is dropped and observe whether the update group key changes.
+// Parameterized on {enableUpdateGroup, includeEgressFilter}: scenario (1) is
+// ingress-only, scenario (2) is ingress + egress.
+class ClearRouteFiltersWithStmtFixture
+    : public PeerManagerTestFixture,
+      public testing::WithParamInterface<std::tuple<bool, bool>> {};
+
+TEST_P(
+    ClearRouteFiltersWithStmtFixture,
+    ClearRouteFilterStatementUpdatesAdjRibAndKey) {
+  const bool enableUpdateGroup = std::get<0>(GetParam());
+  const bool includeEgressFilter = std::get<1>(GetParam());
+  auto config = getConfig(
+      /*includeStaticPeer=*/true,
+      /*includeDynamicShivPeer=*/true,
+      /*includeDynamicMonitorPeer=*/false,
+      /*includeDynamicVipInjectorPeer=*/false,
+      /*enableStatefulHa=*/false,
+      /*enableVipServer=*/true,
+      kDefaultEorTimeS,
+      /*enableSubscriberLimit=*/false,
+      /*enableSwitchLimit=*/false,
+      /*applyGoldenPrefixPolicy=*/false,
+      /*bgpFeatures=*/{},
+      /*enableDynamicPolicyEvaluation=*/false,
+      /*enableUpdateGroup=*/enableUpdateGroup);
+  auto configManager = std::make_shared<ConfigManager>(config);
+  auto peerMgr = std::make_shared<PeerManagerBase>(
+      configManager, nullptr, ribInQ_, ribOutQ_, nbrRouteChangeQ_);
+
+  auto globalConfig = config->getBgpGlobalConfig();
+  auto sessionMgr = std::make_shared<SessionManager>(*globalConfig, false);
+  peerMgr->setSessionManager(sessionMgr);
+
+  auto& evb = peerMgr->getEventBase();
+  auto adjRib1 = setupAdjRib(
+      evb,
+      peerMgr->getChangeListTracker(),
+      kPeerId1,
+      AsNum(kAsn1),
+      sessionTerminateBaton_,
+      config);
+  adjRib1->peeringParams_.description = "adjRib1";
+  adjRib1->isSafeModeOn_ = std::make_shared<std::atomic<bool>>(false);
+  // Build the initial group key so we can observe whether clearing the route
+  // filter changes it.
+  adjRib1->buildAndSetUpdateGroupKey();
+
+  peerMgr->adjRibs_[kPeerId1] = adjRib1;
+
+  auto peerMgrThread = peerMgr->runInThread();
+  auto sessionMgrThread = sessionMgr->runInThread();
+
+  rib_policy::TRouteFilterStatement tStmt = includeEgressFilter
+      ? createTRouteFilterStatementWithIngressAndEgressFilters(
+            {kV4Prefix1}, {kV4Prefix2})
+      : createTRouteFilterStatement(
+            {kV4Prefix1}, /*permissive=*/false, /*egress=*/false);
+  rib_policy::TRouteFilterPolicy tPolicy;
+  tPolicy.statements()->emplace("adjRib1", tStmt);
+  tPolicy.version() = 1;
+  peerMgr->setRouteFilterPolicy(std::make_unique<RouteFilterPolicy>(tPolicy));
+
+  // The adjRib now has a non-null route filter statement.
+  WITH_RETRIES({
+    evb.runInEventBaseThreadAndWait(
+        [&]() { EXPECT_EVENTUALLY_NE(nullptr, adjRib1->routeFilterStmt_); });
+  });
+
+  UpdateGroupKey keyBeforeClear;
+  evb.runInEventBaseThreadAndWait(
+      [&]() { keyBeforeClear = adjRib1->getUpdateGroupKey(); });
+
+  peerMgr->clearIngressEgressRouteFiltersPolicy();
+
+  // The route filter statement is dropped from the adjRib in both paths.
+  WITH_RETRIES({
+    evb.runInEventBaseThreadAndWait(
+        [&]() { EXPECT_EVENTUALLY_EQ(nullptr, adjRib1->routeFilterStmt_); });
+  });
+
+  // The update group key is not derived from the route filter statement (the
+  // route filter name is not yet wired into buildUpdateGroupKey), so clearing
+  // the filter -- ingress-only or ingress+egress -- leaves the key unchanged.
+  evb.runInEventBaseThreadAndWait(
+      [&]() { EXPECT_EQ(keyBeforeClear, adjRib1->getUpdateGroupKey()); });
+
+  peerMgr->markDaemonShutdown();
+  sessionMgr->stop();
+  peerMgr->stop();
+  peerMgrThread.join();
+  sessionMgrThread.join();
+  SUCCEED();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ClearRouteFiltersWithStmtFixture,
+    ClearRouteFiltersWithStmtFixture,
+    testing::Combine(
+        testing::Bool() /* enableUpdateGroup */,
+        testing::Bool() /* includeEgressFilter */));
 
 // Verify that PeerManagerBase clear the Golden Prefixes policy in
 // each adjrib.

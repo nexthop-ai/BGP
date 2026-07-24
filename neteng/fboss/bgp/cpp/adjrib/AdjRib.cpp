@@ -653,7 +653,14 @@ void AdjRib::sessionEstablished(
 const UpdateGroupKey& AdjRib::buildAndSetUpdateGroupKey() {
   updateGroupKey_ = UpdateGroupKey::buildUpdateGroupKey(
       egressPolicyName_,
-      "", // TODO: need to pass in route filter statement name
+      /*
+       * The peer's egress route filter statement affects egress output and so
+       * belongs in the update group key, but it is not wired in yet -- we pass
+       * an empty route filter name. As a result, setting or clearing a route
+       * filter does not change the key (and thus does not re-group peers).
+       * TODO: pass in the route filter statement name.
+       */
+      "",
       outDelay_,
       getBgpSessionType(),
       isAfiIpv4Negotiated_,
