@@ -619,6 +619,23 @@ void AdjRib::sessionEstablished(
   sendCoroScheduled_ = false;
 
   /*
+   * A rejoining peer must start with zeroed egress prefix counts; they are
+   * settled to 0 when the peer detaches or unregisters. A non-zero value here
+   * means the accounting leaked, so surface it before clearing.
+   */
+  if (stats_.getPostOutPrefixCount() != 0 ||
+      stats_.getPreOutPrefixCount() != 0) {
+    XLOGF(
+        ERR,
+        "Non-zero egress prefix counts on session establishment for {}: "
+        "postOutPrefixCount={}, preOutPrefixCount={}",
+        getPeerName(),
+        stats_.getPostOutPrefixCount(),
+        stats_.getPreOutPrefixCount());
+  }
+  clearEgressPrefixCounts();
+
+  /*
    * The per-AFI EGRESS_EOR_PENDING_V4/V6 pending flags live in adjRibFlags_
    * and are cleared by resetAdjRibFlags() below.
    */

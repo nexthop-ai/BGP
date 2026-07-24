@@ -4160,6 +4160,63 @@ TEST_F(
 }
 
 /*
+ * Unregistering a detached peer settles its own prefix counts: cleanUp
+ * decrements both for the per-peer diverged entries it erases AND for the
+ * shared (group-owned) entries the peer advertised, so the peer's
+ * pre/postOutPrefixCount return to 0.
+ */
+TEST_F(
+    UpdateGroupDetachLifecycleTest,
+    UnregisterDetachedPeerDecrementsOwnPrefixCounts) {
+  auto adjRib0 = createAndRegisterPeer(0);
+  auto adjRib1 = createAndRegisterPeer(1);
+  // Keep the group non-frozen after adjRib0 is removed.
+  setUpJoinedRunningPeer(adjRib1, 1);
+  group_->setLastSeenRibVersion(100);
+
+  auto groupOwnerKey = group_->getGroupOwnerKey();
+  auto peerOwnerKey = adjRib0->getPeerOwnerKey();
+  auto attrs = std::make_shared<BgpPath>(*buildBgpPathFields(1, 1, 0, 0));
+
+  // Shared, group-owned entry (ribVersion 5 <= detachedRibVersion 100) that the
+  // peer advertised while detached.
+  auto* shared = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix1, groupOwnerKey, kPlaceholderPathID);
+  shared->setPostAttr(attrs);
+  shared->setRibVersion(5);
+
+  // Diverged, per-peer entry the peer advertised.
+  auto* diverged = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix2, peerOwnerKey, kPlaceholderPathID);
+  diverged->setPostAttr(attrs);
+
+  // Detach the peer and give it the counts for both advertised prefixes.
+  group_->markPeerDetached(adjRib0);
+  adjRib0->setPeerState(PeerUpdateState::DETACHED_RUNNING);
+  adjRib0->setDetachedRibVersion(100);
+  // Balances the decrement deactivateDetachedModeProcessing does on unregister.
+  group_->incrementPeersDetachedAfterJoin();
+  // Only postOut feeds the global totalSentPrefixCount; preOut does not.
+  auto totalSentBefore = totalSentPrefixCount;
+  adjRib0->incrementPostOutPrefixCount(true /* isIpv4 */);
+  adjRib0->incrementPostOutPrefixCount(true /* isIpv4 */);
+  adjRib0->incrementPreOutPrefixCount(true /* isIpv4 */);
+  adjRib0->incrementPreOutPrefixCount(true /* isIpv4 */);
+  ASSERT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 2);
+  ASSERT_EQ(adjRib0->getStats().getPreOutPrefixCount(), 2);
+  ASSERT_EQ(totalSentPrefixCount, totalSentBefore + 2);
+
+  group_->unregisterPeer(adjRib0);
+
+  // Both the per-peer (erased) and the shared (left in the group)
+  // advertisements are decremented, so the peer's own counts return to 0 and
+  // its whole postOut contribution is removed from the global.
+  EXPECT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 0);
+  EXPECT_EQ(adjRib0->getStats().getPreOutPrefixCount(), 0);
+  EXPECT_EQ(totalSentPrefixCount, totalSentBefore);
+}
+
+/*
  * Peer detaches as slow peer. Consumer has pending CL items to process
  * → peer is DSP → starts timer-driven CL consumption loop.
  */
@@ -5179,15 +5236,21 @@ TEST_F(
   EXPECT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 3);
   EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 6);
 
-  /* Peer 0 independently advertises one more prefix: own count and global +1.
-   */
+  /* Peer 0 independently advertises one more prefix (kV4Prefix4) as a per-peer
+   * diverged entry: own count and global +1. */
+  auto peerOwnerKey = adjRib0->getPeerOwnerKey();
+  auto* peerEntry = group_->addToLiteTree(
+      group_->LiteTree_, kV4Prefix4, peerOwnerKey, kPlaceholderPathID);
+  peerEntry->setPostAttr(attrs);
+  peerEntry->setRibVersion(100);
   adjRib0->incrementPostOutPrefixCount(true /* isIpv4 */);
   adjRib0->incrementPreOutPrefixCount(true /* isIpv4 */);
   EXPECT_EQ(adjRib0->getStats().getPostOutPrefixCount(), 4);
   EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 7);
 
-  /* Detached peer goes down: remove its OWN contribution (4) from the global.
-   */
+  /* Detached peer goes down: cleanUpDetachedRibEntries settles its own
+   * contribution -- the per-peer kV4Prefix4 entry it erases plus the 3 shared
+   * group entries it advertised -- so the global drops by all 4. */
   group_->unregisterPeer(adjRib0);
   EXPECT_EQ(group_->getStats().getPostOutPrefixCount(), 3);
   EXPECT_EQ(totalSentPrefixCount, totalSentBefore + 3);
