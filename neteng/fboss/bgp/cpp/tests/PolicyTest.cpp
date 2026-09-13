@@ -7331,13 +7331,43 @@ TEST_F(PolicyTest, LbwRejection_EncodeMultipath_ValidLbw) {
   EXPECT_FALSE(result.actionData->isLbwRejected);
 }
 
-// ACCEPT action should never reject, even with missing LBW
-TEST_F(PolicyTest, LbwRejection_AcceptAction_NoRejection) {
+// Generic ACCEPT remains permissive when no GAR encoding scheme is attached.
+TEST_F(PolicyTest, LbwRejection_AcceptAction_NoEncoding_NoRejection) {
   auto result = applyLbwPolicyAndCheck(
       createLbwActionData(std::nullopt /* no original LBW */, 65530),
       bgp_policy::LbwExtCommunityActionType::ACCEPT);
-  EXPECT_TRUE(result.accepted)
-      << "Route with ACCEPT action should never be rejected";
+  EXPECT_TRUE(result.accepted);
+  EXPECT_FALSE(result.actionData->isLbwRejected);
+}
+
+TEST_F(PolicyTest, LbwRejection_GarAcceptAction_MissingLbw) {
+  auto encoding = makeTestEncoding();
+  auto result = applyLbwPolicyAndCheck(
+      createLbwActionData(std::nullopt /* no original LBW */, 65530),
+      bgp_policy::LbwExtCommunityActionType::ACCEPT,
+      encoding);
+  EXPECT_FALSE(result.accepted);
+  EXPECT_TRUE(result.actionData->isLbwRejected);
+}
+
+TEST_F(PolicyTest, LbwRejection_GarAcceptAction_ZeroLbw) {
+  auto encoding = makeTestEncoding();
+  auto result = applyLbwPolicyAndCheck(
+      createLbwActionData(std::make_pair<uint16_t, float>(65530, 0.0f), 65530),
+      bgp_policy::LbwExtCommunityActionType::ACCEPT,
+      encoding);
+  EXPECT_FALSE(result.accepted);
+  EXPECT_TRUE(result.actionData->isLbwRejected);
+}
+
+TEST_F(PolicyTest, LbwRejection_GarAcceptAction_ValidLbw) {
+  auto encoding = makeTestEncoding();
+  auto result = applyLbwPolicyAndCheck(
+      createLbwActionData(
+          std::make_pair<uint16_t, float>(65530, 100.0f), 65530),
+      bgp_policy::LbwExtCommunityActionType::ACCEPT,
+      encoding);
+  EXPECT_TRUE(result.accepted);
   EXPECT_FALSE(result.actionData->isLbwRejected);
 }
 
@@ -7362,7 +7392,7 @@ TEST_F(PolicyTest, LbwRejection_CounterIncrements) {
   auto encoding = makeTestEncoding();
   applyLbwPolicyAndCheck(
       createLbwActionData(std::nullopt, 65530),
-      bgp_policy::LbwExtCommunityActionType::DECODE_ALL,
+      bgp_policy::LbwExtCommunityActionType::ACCEPT,
       encoding);
 
   facebook::fb303::ThreadCachedServiceData::get()->publishStats();

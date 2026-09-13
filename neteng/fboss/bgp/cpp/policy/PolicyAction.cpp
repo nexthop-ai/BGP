@@ -323,6 +323,17 @@ void LbwExtCommunityAction::applyAction(
       } else {
         attr->pruneNonTransitiveLbwExtCommunity();
       }
+      /*
+       * GAR-generated ACCEPT actions carry the encoding scheme to require an
+       * upstream encoded LBW. Scheme-less ACCEPT remains permissive for
+       * non-GAR users.
+       */
+      if (lbwExtCommunityAction_.encoding_scheme()) {
+        const auto rawLbw = attr->getNonTransitiveRawLbwValue();
+        if (!rawLbw || *rawLbw == 0) {
+          policyActionData->isLbwRejected = true;
+        }
+      }
       break;
     case bgp_policy::LbwExtCommunityActionType::DECODE_ALL:
       // first recover the original lbw ext community
